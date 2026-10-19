@@ -133,6 +133,17 @@ systemctl --user enable --now java-reaper.timer
 Команда требует пароль администратора (`polkit` → `auth_admin_keep`), поэтому
 её выполняет владелец машины.
 
+Если `systemctl --user start` зависает, а `systemctl --user list-jobs` показывает
+job'ы в состоянии `waiting` — завис сам user-менеджер. На этой машине он
+попался в busy-loop (1 поток, ~96 % одного ядра, `daemon-reload` отвечает, job'ы
+не выполняются). Лечится без остановки юнитов:
+
+```bash
+systemctl --user daemon-reexec
+```
+
+После этого таймер поднимается обычным `systemctl --user start java-reaper.timer`.
+
 ## Режимы
 
 ```bash
