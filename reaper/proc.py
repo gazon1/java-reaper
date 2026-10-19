@@ -182,6 +182,46 @@ def inode_owner_map() -> dict[str, int]:
     return owners
 
 
+def find_socket_owners(wanted: set[str]) -> dict[str, int]:
+    """Владельцы конкретных socket-inode — прицельный поиск с ранним выходом.
+
+    Полный `inode_owner_map` читает fd каждого процесса в системе: на машине
+    с 600 процессами это ~0.27 с, и 99 % найденного не нужно — рейперу
+    нужны владельцы лишь нескольких peer-соединений.
+
+    Здесь обход тот же, но с ранним выходом: как только найдены все нужные
+    inode, останавливаемся. PID обходятся по возрастанию: клиент сборки или
+    IDE обычно запущены раньше демона, поэтому нужный владелец находится
+    в начале списка.
+    """
+    owners: dict[str, int] = {}
+    if not wanted:
+        return owners
+    remaining = set(wanted)
+    for entry in sorted((e for e in os.listdir("/proc") if e.isdigit()),
+                        key=int):
+        pid = int(entry)
+        fddir = f"/proc/{pid}/fd"
+        try:
+            fds = os.listdir(fddir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(os.path.join(fddir, fd))
+            except OSError:
+                continue
+            if not target.startswith("socket:["):
+                continue
+            inode = target[8:-1]
+            if inode in remaining:
+                owners[inode] = pid
+                remaining.discard(inode)
+                if not remaining:
+                    return owners
+    return owners
+
+
 def is_loopback(addr_hex: str) -> bool:
     """Адрес из /proc/net/tcp — это u32/128-бит в порядке байтов хоста."""
     a = addr_hex.upper()

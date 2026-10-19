@@ -46,6 +46,7 @@ class PeerConn:
     owner_name: str | None = None
     first_seen: float | None = None   # когда впервые увидели (из состояния)
     age: float | None = None          # now - first_seen
+    peer_inode: str | None = None     # inode второй стороны соединения
 
 
 @dataclass
@@ -109,6 +110,7 @@ class Decision:
     busy: bool = False
     protected: bool = False
     protectors: list[Protector] = field(default_factory=list)
+    stale_peers: list[Protector] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # Совместимость: Decision(d, True, "…") — как в старом монолите.

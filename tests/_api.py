@@ -49,6 +49,7 @@ from reaper.proc import (  # noqa: E402,F401
     children_map,
     daemon_kind,
     find_log_path,
+    find_socket_owners,
     inode_owner_map,
     is_ignored_child,
     is_loopback,
@@ -60,9 +61,28 @@ from reaper.proc import (  # noqa: E402,F401
     socket_inodes,
     tcp_table,
 )
-from reaper.report import canary, format_json, format_status, health  # noqa: E402,F401
+from reaper.report import (  # noqa: E402,F401
+    JSON_SCHEMA_VERSION,
+    PILOT_MAX_REUSE_RATE,
+    PILOT_MIN_EVENTS,
+    audit_report,
+    canary,
+    decision_to_dict,
+    format_explain,
+    format_json,
+    format_status,
+    health,
+    pilot_report,
+)
 from reaper.state import (  # noqa: E402,F401
+    DAEMON_FIELDS,
+    GLOBAL_FIELDS,
+    STATE_VERSION,
+    append_kill,
+    kills_path,
     load_state,
+    note_stale_peers,
+    read_kills,
     record_freed,
     save_state,
     state_path,

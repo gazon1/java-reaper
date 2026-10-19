@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import importlib.machinery
+import json
 import importlib.util
 import signal
 import subprocess
@@ -230,6 +231,43 @@ class TestKillPath(unittest.TestCase):
         proc = run_reaper(self.cfg, "--mode=kill")
         self.assertNotIn("SIGTERM", proc.stdout)
         self.assertTrue(fake.alive())
+
+    def test_kill_is_logged_to_jsonl(self):
+        """Фактическое убийство попадает в журнал kills.jsonl.
+
+        Журнал — это аудит: «кого рейпер убил и почему». Без него
+        нельзя ни подтвердить эффект, ни разобрать инцидент.
+        """
+        fake = self.fake("gradle")
+        self.write_cfg(str(fake.proc.pid))
+        run_reaper(self.cfg, "--mode=dry-run")
+        proc = run_reaper(self.cfg, "--mode=kill")
+        self.assertIn("SIGTERM", proc.stdout)
+
+        kills_path = os.path.join(self.state, "kills.jsonl")
+        self.assertTrue(os.path.exists(kills_path),
+                        "журнал убийств не создан")
+        with open(kills_path, encoding="utf-8") as fh:
+            rows = [json.loads(line) for line in fh if line.strip()]
+        self.assertTrue(rows, "журнал убийств пуст")
+        row = rows[-1]
+        self.assertEqual(row["pid"], fake.proc.pid)
+        self.assertIn(row["action"], ("SIGTERM", "SIGKILL"))
+        self.assertTrue(row.get("reason"), "в записи нет причины")
+        self.assertIn("at", row)
+        self.assertGreater(row["at"], 0)
+        self.assertEqual(row["kind"], "gradle")
+
+    def test_dry_run_writes_no_kills(self):
+        """В dry-run журнал убийств остаётся пустым."""
+        fake = self.fake("gradle")
+        self.write_cfg(str(fake.proc.pid))
+        run_reaper(self.cfg, "--mode=dry-run")
+        run_reaper(self.cfg, "--mode=dry-run")
+        kills_path = os.path.join(self.state, "kills.jsonl")
+        if os.path.exists(kills_path):
+            with open(kills_path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read().strip(), "")
 
 
 if __name__ == "__main__":

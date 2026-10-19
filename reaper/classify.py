@@ -140,6 +140,7 @@ def evaluate(signals: Signals, rules: list[Rule]) -> Decision:
             busy=rule.busy,
             protected=rule.protected,
             protectors=list(signals.peer_protection),
+            stale_peers=list(signals.peer_stale),
         )
     # Правил не должно быть без catch-all; на всякий случай — оставить.
     return Decision(daemon=signals.daemon,  # type: ignore[arg-type]

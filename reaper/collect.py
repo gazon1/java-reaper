@@ -12,7 +12,7 @@ from .proc import (
     children_map,
     daemon_kind,
     find_log_path,
-    inode_owner_map,
+    find_socket_owners,
     is_ignored_child,
     proc_comm,
     proc_cmdline,
@@ -39,14 +39,28 @@ def collect_daemons(cfg: dict[str, Any], state: dict[str, Any],
 
     Состояние используется для двух вещей: инкрементального разбора лога
     (смещение) и возраста peer-соединений (когда мы их увидели впервые).
+
+    Порядок обхода /proc выбран из-за цены: сначала находим демонов и их
+    сокеты, потом — только нужных владельцев peer-соединений (прицельный
+    поиск с ранним выходом). Полный обход fd всех процессов стоил 0.27 с
+    на машине с 600 процессами ради одного-двух нужных inode.
     """
     now = time.time() if now is None else now
     tcp = tcp_table()
-    owners = inode_owner_map()
     kids = children_map()
     prev = state.get("daemons", {})
     daemons: list[Daemon] = []
 
+    # Обратный индекс TCP: (local_port, remote_port) → inode.
+    # Только Established: TIME_WAIT-сокет второй стороны не ищем.
+    # Ищем peer-соединение демона за O(1), а не перебором всей таблицы.
+    tcp_by_ports: dict[tuple[int, int], list[str]] = {}
+    for inode, (lport, rport, st, _ll, _rl) in tcp.items():
+        if st != "01":  # 01 = ESTABLISHED
+            continue
+        tcp_by_ports.setdefault((lport, rport), []).append(inode)
+
+    # Фаза 1: демоны и их логи/память/дети.
     for entry in sorted(os.listdir("/proc")):
         if not entry.isdigit():
             continue
@@ -94,37 +108,69 @@ def collect_daemons(cfg: dict[str, Any], state: dict[str, Any],
             else:
                 d.children.append(child)
 
-        _collect_peers(d, tcp, owners, rec, now)
+        d.peer_conns = _daemon_connections(d, tcp, tcp_by_ports)
         daemons.append(d)
+
+    # Фаза 2: владельцы peer-соединений — прицельно и с ранним выходом.
+    # Нужны только владельцы второй стороны соединения (клиента).
+    wanted: set[str] = set()
+    for d in daemons:
+        for conn in d.peer_conns:
+            if conn.peer_inode:
+                wanted.add(conn.peer_inode)
+    owners = find_socket_owners(wanted)
+
+    # Фаза 3: склеиваем соединения с владельцами и считаем возраст.
+    for d in daemons:
+        d.peer_conns = _attach_peers(d, owners, prev.get(str(d.pid)) or {}, now)
+
     return daemons
 
 
-def _collect_peers(d: Daemon, tcp: dict[str, Any], owners: dict[str, int],
-                   rec: dict[str, Any], now: float) -> None:
-    """Находит Established-соединения демона с локальными клиентами."""
+def _daemon_connections(d: Daemon, tcp: dict[str, Any],
+                        tcp_by_ports: dict[tuple[int, int], list[str]],
+                        ) -> list[PeerConn]:
+    """Established-соединения демона с локальными клиентами (без владельца)."""
     my_inodes = socket_inodes(d.pid)
-    seen_at: dict[str, float] = rec.get("peer_first_seen") or {}
-    fresh: dict[str, float] = {}
-
-    for ino, (lport, rport, state, l_loop, r_loop) in tcp.items():
-        if ino not in my_inodes or state != "01":  # 01 = ESTABLISHED
+    out: list[PeerConn] = []
+    for ino in my_inodes:
+        entry = tcp.get(ino)
+        if entry is None:
+            continue
+        lport, rport, state, l_loop, r_loop = entry
+        if state != "01":  # 01 = ESTABLISHED
             continue
         if not (l_loop or r_loop):
             # Исходящее соединение наружу (например, HTTPS к репозиторию):
             # клиента за ним нет, наблюдателем оно не является.
             continue
         peer_inode = None
-        for other, (ol, orr, ost, _ol, _or) in tcp.items():
-            if ost == "01" and ol == rport and orr == lport:
-                peer_inode = other
-                break
-        owner = owners.get(peer_inode) if peer_inode else None
+        peers = tcp_by_ports.get((rport, lport), [])
+        if peers:
+            peer_inode = peers[0]
+        out.append(PeerConn(inode=ino, local_port=lport, remote_port=rport,
+                            peer_inode=peer_inode))
+    return out
+
+
+def _attach_peers(d: Daemon, owners: dict[str, int], rec: dict[str, Any],
+                  now: float) -> list[PeerConn]:
+    """Проставляет владельца, имя и возраст соединения.
+
+    Возвращает только те соединения, которые действительно наблюдают
+    за демоном: соединение с самим собой — не наблюдатель.
+    """
+    seen_at: dict[str, float] = rec.get("peer_first_seen") or {}
+    fresh: dict[str, float] = {}
+    kept: list[PeerConn] = []
+
+    for conn in d.peer_conns:
+        owner = owners.get(conn.peer_inode) if conn.peer_inode else None
         if owner == d.pid:
             # Соединение с самим собой (внутренний loopback) — не наблюдатель.
             continue
-        conn = PeerConn(inode=ino, local_port=lport, remote_port=rport,
-                        owner_pid=owner,
-                        owner_name=proc_comm(owner) if owner else None)
+        conn.owner_pid = owner
+        conn.owner_name = proc_comm(owner) if owner else None
         key = peer_key(conn)
         first = seen_at.get(key)
         if first is None:
@@ -132,9 +178,10 @@ def _collect_peers(d: Daemon, tcp: dict[str, Any], owners: dict[str, int],
         fresh[key] = first
         conn.first_seen = first
         conn.age = now - first
-        d.peer_conns.append(conn)
+        kept.append(conn)
         if owner is None:
             d.peer_unknown += 1
         else:
             d.peer_pids.append(owner)
     d.peer_first_seen = fresh
+    return kept

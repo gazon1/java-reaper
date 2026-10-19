@@ -9,7 +9,17 @@
 java-reaper --status          # таблица демонов с решениями (ничего не меняет)
 java-reaper --status --json   # то же машинно-читаемо: защиты, peer'ы, возраст
 java-reaper --health          # «таймер молча не работает?» + метрики
+java-reaper --pilot           # вердикт по пилоту: можно ли включать kill-режим
+java-reaper --audit           # демоны с простоями длиннее IDLE_SECONDS
+java-reaper --explain         # таблица правил политики
 journalctl --user -u java-reaper.service -n 50   # что делал рейпер
+tail -20 ~/.local/state/java-reaper/watchdog.log # что делал сторож (crond)
+```
+
+Отчёт за месяц:
+
+```bash
+python3 ~/dev/java-reaper/tools/monthly-report.py
 ```
 
 ## Штатные состояния
@@ -118,6 +128,49 @@ java-reaper --health
   ```
 - После логаута таймер останавливается: нужен `loginctl enable-linger max`
   (требует пароль администратора).
+
+### Сторож: страховка вне user-менеджера
+
+Если user-менеджер завис (см. выше), умирают все user-юниты, включая таймер.
+Сторож работает через `crond` — системный сервис — и потому переживает такую
+смерть. Он раз в 5 минут проверяет, идут ли свипы, и при необходимости
+выполняет свип сам.
+
+```bash
+crontab -l | grep java-reaper          # сторож установлен?
+tail -20 ~/.local/state/java-reaper/watchdog.log
+```
+
+| сообщение | Что значит |
+|---|---|
+| `СТАТУС: ок, последний свип N мин назад` | всё в порядке |
+| `СТАТУС: ПОЛОМАНО — …` | рейпер замолчал; дальше либо `починил`, либо `починить не удалось` |
+| `СТАТУС: ОТКЛЮЧЁН флагом …` | сработал аварийный тормоз; сторож намеренно молчит |
+
+Если сторож не установлен:
+
+```bash
+crontab -l > /tmp/reaper-cron.txt
+cat >> /tmp/reaper-cron.txt <<'EOF'
+*/5 * * * * /usr/bin/python3 /home/max/dev/java-reaper/tools/watchdog.py >> /home/max/.local/state/java-reaper/watchdog.log 2>&1
+EOF
+crontab /tmp/reaper-cron.txt
+```
+
+## Что рейпер убил
+
+Каждое фактическое убийство записано в журнал:
+
+```bash
+cat ~/.local/state/java-reaper/kills.jsonl          # одна JSON-запись на убийство
+python3 ~/dev/java-reaper/tools/monthly-report.py  # сводка за месяц
+```
+
+Запись: `at` (время), `pid`, `action` (SIGTERM/SIGKILL), `reason` (почему),
+`footprint_mb` (сколько памяти освободили), `kind` (gradle/kotlin).
+
+Сводка «сколько ложных срабатываний» — в `--pilot`: доляreuse из метрики
+пилота против критерия ≤ 60 % при ≥ 15 событиях.
 
 ## Логи демонов растут
 

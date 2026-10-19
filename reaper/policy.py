@@ -4,6 +4,10 @@
 первое совпавшее правило решает. Таблица читается как спецификация и
 проверяется инвариантными тестами (см. tests/test_policy.py).
 
+Каждое правило несёт `doc` (что это значит по-человечески) и `condition`
+(формальное условие) — они печатаются командой `--explain` и проверяются
+тестом «у каждого правила есть описание».
+
 Базовый принцип: **неизвестное ⇒ оставить**. Демон, который мы не можем
 измерить (нет лога, нет baseline, неизвестный владелец соединения), не
 убивается никогда.
@@ -44,9 +48,19 @@ class Signals:
 
 @dataclass(frozen=True)
 class Rule:
-    """Одно правило политики."""
+    """Одно правило политики.
+
+    name      — идентификатор (уникален в таблице);
+    doc       — что правило значит по-человечески;
+    condition — формальное условие срабатывания;
+    action    — что делаем, если условие выполнено;
+    check     — предикат;
+    reason    — текст причины для отчёта.
+    """
 
     name: str
+    doc: str
+    condition: str
     action: Action
     check: Callable[[Signals], bool]
     reason: Callable[[Signals], str]
@@ -66,6 +80,7 @@ def default_policy(cfg: dict) -> list[Rule]:
     """
     idle_limit = float(cfg["IDLE_SECONDS"])
     min_footprint = int(cfg["MIN_FOOTPRINT_MB"])
+    peer_max_age = float(cfg.get("PEER_MAX_AGE_SECONDS", 21600))
 
     def not_allowed(s: Signals) -> bool:
         return not s.allowed
@@ -104,31 +119,69 @@ def default_policy(cfg: dict) -> list[Rule]:
         return True
 
     return [
-        Rule("allowlist", Action.KEEP, not_allowed,
+        Rule("allowlist",
+             "Вне прицельного списка PID — не трогаем вообще.",
+             "PID_ALLOWLIST задан и PID в него не входит",
+             Action.KEEP, not_allowed,
              lambda s: "PID вне списка разрешённых — оставляю"),
-        Rule("no-log", Action.KEEP, no_log,
+        Rule("no-log",
+             "Демон не держит свой лог — нечем измерить простой.",
+             "лог не найден через /proc/PID/fd",
+             Action.KEEP, no_log,
              lambda s: "лог не найден — защищаю", protected=True),
-        Rule("unknown-history", Action.KEEP, unknown_history,
+        Rule("unknown-history",
+             "Лог есть, но его история неизвестна (файл больше предела разбора).",
+             "разбор лога неполный и маркеры не найдены",
+             Action.KEEP, unknown_history,
              lambda s: "история лога неизвестна (лог не разобран) — защищаю",
              protected=True),
-        Rule("no-baseline", Action.KEEP, no_baseline,
+        Rule("no-baseline",
+             "Первый свип по демону: не с чем сравнить CPU — наблюдаем.",
+             "нет предыдущего измерения CPU",
+             Action.KEEP, no_baseline,
              lambda s: "нет baseline (первый свип) — защищаю", protected=True),
-        Rule("peer", Action.KEEP, has_peer,
+        Rule("peer",
+             "За демоном наблюдает живой клиент (или висит соединение с владельцем, "
+             "которого мы не видим).",
+             f"есть локальное Established-соединение с клиентом (свежее, < {peer_max_age / 3600:.0f} ч)",
+             Action.KEEP, has_peer,
              lambda s: _fmt_protectors(s.peer_protection), protected=True),
-        Rule("cpu-busy", Action.KEEP, busy_cpu,
+        Rule("cpu-busy",
+             "Демон наработал CPU за свип — он работает.",
+             "CPU за свип > BUSY_CPU_SECONDS",
+             Action.KEEP, busy_cpu,
              lambda s: f"занят: CPU {s.cpu_delta:.1f} с за свип", busy=True),
-        Rule("children", Action.KEEP, busy_children,
+        Rule("children",
+             "У демона есть живой дочерний процесс — он работает.",
+             "есть живой ребёнок (не из ignore-списка)",
+             Action.KEEP, busy_children,
              lambda s: "есть живые дети: "
                        + ", ".join(str(c) for c in s.daemon.children), busy=True),
-        Rule("recent-log", Action.KEEP, recent_log,
+        Rule("recent-log",
+             "Лог обновлялся в пределах свипа — демон активен.",
+             "mtime лога или конец сборки свежее SWEEP_SECONDS",
+             Action.KEEP, recent_log,
              lambda s: "лог обновлялся недавно", busy=True),
-        Rule("small-footprint", Action.KEEP, small,
+        Rule("small-footprint",
+             "Демон занимает мало памяти — дешевле пересоздать, чем рисковать.",
+             f"footprint (RSS+swap) < {min_footprint} МБ",
+             Action.KEEP, small,
              lambda s: f"footprint {s.daemon.footprint_mb} МБ < {min_footprint} МБ"),
-        Rule("building", Action.KEEP, building,
+        Rule("building",
+             "Идёт сборка: демон начал её недавно.",
+             "есть старт сборки без конца и простой < IDLE_SECONDS",
+             Action.KEEP, building,
              lambda s: "сборка идёт (старт без конца)", busy=True),
-        Rule("not-idle", Action.KEEP, not_idle,
+        Rule("not-idle",
+             "Демон простаивает недостаточно долго.",
+             f"простой < IDLE_SECONDS ({idle_limit / 60:.0f} мин)",
+             Action.KEEP, not_idle,
              lambda s: f"простой {s.age / 60:.0f} мин < {idle_limit / 60:.0f} мин"),
-        Rule("kill", Action.KILL, always,
+        Rule("kill",
+             "Все условия кандидата выполнены: простоя достаточно, памяти достаточно, "
+             "демон никем не наблюдается.",
+             "иначе (сюда попадают только прошедшие все проверки)",
+             Action.KILL, always,
              lambda s: (f"простой {s.age / 3600:.1f} ч, "
                         f"footprint {s.daemon.footprint_mb} МБ"
                         + (", зависшая сборка (старт без конца)"
