@@ -117,25 +117,41 @@ Kotlin-демоны защищаются — иначе компилятор м�
 ln -sfn ~/dev/java-reaper/java-reaper ~/.local/bin/java-reaper
 mkdir -p ~/.config/java-reaper
 cp ~/dev/java-reaper/config.example ~/.config/java-reaper/config
+cp ~/dev/java-reaper/config.env.example ~/.config/java-reaper/env
 mkdir -p ~/.config/systemd/user
 cp ~/dev/java-reaper/systemd/java-reaper.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now java-reaper.timer
 ```
 
+Режим выкатки задаётся `~/.config/java-reaper/env` (`REAPER_ARGS=--mode=dry-run`
+на время пилота, `--mode=kill` — после проверки метрики). По умолчанию в юните
+стояит `--mode=dry-run`: боевой режим включается только явно.
+
 `loginctl enable-linger` **обязателен**: `Linger=no`, а `KillUserProcesses` не
 задан (дефолт `no`) — демоны переживают логаут, пользовательский таймер нет.
+Команда требует пароль администратора (`polkit` → `auth_admin_keep`), поэтому
+её выполняет владелец машины.
 
 ## Режимы
 
 ```bash
-java-reaper --status    # таблица демонов с решениями, ничего не убивает
-java-reaper --dry-run   # решения + запись событий «would kill» для метрики
-java-reaper             # исполнение
+java-reaper --status           # таблица демонов с решениями, ничего не меняет
+java-reaper --mode=dry-run     # решения + запись событий «would kill» для метрики
+java-reaper --mode=kill        # исполнение
 ```
+
+`--dry-run` — краткий синоним `--mode=dry-run`. `--status` не трогает состояние:
+это чистое чтение, baseline пишет только рабочий свип.
 
 Первый свип ничего не убивает (нет baseline) — это нормально. Второй свип уже
 принимает решения.
+
+### Прицельный режим
+
+`PID_ALLOWLIST=1234,5678` в конфиге ограничивает убийство перечисленными PID:
+остальные демоны видны в отчёте, но никогда не трогаются. Нужен для первого
+боевого прогона (сначала один процесс) и для проверок на поддельных демонах.
 
 ## Метрика качества (этап dry-run)
 
@@ -144,15 +160,37 @@ java-reaper             # исполнение
 при пороге 3 ч — 47 %; критерий перехода в kill-режим: доля ≤ 60 % при ≥ 15
 уникальных событиях (иначе выборка слишком мала).
 
-## Протокол пилота (шаг 4 выкатки)
+## Протокол пилота (шаг 4 выкатки) — выполнен
 
-1. Найти Gradle-демон с живым Kotlin-демоном (`--status` покажет детей).
-2. Записать PID обоих, `kill -TERM <gradle-pid>`.
-3. 60 с наблюдения: ожидается, что Gradle-демон исчез, а в его логе появилась
-   строка `Daemon vm is shutting down…`; Kotlin-демон уходит сам (маркер клиента
-   удалён shutdown-hook'ом).
-4. Если Kotlin-демон остался — это ожидаемо и не страшно: рейпер убьёт его
-   принудительно, а клиент переподключится или откатится на fallback.
+Пилот проведён на изолированной паре (Gradle 8.14.6 + Kotlin 2.4.21 в отдельном
+`GRADLE_USER_HOME=/tmp/reaper-pilot/.guh`), чтобы не затрагивать чужую работу.
+
+| наблюдение | результат |
+|---|---|
+| `kill -TERM <gradle-pid>` | Gradle-демон вышел за 5 с |
+| лог Gradle-демона | `Daemon vm is shutting down... The daemon has exited normally or was terminated in response to a user interrupt.` |
+| клиентский маркер Kotlin | удалён shutdown-hook'ом (файл исчез) |
+| Kotlin-демон | через 1 с сам написал `No more clients left` → `Delayed shutdown in 1000ms` → `Shutdown complete` |
+| SIGKILL | не потребовался |
+
+Вывод: при штатном SIGTERM Kotlin-демон **не осиротевает** — цепочка
+«Gradle-демон → маркер клиента → Kotlin-демон» рвётся корректно. SIGKILL в
+инструменте нужен только для демонов, чей клиент умер нечисто (маркер уцелел).
+
+## Тесты
+
+```bash
+python3 -m unittest discover -s tests      # 74 теста
+```
+
+- `tests/test_reaper.py` — юнит-тесты: разбор логов и таймстемпов, классификатор
+  (защиты, эскалация зависшей сборки, least fixed point по peer'ам), метрика,
+  конфиг, состояние, поиск лога через `/proc`, CLI.
+- `tests/test_kill_path.py` — сквозные тесты kill-пути на поддельных демонах:
+  SIGTERM, эскалация до SIGKILL (Gradle — после `GRADLE_SIGKILL_AFTER_TRIES`,
+  Kotlin — всегда), dry-run не сигналит, allowlist не трогает чужие PID.
+  Реальные демоны машины тестами не затрагиваются.
+
 
 ## Чего инструмент не делает
 

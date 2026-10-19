@@ -163,6 +163,25 @@ class TestScanGradleLog(unittest.TestCase):
             os.unlink(path)
 
 
+class TestLoopbackDetection(unittest.TestCase):
+    """Внешние соединения демона (HTTPS к репозиторию) не считаются наблюдателем."""
+
+    def test_loopback_v4(self):
+        self.assertTrue(reaper._is_loopback("0100007F"))
+        self.assertTrue(reaper._is_loopback("0100007f"))
+
+    def test_external_v4(self):
+        self.assertFalse(reaper._is_loopback("6B01A8C0"))  # 192.168.1.107
+        self.assertFalse(reaper._is_loopback("EBE92422"))  # 34.36.233.235
+
+    def test_loopback_v6(self):
+        self.assertTrue(reaper._is_loopback("00000000000000000000000001000000"))
+        self.assertFalse(reaper._is_loopback("00000000000000000000000000000001"))
+
+    def test_garbage(self):
+        self.assertFalse(reaper._is_loopback("zz"))
+
+
 class TestDaemonKind(unittest.TestCase):
     def test_gradle(self):
         self.assertEqual(
@@ -647,6 +666,17 @@ class TestCli(unittest.TestCase):
         proc = subprocess.run([sys.executable, "-m", "py_compile", SCRIPT],
                               capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_mode_dry_run_writes_state_and_kills_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = os.path.join(tmp, "config")
+            with open(cfg, "w", encoding="utf-8") as fh:
+                fh.write(f"STATE_DIR = {tmp}/state\nLOCK_PATH = {tmp}/reaper.lock\n")
+            proc = self._run("--mode=dry-run", "--config", cfg)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("режим dry-run", proc.stdout)
+            self.assertNotIn("SIGTERM", proc.stdout)
+            self.assertTrue(os.path.exists(os.path.join(tmp, "state", "state.json")))
 
 
 if __name__ == "__main__":

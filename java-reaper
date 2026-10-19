@@ -50,6 +50,7 @@ DEFAULTS: dict[str, Any] = {
     "GRACE_SECONDS": 15,          # SIGTERM → пауза → SIGKILL
     "GRADLE_SIGKILL_AFTER_TRIES": 3,
     "REUSE_WINDOW_SECONDS": 7200,  # окно «понадобился снова» для метрики
+    "PID_ALLOWLIST": "",            # пусто = все; список PID через запятую
     "LOG_SCAN_MAX_BYTES": 512 * 1024 * 1024,  # предел полного разбора лога
     "STATE_DIR": "~/.local/state/java-reaper",
     "CONFIG_PATH": "~/.config/java-reaper/config",
@@ -268,9 +269,20 @@ def parse_gradle_log(path: str, tail_bytes: int) -> tuple[float | None, float | 
     return res["start"], res["end"]
 
 
-def tcp_table() -> dict[str, tuple[int, int, str]]:
-    """inode → (local_port, remote_port, state) по /proc/net/tcp{,6}."""
-    table: dict[str, tuple[int, int, str]] = {}
+def _is_loopback(addr_hex: str) -> bool:
+    """Адрес из /proc/net/tcp — это u32/128-бит в порядке байтов хоста."""
+    a = addr_hex.upper()
+    if len(a) == 8:
+        return a == "0100007F"          # 127.0.0.1
+    if len(a) == 32:
+        return a in ("00000000000000000000000001000000",  # ::1
+                     "00000000000000000000000000000000")  # ::
+    return False
+
+
+def tcp_table() -> dict[str, tuple[int, int, str, bool, bool]]:
+    """inode → (local_port, remote_port, state, local_is_loopback, remote_is_loopback)."""
+    table: dict[str, tuple[int, int, str, bool, bool]] = {}
     for path in ("/proc/net/tcp", "/proc/net/tcp6"):
         try:
             with open(path, encoding="utf-8") as fh:
@@ -283,11 +295,14 @@ def tcp_table() -> dict[str, tuple[int, int, str]]:
                 continue
             state = f[3]
             try:
-                lport = int(f[1].rsplit(":", 1)[1], 16)
-                rport = int(f[2].rsplit(":", 1)[1], 16)
+                lhex, lport_hex = f[1].rsplit(":", 1)
+                rhex, rport_hex = f[2].rsplit(":", 1)
+                lport = int(lport_hex, 16)
+                rport = int(rport_hex, 16)
             except (IndexError, ValueError):
                 continue
-            table[f[9]] = (lport, rport, state)
+            table[f[9]] = (lport, rport, state,
+                           _is_loopback(lhex), _is_loopback(rhex))
     return table
 
 
@@ -464,11 +479,15 @@ def collect_daemons(cfg: dict[str, Any], state: dict[str, Any]) -> list[Daemon]:
                 d.children.append(child)
 
         my_inodes = socket_inodes(pid)
-        for ino, (lport, rport, state) in tcp.items():
+        for ino, (lport, rport, state, l_loop, r_loop) in tcp.items():
             if ino not in my_inodes or state != "01":  # 01 = ESTABLISHED
                 continue
+            if not (l_loop or r_loop):
+                # Исходящее соединение наружу (например, HTTPS к репозиторию):
+                # клиента за ним нет, наблюдателем оно не является.
+                continue
             peer_inode = None
-            for other, (ol, orr, ost) in tcp.items():
+            for other, (ol, orr, ost, _ol, _or) in tcp.items():
                 if ost == "01" and ol == rport and orr == lport:
                     peer_inode = other
                     break
@@ -541,6 +560,7 @@ def classify(daemons: list[Daemon], state: dict[str, Any], now: float,
     min_foot = int(cfg["MIN_FOOTPRINT_MB"])
     sweep = float(cfg["SWEEP_SECONDS"])
     hz = os.sysconf("SC_CLK_TCK")
+    allow = {int(x) for x in re.split(r"[,\s]+", str(cfg.get("PID_ALLOWLIST") or "")) if x}
 
     known = {d.pid for d in daemons}
     prev = state.get("daemons", {})
@@ -557,7 +577,11 @@ def classify(daemons: list[Daemon], state: dict[str, Any], now: float,
 
         cpu_delta = None
         if "cpu_ticks" in rec:
-            cpu_delta = (d.cpu_ticks - int(rec["cpu_ticks"])) / float(hz)
+            # Дельту приводим к «одному свипу»: если свип задержался (таймер
+            # пропустил запуск), накопленный CPU иначе выглядел бы как работа.
+            elapsed = (now - float(rec["last_sweep_at"])) if rec.get("last_sweep_at") else sweep
+            scale = sweep / max(elapsed, 1.0)
+            cpu_delta = (d.cpu_ticks - int(rec["cpu_ticks"])) / float(hz) * scale
         log_recent = False
         if d.kind == "kotlin" and d.log_mtime is not None:
             log_recent = (now - d.log_mtime) <= sweep
@@ -631,7 +655,9 @@ def classify(daemons: list[Daemon], state: dict[str, Any], now: float,
         busy = False
         protected = False
 
-        if not d.log_ok:
+        if allow and pid not in allow:
+            reason = "PID вне списка разрешённых — оставляю"
+        elif not d.log_ok:
             reason = "лог не найден — защищаю"
             protected = True
         elif not d.idle_known:
@@ -749,7 +775,7 @@ def execute(decisions: list[Decision], state: dict[str, Any], now: float,
         ok = send_signal(dec.daemon.pid, handles.get(dec.daemon.pid), signal.SIGTERM)
         report.append({"pid": dec.daemon.pid, "action": "SIGTERM" if ok else "SIGTERM failed",
                        "reason": dec.reason})
-        rec = state["daemons"].setdefault(str(dec.daemon.pid), {})
+        rec = state.setdefault("daemons", {}).setdefault(str(dec.daemon.pid), {})
         rec["sigterm_attempts"] = int(rec.get("sigterm_attempts", 0)) + 1
 
     deadline = time.time() + float(cfg["GRACE_SECONDS"])
@@ -762,7 +788,7 @@ def execute(decisions: list[Decision], state: dict[str, Any], now: float,
         d = dec.daemon
         if not still_same(d.pid, d.starttime):
             continue
-        rec = state["daemons"].setdefault(str(d.pid), {})
+        rec = state.setdefault("daemons", {}).setdefault(str(d.pid), {})
         if d.kind == "kotlin":
             send_signal(d.pid, handles.get(d.pid), signal.SIGKILL)
             report.append({"pid": d.pid, "action": "SIGKILL", "reason": "не вышел за grace"})
@@ -876,10 +902,14 @@ def main(argv: list[str] | None = None) -> int:
         description="Рейпер застаревших Gradle/Kotlin-демонов")
     parser.add_argument("--dry-run", action="store_true",
                         help="только показать решения, ничего не убивать")
+    parser.add_argument("--mode", choices=("kill", "dry-run"),
+                        help="режим работы: kill (по умолчанию) или dry-run")
     parser.add_argument("--status", action="store_true",
                         help="таблица демонов с решениями (ничего не убивать)")
     parser.add_argument("--config", help="путь к конфигу")
     args = parser.parse_args(argv)
+
+    mode = args.mode or ("dry-run" if args.dry_run else "kill")
 
     cfg = load_config(args.config)
     state_dir = expand(cfg["STATE_DIR"])
@@ -907,7 +937,7 @@ def main(argv: list[str] | None = None) -> int:
         # --status — только чтение: состояние не трогаем.
         return 0
 
-    report = execute(decisions, state, now, cfg, dry_run=args.dry_run)
+    report = execute(decisions, state, now, cfg, dry_run=(mode == "dry-run"))
 
     # Состояние: first_seen/cpu/last_activity и попытки.
     prev = state.setdefault("daemons", {})
@@ -918,6 +948,7 @@ def main(argv: list[str] | None = None) -> int:
         rec["kind"] = d.kind
         rec["cpu_ticks"] = d.cpu_ticks
         rec["starttime"] = d.starttime
+        rec["last_sweep_at"] = now
         rec["log_offset"] = d.log_offset
         if d.kind == "gradle":
             rec["last_build_start"] = d.last_build_start
@@ -943,7 +974,8 @@ def main(argv: list[str] | None = None) -> int:
     for item in report:
         print(f"java-reaper: pid={item['pid']} {item['action']} — {item['reason']}", flush=True)
     killed = [i for i in report if i["action"] in ("SIGTERM", "SIGKILL")]
-    print(f"java-reaper: демонов {len(decisions)}, сигналов отправлено {len(killed)}, "
+    print(f"java-reaper: режим {mode}, демонов {len(decisions)}, "
+          f"сигналов отправлено {len(killed)}, "
           f"кандидатов на убийство {sum(1 for d in decisions if d.kill)}", flush=True)
     return 0
 

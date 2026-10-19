@@ -4,6 +4,12 @@ Documentation=file://%h/dev/java-reaper/README.md
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/java-reaper
+# Режим выкатки задаётся файлом ~/.config/java-reaper/env:
+#   REAPER_ARGS=--mode=dry-run   — только наблюдение (пилот)
+#   REAPER_ARGS=--mode=kill      — боевой режим
+# По умолчанию (без файла) — dry-run: включить бой можно только явно.
+Environment=REAPER_ARGS=--mode=dry-run
+EnvironmentFile=-%h/.config/java-reaper/env
+ExecStart=%h/.local/bin/java-reaper ${REAPER_ARGS}
 WorkingDirectory=%h
 TimeoutStartSec=120
