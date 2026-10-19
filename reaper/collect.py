@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 from .logs import scan_gradle_log
@@ -39,7 +40,7 @@ def collect_daemons(cfg: dict[str, Any], state: dict[str, Any],
     Состояние используется для двух вещей: инкрементального разбора лога
     (смещение) и возраста peer-соединений (когда мы их увидели впервые).
     """
-    now = time_now() if now is None else now
+    now = time.time() if now is None else now
     tcp = tcp_table()
     owners = inode_owner_map()
     kids = children_map()
@@ -137,8 +138,3 @@ def _collect_peers(d: Daemon, tcp: dict[str, Any], owners: dict[str, int],
         else:
             d.peer_pids.append(owner)
     d.peer_first_seen = fresh
-
-
-def time_now() -> float:
-    import time
-    return time.time()

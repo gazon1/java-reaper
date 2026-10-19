@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 from .model import Decision
+from .proc import proc_cmdline
 
 
 def format_status(decisions: list[Decision], state: dict[str, Any]) -> str:
@@ -97,7 +98,6 @@ def canary(daemons: list[Any], decisions: list[Decision]) -> str | None:
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
-        from .proc import proc_cmdline
         cmdline = proc_cmdline(int(entry))
         if "gradle" in cmdline.lower() or "kotlin" in cmdline.lower():
             if "daemon" in cmdline.lower() or "KotlinCompileDaemon" in cmdline:
