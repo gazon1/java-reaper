@@ -1,0 +1,73 @@
+"""Единая точка доступа к API пакета reaper для тестов.
+
+Тесты пишутся как `reaper.classify(...)`, `reaper.Daemon(...)` — этот модуль
+собирает плоское пространство имён из пакетных модулей.
+"""
+
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from reaper.classify import classify, evaluate  # noqa: E402,F401
+from reaper.collect import collect_daemons, peer_key  # noqa: E402,F401
+from reaper.config import (  # noqa: E402,F401
+    DEFAULTS,
+    allowlist,
+    disabled_flag,
+    expand,
+    load_config,
+)
+from reaper.execute import (  # noqa: E402,F401
+    execute,
+    open_pidfd,
+    send_signal,
+    still_same,
+)
+from reaper.housekeeping import trim_idle_logs  # noqa: E402,F401
+from reaper.logs import (  # noqa: E402,F401
+    MARK_BUILD_END,
+    MARK_BUILD_END_ALT,
+    MARK_BUILD_START,
+    parse_gradle_log,
+    scan_gradle_log,
+    scan_markers,
+)
+from reaper.model import (  # noqa: E402,F401
+    Action,
+    CHILD_IGNORE_EXECUTABLES,
+    Daemon,
+    Decision,
+    PeerConn,
+    Protector,
+    observed_activity,
+)
+from reaper.policy import Rule, Signals, default_policy  # noqa: E402,F401
+from reaper.proc import (  # noqa: E402,F401
+    children_map,
+    daemon_kind,
+    find_log_path,
+    inode_owner_map,
+    is_ignored_child,
+    is_loopback,
+    parse_ts,
+    proc_comm,
+    proc_cmdline,
+    read_memory,
+    read_proc_stat,
+    socket_inodes,
+    tcp_table,
+)
+from reaper.report import canary, format_json, format_status, health  # noqa: E402,F401
+from reaper.state import (  # noqa: E402,F401
+    load_state,
+    record_freed,
+    save_state,
+    state_path,
+    update_metric,
+)
+
+# Внутреннее имя из ранних версий.
+_is_loopback = is_loopback

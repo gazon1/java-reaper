@@ -25,17 +25,9 @@ SCRIPT = os.path.join(ROOT, "java-reaper")
 FIXTURES = os.path.join(HERE, "fixtures")
 
 
-def _load_module():
-    loader = importlib.machinery.SourceFileLoader("java_reaper", SCRIPT)
-    spec = importlib.util.spec_from_file_location("java_reaper", SCRIPT, loader=loader)
-    module = importlib.util.module_from_spec(spec)
-    # dataclass на Python 3.14 ищет модуль в sys.modules — регистрируем заранее.
-    sys.modules["java_reaper"] = module
-    loader.exec_module(module)
-    return module
+sys.path.insert(0, HERE)
 
-
-reaper = _load_module()
+import _api as reaper  # noqa: E402
 
 NOW = 1_800_000_000.0
 HOUR = 3600.0
@@ -54,6 +46,12 @@ def make_daemon(pid=1000, kind="gradle", **kw) -> "reaper.Daemon":
         setattr(d, key, value)
     return d
 
+
+def make_peer(pid: int | None, name: str | None = None, age: float | None = None):
+    """Established-соединение демона с локальным клиентом."""
+    return reaper.PeerConn(inode="999", local_port=1234,
+                           remote_port=5678, owner_pid=pid, owner_name=name,
+                           age=age)
 
 def state_for(daemon, first_seen, cpu_ticks=None, last_activity=0.0):
     rec = {"first_seen": first_seen, "last_activity": last_activity}
@@ -309,7 +307,7 @@ class TestClassify(unittest.TestCase):
         self.assertTrue(dec.kill)
 
     def test_unknown_peer_protects(self):
-        d = make_daemon(last_build_end=NOW - 5 * HOUR, peer_unknown=1)
+        d = make_daemon(last_build_end=NOW - 5 * HOUR, peer_conns=[make_peer(None)])
         st = state_for(d, NOW - 5 * HOUR, cpu_ticks=1000)
         dec = self.decide(d, st)
         self.assertFalse(dec.kill)
@@ -381,7 +379,8 @@ class TestClassifyPeerGraph(unittest.TestCase):
 
     def test_busy_peer_protects_idle_daemon(self):
         client = make_daemon(pid=2000, last_build_end=NOW - 5 * HOUR, cpu_ticks=1000)
-        daemon = make_daemon(pid=1000, last_build_end=NOW - 5 * HOUR, peer_pids=[2000])
+        daemon = make_daemon(pid=1000, last_build_end=NOW - 5 * HOUR,
+                           peer_conns=[make_peer(2000, "client")])
         state = {
             "daemons": {
                 "1000": {"first_seen": NOW - 5 * HOUR, "cpu_ticks": 1000},
@@ -397,7 +396,8 @@ class TestClassifyPeerGraph(unittest.TestCase):
     def test_idle_peer_does_not_protect(self):
         """Peer-кандидат (тоже простаивает) не защищает — иначе ничего не убить."""
         peer = make_daemon(pid=2000, last_build_end=NOW - 5 * HOUR, cpu_ticks=1000)
-        daemon = make_daemon(pid=1000, last_build_end=NOW - 5 * HOUR, peer_pids=[2000])
+        daemon = make_daemon(pid=1000, last_build_end=NOW - 5 * HOUR,
+                           peer_conns=[make_peer(2000, "client")])
         state = {
             "daemons": {
                 "1000": {"first_seen": NOW - 5 * HOUR, "cpu_ticks": 1000},
@@ -410,7 +410,8 @@ class TestClassifyPeerGraph(unittest.TestCase):
 
     def test_peer_outside_daemon_list_protects(self):
         """Неизвестный peer (клиент сборки/IDE) — защита."""
-        daemon = make_daemon(pid=1000, last_build_end=NOW - 5 * HOUR, peer_pids=[999999])
+        daemon = make_daemon(pid=1000, last_build_end=NOW - 5 * HOUR,
+                           peer_conns=[make_peer(999999, "ide")])
         state = {"daemons": {"1000": {"first_seen": NOW - 5 * HOUR, "cpu_ticks": 1000}}}
         decisions = reaper.classify([daemon], state, NOW, self.cfg)
         self.assertFalse(decisions[0].kill)

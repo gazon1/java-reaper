@@ -25,16 +25,10 @@ ROOT = os.path.dirname(HERE)
 SCRIPT = os.path.join(ROOT, "java-reaper")
 
 
-def _load_module():
-    loader = importlib.machinery.SourceFileLoader("java_reaper", SCRIPT)
-    spec = importlib.util.spec_from_file_location("java_reaper", SCRIPT, loader=loader)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["java_reaper"] = module
-    loader.exec_module(module)
-    return module
+sys.path.insert(0, HERE)
 
+import _api as reaper  # noqa: E402
 
-reaper = _load_module()
 DEFAULTS = reaper.DEFAULTS
 Daemon = reaper.Daemon
 Decision = reaper.Decision
