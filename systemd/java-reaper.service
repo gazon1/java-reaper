@@ -1,0 +1,9 @@
+[Unit]
+Description=Reap stale Gradle/Kotlin daemons
+Documentation=file://%h/dev/java-reaper/README.md
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/java-reaper
+WorkingDirectory=%h
+TimeoutStartSec=120

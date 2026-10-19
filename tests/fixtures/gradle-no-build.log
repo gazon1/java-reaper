@@ -1,0 +1,2 @@
+2026-10-04T11:58:00.000+0300 [org.gradle.launcher.daemon.registry.DaemonRegistry] Registered daemon.
+2026-10-04T11:58:00.100+0300 [org.gradle.launcher.daemon.server.exec.ExecuteBuild] Daemon started, waiting for a build.

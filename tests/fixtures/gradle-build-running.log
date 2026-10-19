@@ -1,0 +1,4 @@
+2026-10-04T12:00:00.101+0300 [org.gradle.internal.operations.DefaultBuildOperationRunner] Starting Build operation 'Run build'.
+2026-10-04T12:00:01.500+0300 [org.gradle.launcher.daemon.server.DefaultIncomingConnectionHandler] Received command: Build{id=195ce98f, currentDir=/tmp/x}
+2026-10-04T12:00:09.000+0300 [org.gradle.cache.internal.DefaultFileLockManager] Waiting to acquire shared lock on daemon addresses registry.
+2026-10-04T12:00:09.100+0300 [org.gradle.cache.internal.DefaultFileLockManager] Lock acquired on daemon addresses registry.
