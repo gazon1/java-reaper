@@ -1,0 +1,21 @@
+# Сторож java-reaper: работает через crond (системный сервис), минуя
+# user-менеджер. Нужен потому, что user-менеджер на этой машине уже
+# зависал (busy-loop) — тогда молча умирают все user-юниты, включая
+# таймер рейпера, и «нечего убивать» неотличимо от «рейпер не работает».
+#
+# Установка:
+#   crontab -l > /tmp/reaper-cron.txt
+#   cat /tmp/reaper-cron.txt ~/dev/java-reaper/crontab.example >> /tmp/reaper-cron.txt
+#   crontab /tmp/reaper-cron.txt
+#
+# Проверка:
+#   crontab -l | grep java-reaper
+#   tail -20 ~/.local/state/java-reaper/watchdog.log
+#
+# Сторож: проверяет, что свипы идут; если рейпер замолчал (последний
+# свип старше двух интервалов) — выполняет свип сам. Аварийный тормоз
+# (~/.config/java-reaper/disabled) действует и на сторожа: он молчит.
+#
+# Пути в примере — для машины пользователя max; поправь на свои.
+
+*/5 * * * * /usr/bin/python3 /home/max/dev/java-reaper/tools/watchdog.py >> /home/max/.local/state/java-reaper/watchdog.log 2>&1
