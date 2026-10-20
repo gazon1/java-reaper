@@ -22,10 +22,11 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import time
 from typing import Any
 
+from .logfiles import (instance_from_log_name, instance_of, pid_for,
+                       pid_from_log_name)
 from .logparse import Markers, parse_line_ts, scan_file
 from .targets import ACTIVITY_MARKERS, TargetSet, builtin_targets
 
@@ -121,6 +122,15 @@ def summarize_builds(path: str, spec: Any, pid: int | None = None,
         "builds": builds,
         "unclosed_builds": scan.unclosed_builds,
         "canceled_at": scan.canceled_at,
+        # Как восстанавливать промежутки жизни этой сводки: по сборкам или
+        # по корзинам активности. Раньше это определялось по наличию ключа
+        # в словаре, и смена формы сводки тихо ломала бы разбор истории.
+        "activity_kind": "builds",
+        # Пороги, по которым жил этот демон. Без них история не самодостаточна:
+        # «умер ли демон сам» и «простой ли он дольше порога» пришлось бы
+        # угадывать по нынешним настройкам, а те со временем меняются.
+        "self_timeout_seconds": getattr(spec, "self_timeout_seconds", None),
+        "idle_seconds": getattr(spec, "idle_seconds", None),
         "summary_at": time.time(),
     }
     return record
@@ -153,6 +163,10 @@ def summarize_activity(path: str, spec: Any, instance: str | None = None
         "last_activity": last,
         "activity": spans,
         "bucket_seconds": bucket_seconds,
+        # См. пояснение в summarize_builds: вид активности и пороги цели.
+        "activity_kind": "activity",
+        "self_timeout_seconds": getattr(spec, "self_timeout_seconds", None),
+        "idle_seconds": getattr(spec, "idle_seconds", None),
         "summary_at": time.time(),
     }
 
@@ -189,14 +203,23 @@ def effective_canceled(record: dict[str, Any]) -> float | None:
 def intervals(record: dict[str, Any]) -> list[tuple[float, float]]:
     """Интервалы активности демона из сводки — единая модель для всех видов.
 
-    Два вида моделей, и выбирается по содержанию сводки, а не по имени вида:
+    Два вида моделей:
       * «builds» — интервалы сборок (демон пишет маркеры начала/конца);
       * «activity» — корзины активности (признак активности — mtime лога).
+
+    Какой — решает поле `activity_kind` в сводке. Раньше модель выбиралась по
+    наличию ключа в словаре, то есть по содержанию: смена формы сводки
+    тихо ломала бы разбор истории, и заметить это можно было бы только
+    по испортившимся цифрам. У старых записей поля нет — там разбираемся
+    по содержанию, как раньше (история уже накоплена, выбрасывать её нельзя).
     """
     out: list[tuple[float, float]] = []
-    builds = record.get("builds")
-    if builds:
-        for build in builds:
+    model = record.get("activity_kind")
+    if model is None:
+        # Старая запись: определяем модель по содержанию.
+        model = "builds" if record.get("builds") else "activity"
+    if model == "builds":
+        for build in record.get("builds") or []:
             start = float(build[0])
             end = build[1]
             if end is None:
@@ -281,13 +304,13 @@ def summarize_by_path(path: str, kind: str | None = None,
     name = os.path.basename(path)
     if kind == "gradle" or name.startswith("daemon-"):
         version = os.path.basename(os.path.dirname(path))
-        pid = _pid_from_log_name(path)
+        pid = pid_from_log_name(path)
         try:
             return summarize_gradle(path, pid=pid, version=version)
         except OSError:
             return None
     if name.startswith("kotlin-daemon."):
-        instance = _instance_from_log_name(path)
+        instance = instance_from_log_name(path)
         try:
             return summarize_kotlin(path, instance=instance)
         except OSError:
@@ -301,19 +324,7 @@ def _pid_for(path: str, spec: Any) -> int | None:
     У цели PID в имени лога может быть настоящим (Gradle), а может и нет
     (Kotlin) — тогда это «неизвестно», а не «демон без PID».
     """
-    pattern = str(getattr(spec, "log_pid_regex", "") or "")
-    if pattern:
-        try:
-            match = re.compile(pattern).match(os.path.basename(path))
-        except re.error:
-            match = None
-        if match:
-            raw = match.groupdict().get("pid")
-            try:
-                return int(raw)  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                return None
-    return _pid_from_log_name(path)
+    return pid_for(spec, path)
 
 
 def _instance_for(path: str, spec: Any) -> str | None:
@@ -323,35 +334,7 @@ def _instance_for(path: str, spec: Any) -> str | None:
     инстанс (у Kotlin — метка инстанса, у неё ротация файлов .00/.01).
     Если регулярки нет — берём имя файла, как раньше.
     """
-    pattern = str(getattr(spec, "log_group_regex", "") or "")
-    if pattern:
-        try:
-            match = re.compile(pattern).match(os.path.basename(path))
-        except re.error:
-            match = None
-        if match:
-            group = match.groupdict().get("group")
-            if group:
-                return group
-    return _instance_from_log_name(path)
-
-
-def _pid_from_log_name(path: str) -> int | None:
-    """PID из имени лога Gradle (`daemon-<pid>.out.log`)."""
-    name = os.path.basename(path)
-    try:
-        return int(name.split("-")[1].split(".")[0])
-    except (IndexError, ValueError):
-        return None
-
-
-def _instance_from_log_name(path: str) -> str | None:
-    """Инстанс из имени лога Kotlin (`kotlin-daemon.…-<инстанс>.<N>.log`)."""
-    name = os.path.basename(path)
-    try:
-        return name.split("-")[-1].split(".")[0]
-    except IndexError:
-        return None
+    return instance_of(spec, path)
 
 
 def archive_daemon_log(path: str, kind: str | None, history_path: str,

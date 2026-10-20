@@ -44,10 +44,8 @@ Gradle и Kotlin не убирают свои логи: `~/.gradle/daemon` ра�
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
-import re
 import sys
 import time
 from typing import Any
@@ -62,16 +60,14 @@ from reaper.history import (  # noqa: E402
     history_keys,
     summarize_by_path,
 )
+from reaper.logfiles import (  # noqa: E402
+    discover,
+    group_of as group_of_spec,
+    is_forbidden,
+    is_target_process,
+    pid_of,
+)
 from reaper.targets import TargetSet, load_targets  # noqa: E402
-
-
-def proc_cmdline(pid: int) -> str:
-    """Командная строка процесса (пустая, если процесса нет)."""
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as fh:
-            return fh.read().decode("utf-8", "replace").replace("\0", " ")
-    except OSError:
-        return ""
 
 
 def is_live_daemon(pid: int, spec: Any, targets: TargetSet) -> bool:
@@ -79,13 +75,9 @@ def is_live_daemon(pid: int, spec: Any, targets: TargetSet) -> bool:
 
     PID мог быть переиспользован другим процессом — тогда демон мёртв,
     даже если PID существует. Поэтому проверяем не «существует ли PID», а
-    «похож ли процесс на демон этой цели».
+    «похож ли процесс на демон этой цели» (общий модуль `logfiles`).
     """
-    cmdline = proc_cmdline(pid)
-    if not cmdline:
-        return False
-    matched = targets.match(cmdline)
-    return matched is not None and matched.name == spec.name
+    return is_target_process(pid, spec, targets)
 
 
 def open_paths_under(dirs: list[str]) -> set[str]:
@@ -117,26 +109,6 @@ def open_paths_under(dirs: list[str]) -> set[str]:
     return out
 
 
-def _expand(pattern: str) -> list[str]:
-    """Раскрывает шаблон пути с «~» и wildcards."""
-    return sorted(glob.glob(os.path.expanduser(pattern)))
-
-
-def iter_logs(spec: Any, overrides: dict[str, list[str]] | None = None
-              ) -> list[str]:
-    """Все файлы логов цели — по её шаблонам (log_globs)."""
-    patterns = (overrides or {}).get(spec.name) or list(spec.log_globs)
-    out: list[str] = []
-    seen: set[str] = set()
-    for pattern in patterns:
-        for path in _expand(pattern):
-            if path in seen or not os.path.isfile(path):
-                continue
-            seen.add(path)
-            out.append(path)
-    return out
-
-
 def group_of(spec: Any, path: str) -> str:
     """Ключ группы файлов одного демона.
 
@@ -144,39 +116,12 @@ def group_of(spec: Any, path: str) -> str:
     и живой демон держит открытым только последний. Если судить по каждому
     файлу отдельно, мы удалили бы логи живого демона. Поэтому у цели есть
     регулярка группировки; если её нет — файл сам себе группа.
+
+    Запасной вариант («файл сам себе группа») живёт здесь, а не в общем
+    модуле: там None означает «группу определить нельзя», и для истории
+    это другое значение, чем для уборки.
     """
-    if not spec.log_group_regex:
-        return path
-    try:
-        pattern = re.compile(spec.log_group_regex)
-    except re.error:
-        return path
-    match = pattern.match(os.path.basename(path))
-    if not match:
-        return path
-    return match.groupdict().get("group") or path
-
-
-def pid_of(spec: Any, path: str) -> int | None:
-    """PID демона из имени файла (если у цели он настоящий)."""
-    if not spec.log_pid_regex:
-        return None
-    try:
-        pattern = re.compile(spec.log_pid_regex)
-    except re.error:
-        return None
-    match = pattern.match(os.path.basename(path))
-    if not match:
-        return None
-    try:
-        return int(match.groupdict().get("pid"))
-    except (TypeError, ValueError):
-        return None
-
-
-def is_forbidden(spec: Any, name: str) -> bool:
-    """Файл из «неприкосновенного» списка цели."""
-    return any(name.startswith(prefix) for prefix in spec.forbidden_prefixes)
+    return group_of_spec(spec, path) or path
 
 
 def collect(targets: TargetSet, min_age_seconds: float, now: float,
@@ -186,7 +131,7 @@ def collect(targets: TargetSet, min_age_seconds: float, now: float,
     """Собирает план уборки: логи мёртвых демонов, которые не жалко удалить."""
     plan: list[dict[str, Any]] = []
     for spec in targets.specs():
-        paths = iter_logs(spec, overrides)
+        paths = discover(spec, overrides)
         if not paths:
             continue
         if open_paths is None:
