@@ -220,6 +220,52 @@ class TargetSet:
         """Подписи видов для отчётов (по умолчанию — имя цели)."""
         return {name: (spec.label or name) for name, spec in self._specs.items()}
 
+    def describe(self) -> dict[str, Any]:
+        """Цели для отчёта — сгруппированные по смыслу.
+
+        У цели 25 полей, и в плоском виде отчёт превращается в простыню.
+        Здесь они собраны по группам: «как узнаём», «где логи», «как работает»,
+        «пороги», «безопасность» — так видно, что цель умеет и по каким
+        правилам живёт.
+        """
+        out: dict[str, Any] = {}
+        for name, spec in self._specs.items():
+            out[name] = {
+                "label": spec.label or name,
+                "match": {
+                    "cmdline": spec.match_cmdline,
+                    "comm": spec.match_comm,
+                },
+                "log": {
+                    "name_regex": spec.log_name_regex,
+                    "globs": list(spec.log_globs),
+                    "group_regex": spec.log_group_regex,
+                    "pid_regex": spec.log_pid_regex,
+                    "forbidden_prefixes": list(spec.forbidden_prefixes),
+                    "trim": spec.log_trim,
+                },
+                "work": {
+                    "activity": spec.activity,
+                    "ts_format": spec.ts_format,
+                    "build_start": spec.build_start,
+                    "build_end": spec.build_end,
+                },
+                "limits": {
+                    "idle_seconds": spec.idle_seconds,
+                    "recreate_cost_seconds": spec.recreate_cost_seconds,
+                    "build_active_seconds": spec.build_active_seconds,
+                    "stuck_after_seconds": spec.stuck_after_seconds,
+                    "min_footprint_mb": spec.min_footprint_mb,
+                    "large_daemon_mb": spec.large_daemon_mb,
+                    "self_timeout_seconds": spec.self_timeout_seconds,
+                },
+                "safety": {
+                    "rebuildable": spec.rebuildable,
+                    "protects": list(spec.protects),
+                },
+            }
+        return out
+
     def __len__(self) -> int:
         return len(self._specs)
 
@@ -280,40 +326,73 @@ def _spec_from_dict(raw: dict[str, Any], warnings: list[str],
             return getattr(base, field_name)
         return default
 
-    protects = field("protects", ())
-    if isinstance(protects, str):
-        protects = (protects,)
+    # Поля цели разложены по секциям — «как узнаём», «где логи», «как работает»,
+    # «пороги», «безопасность». Каждая секция разбирается своим маленьким
+    # помощником: так видно, к какой группе относится поле, и новое поле
+    # сразу находит себе место (раньше всё было в одной простыне на 25 полей).
+    def match_fields() -> dict[str, Any]:
+        return {
+            "match_cmdline": str(field("match_cmdline", "")),
+            "match_comm": str(field("match_comm", "")),
+        }
+
+    def log_fields() -> dict[str, Any]:
+        return {
+            "log_name_regex": str(field("log_name_regex", "")),
+            "log_trim": bool(field("log_trim", False)),
+            "log_globs": _str_tuple(field("log_globs", ())),
+            "log_group_regex": str(field("log_group_regex", "")),
+            "log_pid_regex": str(field("log_pid_regex", "")),
+            "forbidden_prefixes": _str_tuple(field("forbidden_prefixes", ())),
+        }
+
+    def work_fields() -> dict[str, Any]:
+        return {
+            "activity": str(field("activity", ACTIVITY_MTIME)),
+            "ts_format": str(field("ts_format", TS_ISO)),
+            "build_start": str(field("build_start", "")),
+            "build_end": str(field("build_end", "")),
+            "build_end_alt": str(field("build_end_alt", "")),
+            "cancel": str(field("cancel", "")),
+            "bucket_seconds": (int(field("bucket_seconds", 0) or 0)
+                               if str(field("bucket_seconds", 0) or 0).isdigit()
+                               else 0),
+        }
+
+    def limit_fields() -> dict[str, Any]:
+        return {
+            "idle_seconds": _optional_float(field("idle_seconds", None)),
+            "recreate_cost_seconds": _optional_float(
+                field("recreate_cost_seconds", None)),
+            "build_active_seconds": _optional_float(
+                field("build_active_seconds", None)),
+            "stuck_after_seconds": _optional_float(
+                field("stuck_after_seconds", None)),
+            "min_footprint_mb": (None if field("min_footprint_mb", None) in (None, "")
+                                 else int(field("min_footprint_mb", 0))),
+            "large_daemon_mb": (None if field("large_daemon_mb", None) in (None, "")
+                                else int(field("large_daemon_mb", 0))),
+            "self_timeout_seconds": _optional_float(
+                field("self_timeout_seconds", None)),
+        }
+
+    def safety_fields() -> dict[str, Any]:
+        protects = field("protects", ())
+        if isinstance(protects, str):
+            protects = (protects,)
+        return {
+            "protects": tuple(str(p) for p in protects),
+            "rebuildable": bool(field("rebuildable", False)),
+        }
+
     spec = TargetSpec(
         name=name,
         label=str(field("label", "")),
-        match_cmdline=str(field("match_cmdline", "")),
-        match_comm=str(field("match_comm", "")),
-        log_name_regex=str(field("log_name_regex", "")),
-        activity=str(field("activity", ACTIVITY_MTIME)),
-        ts_format=str(field("ts_format", TS_ISO)),
-        build_start=str(field("build_start", "")),
-        build_end=str(field("build_end", "")),
-        build_end_alt=str(field("build_end_alt", "")),
-        cancel=str(field("cancel", "")),
-        idle_seconds=_optional_float(field("idle_seconds", None)),
-        recreate_cost_seconds=_optional_float(field("recreate_cost_seconds", None)),
-        build_active_seconds=_optional_float(field("build_active_seconds", None)),
-        stuck_after_seconds=_optional_float(field("stuck_after_seconds", None)),
-        min_footprint_mb=(None if field("min_footprint_mb", None) in (None, "")
-                          else int(field("min_footprint_mb", 0))),
-        large_daemon_mb=(None if field("large_daemon_mb", None) in (None, "")
-                         else int(field("large_daemon_mb", 0))),
-        self_timeout_seconds=_optional_float(field("self_timeout_seconds", None)),
-        protects=tuple(str(p) for p in protects),
-        rebuildable=bool(field("rebuildable", False)),
-        log_trim=bool(field("log_trim", False)),
-        log_globs=_str_tuple(field("log_globs", ())),
-        log_group_regex=str(field("log_group_regex", "")),
-        log_pid_regex=str(field("log_pid_regex", "")),
-        forbidden_prefixes=_str_tuple(field("forbidden_prefixes", ())),
-        bucket_seconds=(int(field("bucket_seconds", 0) or 0)
-                        if str(field("bucket_seconds", 0) or 0).isdigit()
-                        else 0),
+        **match_fields(),
+        **log_fields(),
+        **work_fields(),
+        **limit_fields(),
+        **safety_fields(),
     )
     if not spec.match_cmdline and not spec.match_comm:
         warnings.append(f"цели: у «{name}» нет ни match_cmdline, ни match_comm "

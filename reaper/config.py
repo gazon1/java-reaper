@@ -283,11 +283,31 @@ def idle_limit(cfg: dict[str, Any], kind: str) -> float:
     2 ч — заведомо выше «живого» простоя (p99.9 = 100 мин).
 
     Это плоская (legacy) версия: она читает только плоский конфиг и не знает
-    про targets.yaml. Основной путь — `resolve_targets`.
+    про targets.yaml. Основной путь — `idle_limit_for_kind`.
     """
     if kind == "kotlin":
         return float(cfg.get("KOTLIN_IDLE_SECONDS", cfg["IDLE_SECONDS"]))
     return float(cfg["IDLE_SECONDS"])
+
+
+def idle_limit_for_kind(cfg: dict[str, Any], kind: str,
+                        targets: "TargetSet | None" = None) -> float:
+    """Порог простоя для вида демона — единственное место, где он считается.
+
+    Описание цели (targets.yaml) важнее плоского ключа конфига, а плоский
+    ключ — запасной путь. Раньше это считалось в пяти местах по-разному, и
+    одно из них (аудит, который решает «критерий приёмки выполнен») про
+    описание цели вообще забывало: при пороге, заданном в YAML, аудит
+    сравнивал бы демонов с другим числом.
+
+    После `resolve_targets` обе дороги дают одно число (там уже применён
+    приоритет ключей), но считать его надо в одном месте.
+    """
+    if targets is not None:
+        spec = targets.get(kind)
+        if spec is not None and spec.idle_seconds is not None:
+            return float(spec.idle_seconds)
+    return float(idle_limit(cfg, kind))
 
 
 # Ключи конфига, влияющие на решения по ЛЮБОМУ виду демонов. Меняются —

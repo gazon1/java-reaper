@@ -14,7 +14,8 @@ import os
 from dataclasses import replace
 from typing import Any
 
-from .config import allowlist, idle_limit as idle_limit_for, legacy_cost_key
+from .config import (allowlist, idle_limit_for_kind as _idle_limit_for_kind,
+                    legacy_cost_key)
 from .model import (ACTIVITY_MARKERS, ACTIVITY_MTIME, Action, Context, Daemon,
                     Decision, Protector, observed_activity)
 from .proc import mem_available_mb
@@ -43,12 +44,12 @@ def recreate_cost(cfg: dict[str, Any], kind: str,
 
 def idle_limit_for_kind(cfg: dict[str, Any], kind: str,
                         targets: TargetSet | None = None) -> float:
-    """Порог простоя для вида демона (секунды)."""
-    if targets is not None:
-        spec = targets.get(kind)
-        if spec is not None and spec.idle_seconds is not None:
-            return float(spec.idle_seconds)
-    return float(idle_limit_for(cfg, kind))
+    """Порог простоя для вида демона (секунды).
+
+    Обёртка над `config.idle_limit_for_kind` — там это считается в одном
+    месте, чтобы отчёт, аудит и правила не разъезжались.
+    """
+    return _idle_limit_for_kind(cfg, kind, targets)
 
 
 def _activity_of(d: Daemon, targets: TargetSet | None) -> str:

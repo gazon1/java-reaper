@@ -1018,7 +1018,7 @@ class TestKindSummary(unittest.TestCase):
         decisions = [reaper.Decision(g, True, "простой")]
         payload = _json.loads(reaper.format_json(decisions, {"metric": {}},
                                                  self.cfg, now=NOW))
-        self.assertEqual(payload["schema_version"], 3)
+        self.assertEqual(payload["schema_version"], 4)
         self.assertIn("kinds", payload)
         self.assertEqual(payload["kinds"]["gradle"]["count"], 1)
         self.assertEqual(payload["config"]["KOTLIN_IDLE_SECONDS"], 7200)
@@ -1042,7 +1042,7 @@ class TestKindSummary(unittest.TestCase):
 
     def test_schema_version_is_public(self):
         """Потребитель JSON обязан видеть версию схемы, а не угадывать."""
-        self.assertEqual(reaper.JSON_SCHEMA_VERSION, 3)
+        self.assertEqual(reaper.JSON_SCHEMA_VERSION, 4)
 
 
 # --------------------------------------------------------------------------- #

@@ -549,5 +549,40 @@ class TestHealthBranches(unittest.TestCase):
         self.assertIn("1024", text)
 
 
+class TestPathPrivacy(unittest.TestCase):
+    """В машинном выводе домашнего пути пользователя быть не должно.
+
+    Путь к логу нужен (видно, где лежит), но домашний каталог раскрывает имя
+    пользователя и раскладку его рабочих каталогов — в публичном отчёте этому
+    не место.
+    """
+
+    def test_home_prefix_is_cut(self):
+        home = os.path.expanduser("~")
+        self.assertEqual(reaper.redact_home(f"{home}/.gradle/x.log"),
+                         "~/.gradle/x.log")
+
+    def test_path_outside_home_is_untouched(self):
+        self.assertEqual(reaper.redact_home("/tmp/kotlin-daemon.log"),
+                         "/tmp/kotlin-daemon.log")
+
+    def test_empty_path_stays_empty(self):
+        self.assertIsNone(reaper.redact_home(None))
+        self.assertEqual(reaper.redact_home(""), "")
+
+    def test_json_daemon_record_has_no_home_path(self):
+        cfg = dict(reaper.DEFAULTS)
+        home = os.path.expanduser("~")
+        d = reaper.Daemon(pid=1, kind="gradle", rss_mb=100, swap_mb=0,
+                          cpu_ticks=1, starttime=1,
+                          log_path=f"{home}/.gradle/daemon/9.7.1/daemon-1.out.log")
+        dec = reaper.Decision(d, False, "тест")
+        payload = json.loads(reaper.format_json([dec], {"metric": {}}, cfg))
+        record = payload["daemons"][0]
+        self.assertTrue(record["log_path"].startswith("~/"),
+                        f"домашний путь утёк: {record['log_path']}")
+        self.assertNotIn(home, record["log_path"])
+
+
 if __name__ == "__main__":
     unittest.main()

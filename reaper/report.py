@@ -7,15 +7,18 @@ import os
 import time
 from typing import Any
 
-from .config import idle_limit as idle_limit_for
-from .model import Decision
+from .config import idle_limit_for_kind
+from .model import ACTIVITY_MARKERS, Decision
 from .policy import default_policy
 from .state import read_kills
 from .targets import TargetSet, builtin_targets
 
 # Версия схемы машинного вывода: потребитель (агент, скрипт) обязан понимать,
 # что формат изменился, а не молча получить «поле пропало».
-JSON_SCHEMA_VERSION = 3
+#
+# 4 — log_path стал путём относительно домашнего каталога (`~/…`): домашний
+#     путь пользователя в машинном выводе не светится.
+JSON_SCHEMA_VERSION = 4
 
 # Критерий перехода из dry-run в kill-режим.
 # Значения по умолчанию; переопределяются конфигом (PILOT_MIN_EVENTS,
@@ -47,9 +50,7 @@ def kind_summary(decisions: list[Decision], cfg: dict[str, Any],
         items = [d for d in decisions if d.daemon.kind == kind]
         kill = [d for d in items if d.kill]
         spec = target_set.get(kind)
-        limit = (spec.idle_seconds if spec is not None
-                 and spec.idle_seconds is not None
-                 else idle_limit_for(cfg, kind))
+        limit = idle_limit_for_kind(cfg, kind, target_set)
         out[kind] = {
             "label": labels.get(kind, kind),
             "count": len(items),
@@ -98,9 +99,7 @@ def format_status(decisions: list[Decision], state: dict[str, Any],
             continue
         kill = [d for d in items if d.kill]
         spec = target_set.get(kind)
-        limit = (spec.idle_seconds if spec is not None
-                 and spec.idle_seconds is not None
-                 else (idle_limit_for(cfg, kind) if cfg else 0.0))
+        limit = idle_limit_for_kind(cfg, kind, target_set) if cfg else 0.0
         limit_txt = f", порог простоя {limit / 3600:.0f} ч" if limit else ""
         lines.append(f"  {labels.get(kind, kind)}: {len(items)} шт, "
                      f"{sum(d.daemon.footprint_mb for d in items)} МБ, "
@@ -134,6 +133,22 @@ def format_status(decisions: list[Decision], state: dict[str, Any],
     return "\n".join(lines)
 
 
+def redact_home(path: str | None) -> str | None:
+    """Путь без домашнего каталога: `/home/max/x` → `~/x`.
+
+    Приватность машинного вывода: домашний путь раскрывает имя пользователя
+    и раскладку его рабочих каталогов, а в отчёте он не нужен — нужен сам
+    путь. Поэтому путь остаётся (видно, где лежит лог), но без домашнего
+    каталога. Внутренние пути и UID в вывод не попадают.
+    """
+    if not path:
+        return path
+    home = os.path.expanduser("~")
+    if home and home not in ("/", "") and path.startswith(home):
+        return "~" + path[len(home):]
+    return path
+
+
 def decision_to_dict(dec: Decision) -> dict[str, Any]:
     d = dec.daemon
     return {
@@ -163,7 +178,7 @@ def decision_to_dict(dec: Decision) -> dict[str, Any]:
              "age_seconds": c.age}
             for c in d.peer_conns
         ],
-        "log_path": d.log_path,
+        "log_path": redact_home(d.log_path),
         "stuck_build": bool(d.stuck_build),
         "canceled_at": d.canceled_at,
         "recreate_cost_seconds": dec.recreate_cost_seconds,
@@ -246,9 +261,7 @@ def format_explain(cfg: dict[str, Any],
     lines.append("")
     limits = []
     for name, spec in target_set.specs_by_name().items():
-        limit = spec.idle_seconds
-        if limit is None:
-            limit = idle_limit_for(cfg, name)
+        limit = idle_limit_for_kind(cfg, name, target_set)
         notes = []
         if spec.self_timeout_seconds:
             notes.append(f"свой idle-таймаут {spec.self_timeout_seconds / 60:.0f} мин")
@@ -273,6 +286,43 @@ def format_explain(cfg: dict[str, Any],
                       for name, spec in target_set.specs_by_name().items()
                       if spec.recreate_cost_seconds)
     lines.append(f"цена воссоздания: {costs} (влияет на порядок уборки)")
+
+    # Описание целей по секциям: так видно, что цель умеет и по каким
+    # правилам живёт, — ровно то, что нужно проверить после правки YAML.
+    lines.append("")
+    lines.append("Цели:")
+    for name, spec in target_set.specs_by_name().items():
+        lines.append(f"  {labels.get(name, name)} ({name}):")
+        match = []
+        if spec.match_cmdline:
+            match.append(f"cmdline «{spec.match_cmdline}»")
+        if spec.match_comm:
+            match.append(f"команда «{spec.match_comm}»")
+        lines.append("    узнаём по: " + (", ".join(match) if match else "—"))
+        log_bits = []
+        if spec.log_name_regex:
+            log_bits.append(f"имя «{spec.log_name_regex}»")
+        if spec.log_globs:
+            log_bits.append(f"{len(spec.log_globs)} шаблон(ов) путей")
+        if spec.log_pid_regex:
+            log_bits.append("PID из имени файла")
+        if spec.log_group_regex:
+            log_bits.append("группировка по инстансу")
+        if spec.forbidden_prefixes:
+            log_bits.append(f"{len(spec.forbidden_prefixes)} неприкосновенных префикс(ов)")
+        lines.append("    логи: " + (", ".join(log_bits) if log_bits else "своих логов нет"))
+        if spec.activity == ACTIVITY_MARKERS:
+            work = f"маркеры работы (начало «{spec.build_start or '—'}»)"
+        else:
+            work = f"активность по mtime лога, формат {spec.ts_format}"
+        lines.append("    работа: " + work)
+        safety = []
+        safety.append("пересоздаваемый" if spec.rebuildable
+                      else "НЕ пересоздаваемый (убивать нельзя)")
+        if spec.protects:
+            safety.append("защищает: "
+                          + ", ".join(labels.get(k, k) for k in spec.protects))
+        lines.append("    безопасность: " + ", ".join(safety))
     return "\n".join(lines)
 
 
@@ -407,10 +457,7 @@ def audit_report(cfg: dict[str, Any], decisions: list[Decision],
     labels = target_set.labels()
 
     def limit_of(kind: str) -> float:
-        spec = target_set.get(kind)
-        if spec is not None and spec.idle_seconds is not None:
-            return float(spec.idle_seconds)
-        return float(idle_limit_for(cfg, kind))
+        return idle_limit_for_kind(cfg, kind, target_set)
 
     stale = [dec for dec in decisions
              if dec.idle_seconds is not None
