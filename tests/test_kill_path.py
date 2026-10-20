@@ -133,6 +133,9 @@ class TestKillPath(unittest.TestCase):
             "MIN_FOOTPRINT_MB=0",
             "BUSY_CPU_SECONDS=1000",
             "GRACE_SECONDS=1",
+            # Память: «всегда убирать» — иначе исход теста зависел бы от
+            # того, сколько памяти свободно на машине, где он идёт.
+            "MEMORY_PRESSURE_MB=0",
             f"STATE_DIR={self.state}",
             f"LOCK_PATH={os.path.join(self.tmp, 'lock')}",
             f"PID_ALLOWLIST={allow}",
@@ -185,7 +188,9 @@ class TestKillPath(unittest.TestCase):
         детерминированно, прямым вызовом execute() (см. следующий тест).
         """
         fake = self.fake("kotlin", mode="stubborn")
-        self.write_cfg(str(fake.proc.pid))
+        # Защита «идёт сборка Gradle» выключена: иначе исход зависел бы от
+        # того, собирает ли что-то на машине в этот момент.
+        self.write_cfg(str(fake.proc.pid), GRADLE_BUILD_ACTIVE_SECONDS=0)
         run_reaper(self.cfg, "--mode=dry-run")
         proc = run_reaper(self.cfg, "--mode=kill")
         if "идёт сборка Gradle" in proc.stdout:

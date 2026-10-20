@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable
 
-from .model import Action, Protector
+from .model import Action, Context, Protector
 
 
 @dataclass
@@ -49,14 +49,12 @@ class Signals:
     stuck_build: bool = False
     # Сколько секунд прошло с момента отмены сборки.
     stuck_age: float = 0.0
-    # Идёт ли где-то сборка Gradle. Это КОНТЕКСТ всего набора демонов, а не
-    # признак самого демона: пока идёт сборка, компилятор нужен, и убивать
-    # Kotlin-демоны нельзя (иначе сборка упадёт посреди компиляции).
-    gradle_building: bool = False
-    # Сколько секунд прошло с начала той сборки Gradle (None — сборки нет).
-    # Защита действует только пока сборка «свежая»: зависшая намертво
-    # сборка — не причина блокировать уборку Kotlin-навсегда.
-    gradle_build_age: float | None = None
+    # Контекст всего набора демонов: свободная память, свежая сборка
+    # Gradle. Правила читают его, а не каждый демон сам по себе.
+    context: Context = field(default_factory=Context)
+    # Цена ошибки: сколько секунд стоит воссоздать этого демона (холодный
+    # старт). Влияет на порядок уборки, а не на сам факт.
+    recreate_cost_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -95,6 +93,8 @@ def default_policy(cfg: dict) -> list[Rule]:
     stuck_after = float(cfg.get("STUCK_AFTER_SECONDS", 3600))
     build_active = float(cfg.get("GRADLE_BUILD_ACTIVE_SECONDS", 1800))
     min_footprint = int(cfg["MIN_FOOTPRINT_MB"])
+    pressure_mb = int(cfg.get("MEMORY_PRESSURE_MB", 4096))
+    large_mb = int(cfg.get("KILL_LARGE_DAEMON_MB", 4096))
     peer_max_age = float(cfg.get("PEER_MAX_AGE_SECONDS", 21600))
 
     def not_allowed(s: Signals) -> bool:
@@ -142,14 +142,32 @@ def default_policy(cfg: dict) -> list[Rule]:
         начавшаяся несколько часов назад и не завершившаяся, — это
         зависший демон, и он сам подлежит уборке.
         """
-        if not s.gradle_building or s.daemon.kind != "kotlin":
+        if s.daemon.kind != "kotlin":
             return False
-        if s.gradle_build_age is None:
-            return True
-        return s.gradle_build_age <= build_active
+        age = s.context.gradle_build_age
+        if age is None:
+            return False
+        return age <= build_active
 
     def always(s: Signals) -> bool:
         return True
+
+    def memory_not_needed(s: Signals) -> bool:
+        """Памяти хватает, а демон небольшой — убирать незачем.
+
+        Рейпер существует ради памяти: если свободной памяти достаточно,
+        а демон занимает мало, то его убийство — это только цена (холодный
+        старт) без выгоды. Крупные демоны убираются в любом случае:
+        столько памяти жалко держать простаивающим.
+        """
+        available = s.context.mem_available_mb
+        if available is None:
+            return False  # не измерили — ведём себя как раньше
+        if pressure_mb <= 0:
+            return False  # режим «всегда убирать»
+        if available < pressure_mb:
+            return False  # память нужна — убираем
+        return s.daemon.footprint_mb < large_mb
 
     def stuck(s: Signals) -> bool:
         """Демон завис: клиент отвалился во время сборки.
@@ -234,11 +252,21 @@ def default_policy(cfg: dict) -> list[Rule]:
              Action.KEEP, not_idle,
              lambda s: f"простой {s.age / 60:.0f} мин < {s.idle_limit / 60:.0f} мин"),
         Rule("gradle-building",
-             "Идёт сборка Gradle — компилятор нужен прямо сейчас.",
-             "есть Gradle-демон со сборкой без конца",
+             "Идёт свежая сборка Gradle — компилятор нужен прямо сейчас.",
+             f"есть Gradle-демон со сборкой без конца, начавшейся не позже "
+             f"{build_active / 60:.0f} мин назад",
              Action.KEEP, gradle_building,
              lambda s: "идёт сборка Gradle — Kotlin-демоны не трогаю",
              protected=True),
+        Rule("memory-not-needed",
+             "Свободной памяти хватает, а демон небольшой: убивать его — "
+             "платить холодным стартом без выгоды.",
+             f"MemAvailable ≥ MEMORY_PRESSURE_MB ({pressure_mb} МБ) "
+             f"и footprint < KILL_LARGE_DAEMON_MB ({large_mb} МБ)",
+             Action.KEEP, memory_not_needed,
+             lambda s: (f"свободной памяти хватает "
+                        f"({s.context.mem_available_mb} МБ), демон небольшой — "
+                        f"не трогаю")),
         Rule("kill",
              "Все условия кандидата выполнены: простоя достаточно, памяти достаточно, "
              "демон никем не наблюдается.",
@@ -247,6 +275,8 @@ def default_policy(cfg: dict) -> list[Rule]:
              lambda s: (f"простой {s.age / 3600:.1f} ч "
                         f"(порог {s.idle_limit / 3600:.0f} ч), "
                         f"footprint {s.daemon.footprint_mb} МБ"
+                        + (f", цена воссоздания ~{s.recreate_cost_seconds:.0f} с"
+                           if s.recreate_cost_seconds else "")
                         + (", зависшая сборка (старт без конца)"
                            if s.build_in_progress else ""))),
     ]

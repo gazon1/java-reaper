@@ -11,7 +11,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from reaper.classify import classify, evaluate  # noqa: E402,F401
+from reaper.classify import build_context, classify, evaluate, recreate_cost  # noqa: E402,F401
 from reaper.collect import (  # noqa: E402,F401
     canceled_state,
     collect_daemons,
@@ -28,6 +28,7 @@ from reaper.config import (  # noqa: E402,F401
 )
 from reaper.execute import (  # noqa: E402,F401
     execute,
+    kill_order,
     open_pidfd,
     send_signal,
     still_same,
@@ -63,6 +64,7 @@ from reaper.logread import (  # noqa: E402,F401
 from reaper.model import (  # noqa: E402,F401
     Action,
     CHILD_IGNORE_EXECUTABLES,
+    Context,
     Daemon,
     Decision,
     PeerConn,
@@ -78,6 +80,7 @@ from reaper.proc import (  # noqa: E402,F401
     inode_owner_map,
     is_ignored_child,
     is_loopback,
+    mem_available_mb,
     parse_ts,
     proc_comm,
     proc_cmdline,

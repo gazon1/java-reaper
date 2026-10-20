@@ -39,18 +39,32 @@ def still_same(pid: int, starttime: int) -> bool:
             and st["state"] != "Z")
 
 
+def kill_order(decisions: list[Decision]) -> list[Decision]:
+    """Порядок уборки: по выгоде — сколько мегабайт освобождаем на секунду
+    цены воссоздания.
+
+    Дорогой Gradle-демон (холодный старт ~40 с) уступает дешёвому Kotlin-ному
+    (~5 с): тот даёт больше освобождённой памяти на единицу потраченного
+    времени. Второй ключ — Gradle первыми: их shutdown-hook чистит маркеры
+    клиентов, и это нужно сделать до того, как ляжет Kotlin-демон.
+    """
+    return sorted(decisions, key=lambda d: (
+        -(d.daemon.footprint_mb / max(d.recreate_cost_seconds, 1.0)),
+        0 if d.daemon.kind == "gradle" else 1))
+
+
 def execute(decisions: list[Decision], state: dict[str, Any], now: float,
             cfg: dict[str, Any], dry_run: bool) -> list[dict[str, Any]]:
     """Убивает подтверждённых кандидатов. Возвращает отчёт о действиях."""
     report: list[dict[str, Any]] = []
-    to_kill = [d for d in decisions if d.kill]
+    to_kill = kill_order([d for d in decisions if d.kill])
     if not to_kill:
         return report
 
     # Страховка от массовой ошибки правил: за свип — не больше N демонов.
+    # Отбор идёт по тому же порядку выгоды, что и сама уборка.
     limit = int(cfg.get("MAX_KILLS_PER_SWEEP", 3))
     if limit > 0 and len(to_kill) > limit:
-        to_kill.sort(key=lambda d: -d.daemon.footprint_mb)
         overflow = to_kill[limit:]
         to_kill = to_kill[:limit]
         for d in overflow:
@@ -60,9 +74,6 @@ def execute(decisions: list[Decision], state: dict[str, Any], now: float,
     # Защита Kotlin-демонов, если где-то идёт сборка Gradle, живёт в таблице
     # правил (правило «gradle-building»), а не здесь: решение, отчёт и
     # метрика должны говорить одно и то же.
-
-    # Порядок: сначала Gradle (их shutdown-hook чистит маркеры клиентов).
-    to_kill.sort(key=lambda d: 0 if d.daemon.kind == "gradle" else 1)
 
     handles: dict[int, int | None] = {}
     confirmed: list[Decision] = []

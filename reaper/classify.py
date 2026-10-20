@@ -11,11 +11,26 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from typing import Any
 
 from .config import allowlist, idle_limit as idle_limit_for
-from .model import Action, Daemon, Decision, Protector, observed_activity
+from .model import (Action, Context, Daemon, Decision, Protector,
+                    observed_activity)
+from .proc import mem_available_mb
 from .policy import Rule, Signals, default_policy
+
+
+def recreate_cost(cfg: dict[str, Any], kind: str) -> float:
+    """Сколько секунд стоит воссоздать демона этого класса (холодный старт).
+
+    Измерено: Gradle — 41.6 с против 2.4 с тёплого. Kotlin дешёв: это
+    старт JVM. Значение нужно, чтобы при нехватке памяти первым убирать
+    того, чьё пересоздание дешевле.
+    """
+    key = ("GRADLE_RECREATE_COST_SECONDS" if kind == "gradle"
+           else "KOTLIN_RECREATE_COST_SECONDS")
+    return float(cfg.get(key, 0) or 0)
 
 
 def _measure(d: Daemon, rec: dict[str, Any], now: float,
@@ -158,6 +173,8 @@ def evaluate(signals: Signals, rules: list[Rule]) -> Decision:
             protectors=list(signals.peer_protection),
             stale_peers=list(signals.peer_stale),
             rule=rule.name,
+            recreate_cost_seconds=signals.recreate_cost_seconds,
+            context=signals.context,
         )
     # Правил не должно быть без catch-all; на всякий случай — оставить.
     return Decision(daemon=signals.daemon,  # type: ignore[arg-type]
@@ -165,26 +182,42 @@ def evaluate(signals: Signals, rules: list[Rule]) -> Decision:
                     idle_seconds=signals.age, protected=True, rule="catch-all")
 
 
+def build_context(daemons: list[Daemon], now: float,
+                  context: Context | None = None) -> Context:
+    """Собирает контекст всего набора демонов.
+
+    Контекст — то, что невозможно знать по одному демону: сколько памяти
+    доступно системе и идёт ли где-то свежая сборка Gradle.
+
+    `context` можно передать явно — тогда тесты не зависят от того, сколько
+    памяти свободно на машине, где они идут. Не передан — берём из системы.
+    """
+    ctx = replace(context, now=now) if context is not None else Context(now=now)
+    if ctx.mem_available_mb is None and context is None:
+        ctx.mem_available_mb = mem_available_mb()
+    ctx.daemon_count = len(daemons)
+    ctx.total_footprint_mb = sum(d.footprint_mb for d in daemons)
+    # Пока идёт СВЕЖАЯ сборка — компилятор нужен, и Kotlin-демоны трогать
+    # нельзя. Зависшая сборка (началась давно и не кончилась) защиты не
+    # даёт: такой демон сам подлежит уборке.
+    if ctx.gradle_build_age is None:
+        ages = [now - d.last_build_start for d in daemons
+                if d.kind == "gradle" and d.build_in_progress
+                and d.last_build_start is not None]
+        if ages:
+            ctx.gradle_build_age = min(ages)
+    return ctx
+
+
 def classify(daemons: list[Daemon], state: dict[str, Any], now: float,
-             cfg: dict[str, Any]) -> list[Decision]:
+             cfg: dict[str, Any],
+             context: Context | None = None) -> list[Decision]:
     """Решает, кого убивать. Чистая функция: не трогает систему."""
     rules = default_policy(cfg)
     peer_max_age = float(cfg["PEER_MAX_AGE_SECONDS"])
     prev = state.get("daemons", {})
 
-    # Контекст всего набора: идёт ли где-то сборка Gradle. Пока идёт —
-    # компилятор нужен, и Kotlin-демоны трогать нельзя. Защита действует
-    # только для свежей сборки: зависшая (началась давно и не кончилась)
-    # — не причина блокировать уборку Kotlin-навсегда.
-    gradle_build_age: float | None = None
-    for d in daemons:
-        if d.kind != "gradle" or not d.build_in_progress:
-            continue
-        if d.last_build_start is None:
-            continue
-        age = now - d.last_build_start
-        if gradle_build_age is None or age < gradle_build_age:
-            gradle_build_age = age
+    ctx = build_context(daemons, now, context)
 
     signals: dict[int, Signals] = {}
     for d in daemons:
@@ -192,8 +225,8 @@ def classify(daemons: list[Daemon], state: dict[str, Any], now: float,
         if rec.get("starttime") is not None and rec["starttime"] != d.starttime:
             rec = {}  # PID переиспользован
         sig = _measure(d, rec, now, cfg)
-        sig.gradle_building = gradle_build_age is not None
-        sig.gradle_build_age = gradle_build_age
+        sig.context = ctx
+        sig.recreate_cost_seconds = recreate_cost(cfg, d.kind)
         signals[d.pid] = sig
 
     protection, stale = _peer_protection(signals, peer_max_age)

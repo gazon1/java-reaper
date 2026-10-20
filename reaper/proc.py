@@ -50,6 +50,23 @@ def read_proc_stat(pid: int) -> dict[str, object] | None:
     }
 
 
+def mem_available_mb() -> int | None:
+    """Сколько памяти доступно системе (МБ) — None, если не измерить.
+
+    MemAvailable, а не MemFree: доступная память учитывает то, что можно
+    вытеснить из кеша без обмена. Именно её имеет смысл сравнивать с
+    порогом давления.
+    """
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def read_memory(pid: int) -> tuple[int, int]:
     """(VmRSS, VmSwap) в КБ. zram-счёт важен: часть страниц вытеснена в swap."""
     rss = swap = 0

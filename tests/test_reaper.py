@@ -241,6 +241,9 @@ class TestBuildInProgress(unittest.TestCase):
 
 class TestClassify(unittest.TestCase):
     cfg = dict(reaper.DEFAULTS)
+    # Память: «всегда убирать» — иначе решение зависело бы от
+    # того, сколько памяти свободно на машине, где идут тесты.
+    cfg["MEMORY_PRESSURE_MB"] = 0
 
     def decide(self, daemon, state, now=NOW):
         decisions = reaper.classify([daemon], state, now, self.cfg)
@@ -376,6 +379,9 @@ class TestClassifyPeerGraph(unittest.TestCase):
     """Least fixed point по наблюдателям: peer защищает, только если он сам занят."""
 
     cfg = dict(reaper.DEFAULTS)
+    # Память: «всегда убирать» — иначе решение зависело бы от
+    # того, сколько памяти свободно на машине, где идут тесты.
+    cfg["MEMORY_PRESSURE_MB"] = 0
 
     def test_busy_peer_protects_idle_daemon(self):
         client = make_daemon(pid=2000, last_build_end=NOW - 5 * HOUR, cpu_ticks=1000)
@@ -424,6 +430,9 @@ class TestClassifyPeerGraph(unittest.TestCase):
 
 class TestMetric(unittest.TestCase):
     cfg = dict(reaper.DEFAULTS)
+    # Память: «всегда убирать» — иначе решение зависело бы от
+    # того, сколько памяти свободно на машине, где идут тесты.
+    cfg["MEMORY_PRESSURE_MB"] = 0
 
     def test_reuse_detected_after_event(self):
         d = make_daemon(last_build_end=NOW + 10)  # активность после события
@@ -683,6 +692,9 @@ class TestFindLogPath(unittest.TestCase):
 
 class TestExecuteDryRun(unittest.TestCase):
     cfg = dict(reaper.DEFAULTS)
+    # Память: «всегда убирать» — иначе решение зависело бы от
+    # того, сколько памяти свободно на машине, где идут тесты.
+    cfg["MEMORY_PRESSURE_MB"] = 0
 
     def test_dry_run_sends_no_signals(self):
         pid = os.getpid()
@@ -809,6 +821,9 @@ class TestThresholds(unittest.TestCase):
     """Пороги простоя: Gradle и Kotlin живут по разным правилам."""
 
     cfg = dict(reaper.DEFAULTS)
+    # Память: «всегда убирать» — иначе решение зависело бы от
+    # того, сколько памяти свободно на машине, где идут тесты.
+    cfg["MEMORY_PRESSURE_MB"] = 0
 
     def decide(self, d, st=None):
         if st is None:
@@ -844,6 +859,9 @@ class TestStuckDaemon(unittest.TestCase):
     """Зависший демон: клиент отвалился во время сборки."""
 
     cfg = dict(reaper.DEFAULTS)
+    # Память: «всегда убирать» — иначе решение зависело бы от
+    # того, сколько памяти свободно на машине, где идут тесты.
+    cfg["MEMORY_PRESSURE_MB"] = 0
 
     def decide(self, d, st=None):
         if st is None:
@@ -917,6 +935,9 @@ class TestKindSummary(unittest.TestCase):
     """Сводка по классам демонов в отчёте (п.2)."""
 
     cfg = dict(reaper.DEFAULTS)
+    # Память: «всегда убирать» — иначе решение зависело бы от
+    # того, сколько памяти свободно на машине, где идут тесты.
+    cfg["MEMORY_PRESSURE_MB"] = 0
 
     def test_summary_separates_kinds(self):
         g = make_daemon(pid=1, kind="gradle", rss_mb=400)
@@ -951,6 +972,51 @@ class TestKindSummary(unittest.TestCase):
         self.assertEqual(payload["kinds"]["gradle"]["count"], 1)
         self.assertEqual(payload["config"]["KOTLIN_IDLE_SECONDS"], 7200)
 
+# --------------------------------------------------------------------------- #
+# Контекст: свободная память и свежая сборка Gradle (общий объект)
+# --------------------------------------------------------------------------- #
+
+class TestContext(unittest.TestCase):
+    """Контекст — то, что невозможно знать по одному демону."""
+
+    def test_mem_available_is_measurable(self):
+        value = reaper.mem_available_mb()
+        if value is None:
+            self.skipTest("на этой машине нет /proc/meminfo")
+        self.assertGreater(value, 0)
+
+    def test_context_counts_daemons_and_footprint(self):
+        g = make_daemon(pid=1, kind="gradle", rss_mb=400, swap_mb=100)
+        k = make_daemon(pid=2, kind="kotlin", rss_mb=300)
+        ctx = reaper.build_context([g, k], NOW)
+        self.assertEqual(ctx.daemon_count, 2)
+        self.assertEqual(ctx.total_footprint_mb, 800)
+        self.assertEqual(ctx.now, NOW)
+
+    def test_context_sees_fresh_gradle_build(self):
+        g = make_daemon(pid=1, kind="gradle",
+                        last_build_start=NOW - 60, last_build_end=None)
+        ctx = reaper.build_context([g], NOW)
+        self.assertIsNotNone(ctx.gradle_build_age)
+        self.assertAlmostEqual(ctx.gradle_build_age, 60, delta=1)
+
+    def test_context_without_gradle_build(self):
+        g = make_daemon(pid=1, kind="gradle", last_build_end=NOW - 60)
+        ctx = reaper.build_context([g], NOW)
+        self.assertIsNone(ctx.gradle_build_age)
+
+    def test_decision_carries_context(self):
+        d = make_daemon(pid=1, kind="gradle", rss_mb=400)
+        d.last_build_end = NOW - 10 * HOUR
+        state = {"daemons": {"1": {"first_seen": NOW - 10 * HOUR,
+                                   "cpu_ticks": 1000}}}
+        ctx = reaper.Context(now=NOW, mem_available_mb=12345)
+        dec = reaper.classify([d], state, NOW, dict(reaper.DEFAULTS),
+                              context=ctx)[0]
+        self.assertIsNotNone(dec.context)
+        self.assertEqual(dec.context.mem_available_mb, 12345)
+        self.assertEqual(dec.context.daemon_count, 1)
+
 
 # --------------------------------------------------------------------------- #
 # Наблюдаемость правил и детекция деградации (блок 2)
@@ -960,6 +1026,9 @@ class TestObservability(unittest.TestCase):
     """Видно, какие правила работают и не слеп ли рейпер."""
 
     cfg = dict(reaper.DEFAULTS)
+    # Память: «всегда убирать» — иначе решение зависело бы от
+    # того, сколько памяти свободно на машине, где идут тесты.
+    cfg["MEMORY_PRESSURE_MB"] = 0
 
     def test_rule_hits_counted(self):
         d1 = make_daemon(pid=1, last_build_end=NOW - 10 * HOUR)

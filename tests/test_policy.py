@@ -80,6 +80,9 @@ def random_case(rng: random.Random):
 
 class TestPolicyInvariants(unittest.TestCase):
     cfg = dict(reaper.DEFAULTS)
+    # Память: «всегда убирать» — иначе решение зависело бы от
+    # того, сколько памяти свободно на машине, где идут тесты.
+    cfg["MEMORY_PRESSURE_MB"] = 0
 
     def _decide(self, d, state):
         decisions = reaper.classify([d], state, NOW, self.cfg)
@@ -207,6 +210,9 @@ class TestPolicyInvariants(unittest.TestCase):
 
 class TestExecutionLimits(unittest.TestCase):
     cfg = dict(reaper.DEFAULTS)
+    # Память: «всегда убирать» — иначе решение зависело бы от
+    # того, сколько памяти свободно на машине, где идут тесты.
+    cfg["MEMORY_PRESSURE_MB"] = 0
     cfg["MAX_KILLS_PER_SWEEP"] = 2
     cfg["GRACE_SECONDS"] = 0.2
 
@@ -294,6 +300,108 @@ class TestLogTrimming(unittest.TestCase):
             self.assertEqual(os.path.getsize(path), 2_000_000)
         finally:
             os.unlink(path)
+
+
+class TestMemoryPressure(unittest.TestCase):
+    """Уборка зависит от того, нужна ли машине память.
+
+    Рейпер существует ради памяти. Если памяти хватает, убивать небольшого
+    простаивающего демона — это только цена (холодный старт) без выгоды.
+    """
+
+    cfg = dict(reaper.DEFAULTS)
+
+    def _decide(self, mem_available_mb, footprint_mb=512, kind="gradle",
+                cfg=None):
+        d = make_daemon(pid=1000, kind=kind, rss_mb=footprint_mb)
+        d.last_build_end = NOW - 10 * HOUR
+        d.log_mtime = NOW - 10 * HOUR
+        state = baseline(d, first_seen=NOW - 10 * HOUR)
+        ctx = reaper.Context(now=NOW, mem_available_mb=mem_available_mb)
+        decisions = reaper.classify([d], state, NOW, cfg or self.cfg,
+                                    context=ctx)
+        self.assertEqual(len(decisions), 1)
+        return decisions[0]
+
+    def test_small_daemon_kept_when_memory_is_enough(self):
+        dec = self._decide(mem_available_mb=32000)
+        self.assertFalse(dec.kill, "демон убит, хотя памяти хватает")
+        self.assertEqual(dec.rule, "memory-not-needed")
+
+    def test_killed_when_memory_under_pressure(self):
+        dec = self._decide(mem_available_mb=1024)
+        self.assertTrue(dec.kill)
+        self.assertEqual(dec.rule, "kill")
+
+    def test_large_daemon_killed_even_with_free_memory(self):
+        """Крупный демон жалко держать простаивающим в любом случае."""
+        dec = self._decide(mem_available_mb=32000, footprint_mb=8192)
+        self.assertTrue(dec.kill)
+        self.assertEqual(dec.rule, "kill")
+
+    def test_unmeasurable_memory_behaves_as_before(self):
+        """Память не измерили — ведём себя как раньше, а не как «памяти много»."""
+        dec = self._decide(mem_available_mb=None)
+        self.assertTrue(dec.kill)
+        self.assertEqual(dec.rule, "kill")
+
+    def test_zero_pressure_means_always_kill(self):
+        cfg = dict(self.cfg)
+        cfg["MEMORY_PRESSURE_MB"] = 0
+        dec = self._decide(mem_available_mb=32000, cfg=cfg)
+        self.assertTrue(dec.kill)
+
+    def test_memory_rule_does_not_override_idle_rule(self):
+        """Памяти хватает, но демон простаивает мало — правит «not-idle»."""
+        d = make_daemon(pid=1000, kind="gradle", rss_mb=512)
+        d.last_build_end = NOW - 600
+        state = baseline(d, first_seen=NOW - 10 * HOUR)
+        ctx = reaper.Context(now=NOW, mem_available_mb=32000)
+        dec = reaper.classify([d], state, NOW, self.cfg, context=ctx)[0]
+        self.assertFalse(dec.kill)
+        self.assertEqual(dec.rule, "not-idle")
+
+    def test_kotlin_also_respects_memory_pressure(self):
+        dec = self._decide(mem_available_mb=32000, kind="kotlin")
+        self.assertFalse(dec.kill)
+        self.assertEqual(dec.rule, "memory-not-needed")
+
+
+class TestRecreateCost(unittest.TestCase):
+    """Цена ошибки: воссоздание дорогого демона дороже, порядок — по выгоде."""
+
+    cfg = dict(reaper.DEFAULTS)
+
+    def test_cost_from_config(self):
+        self.assertEqual(reaper.recreate_cost(self.cfg, "gradle"), 40)
+        self.assertEqual(reaper.recreate_cost(self.cfg, "kotlin"), 5)
+
+    def test_cost_put_into_decision(self):
+        d = make_daemon(pid=1, kind="gradle", rss_mb=512)
+        d.last_build_end = NOW - 10 * HOUR
+        state = baseline(d, first_seen=NOW - 10 * HOUR)
+        dec = reaper.classify([d], state, NOW, self.cfg)[0]
+        self.assertEqual(dec.recreate_cost_seconds, 40)
+
+    def test_cheap_daemon_killed_first(self):
+        """МБ на секунду цены: Kotlin (300 МБ / 5 с = 60) выгоднее
+        Gradle (2000 МБ / 40 с = 50)."""
+        g = make_daemon(pid=1, kind="gradle", rss_mb=2000)
+        k = make_daemon(pid=2, kind="kotlin", rss_mb=300)
+        dg = reaper.Decision(g, True, "простой", recreate_cost_seconds=40)
+        dk = reaper.Decision(k, True, "простой", recreate_cost_seconds=5)
+        order = reaper.kill_order([dg, dk])
+        self.assertEqual([d.daemon.pid for d in order], [2, 1])
+
+    def test_equal_benefit_keeps_gradle_first(self):
+        """При равной выгоде Gradle идёт первым: его shutdown-hook чистит
+        маркеры клиентов, и это нужно сделать раньше, чем ляжет Kotlin."""
+        g = make_daemon(pid=1, kind="gradle", rss_mb=1000)
+        k = make_daemon(pid=2, kind="kotlin", rss_mb=1000)
+        dg = reaper.Decision(g, True, "простой", recreate_cost_seconds=10)
+        dk = reaper.Decision(k, True, "простой", recreate_cost_seconds=10)
+        order = reaper.kill_order([dk, dg])
+        self.assertEqual([d.daemon.pid for d in order], [1, 2])
 
 
 if __name__ == "__main__":

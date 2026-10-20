@@ -102,6 +102,31 @@ def observed_activity(d: Daemon) -> float | None:
 
 
 @dataclass
+class Context:
+    """Контекст всего набора демонов.
+
+    То, что невозможно знать по одному демону: сколько в системе свободной
+    памяти, идёт ли где-то свежая сборка Gradle. Правила читают это через
+    `Signals.context`.
+
+    Отдельный объект — а не поля в `Signals`, потому что контекст общий, а
+    демонный. Смешивать их опасно: когда «сборка идёт» лежало рядом с
+    признаками одного демона, оно означало «последняя сборка не завершилась»
+    — а у зависшего демона это верно навсегда, и один зависший Gradle-демон
+    блокировал уборку всех Kotlin-демонов.
+    """
+
+    now: float = 0.0
+    # Сколько памяти доступно системе (МБ). None — измерить не удалось.
+    mem_available_mb: int | None = None
+    # Сколько секунд прошло с начала самой свежей сборки Gradle.
+    # None — свежей сборки нет.
+    gradle_build_age: float | None = None
+    daemon_count: int = 0
+    total_footprint_mb: int = 0
+
+
+@dataclass
 class Decision:
     """Единственный источник правды о судьбе демона.
 
@@ -118,6 +143,10 @@ class Decision:
     protected: bool = False
     protectors: list[Protector] = field(default_factory=list)
     stale_peers: list[Protector] = field(default_factory=list)
+    # Цена воссоздания демона (секунды) — влияет на порядок уборки.
+    recreate_cost_seconds: float = 0.0
+    # Контекст, в котором принято решение (свободная память, свежая сборка).
+    context: "Context | None" = None
     # Имя правила, которое сработало («not-idle», «stuck», «kill»…).
     # Нужно для наблюдаемости: видно, какие правила вообще работают,
     # и деградацию детекции («все демоны ушли в unknown-history»).
