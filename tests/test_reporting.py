@@ -31,6 +31,14 @@ NOW = 1_800_000_000.0
 HOUR = 3600.0
 
 
+def _verdict_line(text: str) -> str:
+    """Строка «ВЕРДИКТ: …» — отдельно от остального отчёта."""
+    for line in text.splitlines():
+        if line.startswith("ВЕРДИКТ:"):
+            return line
+    return ""
+
+
 def make_daemon(pid=1000, kind="gradle", **kw):
     d = reaper.Daemon(pid=pid, kind=kind,
                       starttime=kw.pop("starttime", 12345),
@@ -369,6 +377,30 @@ class TestPilotReport(unittest.TestCase):
         text, code = reaper.pilot_report(self.cfg, self._state(3, 0.0), now=NOW)
         self.assertEqual(code, 2)
         self.assertIn("ДАННЫХ МАЛО", text)
+
+    def test_no_events_says_pilot_has_nothing_to_collect(self):
+        """Ноль событий — не «мало данных», а «данных не будет».
+
+        Если kill-правила не сработали ни разу, кандидатов не было, и пилоту
+        не из чего набирать выборку: ждать её надо не временем, а появлением
+        зависшего демона. Вердикт обязан это сказать прямо.
+        """
+        state = {"metric": {"events": 0, "reused": 0, "rate": 0.0,
+                            "pending": 0, "by_kind": {}},
+                 "pilot_started_at": NOW - 86400,
+                 "rule_hits": {"not-idle": 10}}
+        text, code = reaper.pilot_report(self.cfg, state, now=NOW)
+        self.assertEqual(code, 2)
+        verdict_line = _verdict_line(text)
+        self.assertIn("не из чего набирать события", verdict_line)
+        self.assertIn("Kill-режим включать рано", verdict_line)
+
+    def test_no_events_reason_dropped_when_events_exist(self):
+        """При набранных событиях причина «не из чего набирать» неуместна."""
+        state = self._state(20, 0.1)
+        state["rule_hits"] = {"kill": 20}
+        text, _ = reaper.pilot_report(self.cfg, state, now=NOW)
+        self.assertNotIn("не из чего набирать события", _verdict_line(text))
 
     def test_high_reuse_rate_blocks(self):
         text, code = reaper.pilot_report(self.cfg, self._state(20, 0.9), now=NOW)

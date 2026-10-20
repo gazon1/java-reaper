@@ -7,9 +7,9 @@ import os
 import time
 from typing import Any
 
-from .config import idle_limit_for_kind
+from .config import DEFAULTS, idle_limit_for_kind
 from .model import ACTIVITY_MARKERS, Decision
-from .policy import default_policy
+from .policy import default_policy, kill_rule_names
 from .state import read_kills
 from .targets import TargetSet, builtin_targets
 
@@ -28,6 +28,10 @@ PILOT_MIN_EVENTS = 8
 
 # Классы демонов и их подписи в отчётах. Основной путь — набор целей
 # (targets.yaml); эти константы нужны там, где набора целей нет.
+# Правила, которые УБИВАЮТ, перечисляются самой таблицей политики
+# (reaper.policy.kill_rule_names): их срабатывание — единственное
+# доказательство, что путь «решили убить» работает.
+
 KINDS = ("gradle", "kotlin")
 KIND_LABELS = {"gradle": "Gradle", "kotlin": "Kotlin"}
 
@@ -179,6 +183,7 @@ def format_status(decisions: list[Decision], state: dict[str, Any],
     stale = int(state.get("stale_peer_events", 0))
     if stale:
         lines.append(f"зависших клиентов снято защитой: {stale}")
+    lines.extend(_coverage_lines(state, cfg))
     return "\n".join(lines)
 
 
@@ -196,6 +201,72 @@ def redact_home(path: str | None) -> str | None:
     if home and home not in ("/", "") and path.startswith(home):
         return "~" + path[len(home):]
     return path
+
+
+def rule_coverage(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    """Покрытие правил: что срабатывало, а что ни разу.
+
+    Правило, которое не сработало НИ РАЗУ, оставляет свой порог
+    непроверенным: значение стоит, но никто не знает, верное ли оно.
+    Особенно это касается kill-правил: пока ни одно из них не сработало,
+    сам путь «решили убить» на живых демонах не проверен, а пилот не может
+    набрать событий — их не из чего набрать.
+
+    Счётчики берутся из состояния (накопительные), а не из журнала
+    свипов: состояние живёт рядом с рейпером и не теряется.
+    """
+    hits = {name: int(count or 0)
+            for name, count in (state.get("rule_hits") or {}).items()}
+    # Имена правил и список убивающих берутся из таблицы политики: она и есть
+    # источник истины. Пороги подставляются из значений по умолчанию, чтобы
+    # список правил получался всегда, даже если конфиг не задан.
+    policy_cfg = {**DEFAULTS, **cfg}
+    all_rules = [rule.name for rule in default_policy(policy_cfg)]
+    kill_rules = kill_rule_names(policy_cfg)
+    fired = {name: hits[name] for name in all_rules if hits.get(name)}
+    never = [name for name in all_rules if not hits.get(name)]
+    kill_fired = {name: count for name, count in fired.items()
+                  if name in kill_rules}
+    kill_never = [name for name in kill_rules if not hits.get(name)]
+    return {
+        "hits": fired,
+        "never_fired": never,
+        "kill_fired": kill_fired,
+        "kill_never_fired": kill_never,
+    }
+
+
+def _coverage_lines(state: dict[str, Any], cfg: dict[str, Any]) -> list[str]:
+    """Строки о покрытии правил — для отчётов.
+
+    Различаем два случая, потому что они означают разное:
+      * kill-правило не сработало ни разу — его порог НЕ ПРОВЕРЕН, и пилоту
+        не из чего набирать события;
+      * защитное правило не сработало — это не беда: значит, защищать было
+        некого (демоны либо не простаивали, либо не были заметены).
+    """
+    coverage = rule_coverage(state, cfg)
+    fired = coverage["hits"]
+    if not fired and not coverage["never_fired"]:
+        return []
+    lines = []
+    if fired:
+        parts = ", ".join(f"{name} ×{count}" for name, count in
+                          sorted(fired.items(), key=lambda kv: -kv[1]))
+        lines.append(f"покрытие правил: сработали {parts}")
+    if coverage["kill_never_fired"]:
+        lines.append("  kill-правила НИ РАЗУ не сработали: "
+                     + ", ".join(coverage["kill_never_fired"])
+                     + " → путь «убить» на живых демонах не проверен, "
+                       "пилоту не из чего набирать события")
+    protective = [name for name in coverage["never_fired"]
+                  if name not in coverage["kill_never_fired"]
+                  and name not in coverage["kill_fired"]]
+    if protective:
+        lines.append("  защитные правила ни разу не сработали: "
+                     + ", ".join(protective)
+                     + " (защищать было некого)")
+    return lines
 
 
 def decision_to_dict(dec: Decision) -> dict[str, Any]:
@@ -437,6 +508,17 @@ def pilot_report(cfg: dict[str, Any], state: dict[str, Any],
     by_kind = metric.get("by_kind") or {}
     kind_verdicts = _kind_verdicts(by_kind, min_events, max_rate)
     judged = [v for v in kind_verdicts if v["verdict_code"] != 2]
+    coverage = rule_coverage(state, cfg)
+    kill_never = coverage.get("kill_never_fired") or []
+    # Если kill-правила не сработали ни разу, то событий «would kill» не будет:
+    # пилоту не из чего набирать выборку. Это не «мало данных» — это «данные не
+    # могут появиться»: ждать их нужно не временем, а самим зависшим демоном.
+    no_events_reason = (
+        f"kill-правила ({', '.join(kill_never)}) не сработали ни разу — путь "
+        f"«убить» на живых демонах не проверен, и пилоту не из чего набирать "
+        f"события: кандидатов на убийство не было ни разу. "
+        f"Kill-режим включать рано."
+        if kill_never and counted == 0 else "")
     if not kind_verdicts and counted:
         # Метрика старого формата (без разбивки по видам) — вердикт как раньше,
         # по общей цифре. Так читаются состояния, набранные до появления целей.
@@ -456,6 +538,8 @@ def pilot_report(cfg: dict[str, Any], state: dict[str, Any],
     elif not judged:
         verdict = (f"ДАННЫХ МАЛО: ни у одного вида не набралось {min_events} "
                    f"наблюдённых событий — вердикт не выносим")
+        if no_events_reason:
+            verdict += ". " + no_events_reason
         code = 2
     elif any(v["verdict_code"] == 1 for v in judged):
         worst = next(v for v in judged if v["verdict_code"] == 1)
@@ -502,6 +586,9 @@ def pilot_report(cfg: dict[str, Any], state: dict[str, Any],
                 f"{100 * item['rate']:.0f} % (взвешенно по цене "
                 f"{100 * item['rate_weighted']:.0f} %), цена ложных "
                 f"{item['cost_reused_seconds']:.0f} с — {mark}")
+        lines.append("")
+    lines.extend(_coverage_lines(state, cfg))
+    if lines[-1] != "":
         lines.append("")
     lines.append(f"ВЕРДИКТ: {verdict}")
     return "\n".join(lines), code

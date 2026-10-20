@@ -404,5 +404,26 @@ class TestRecreateCost(unittest.TestCase):
         self.assertEqual([d.daemon.pid for d in order], [1, 2])
 
 
+class TestKillRuleNames(unittest.TestCase):
+    """Список убивающих правил берётся из таблицы, а не пишется руками."""
+
+    def test_matches_rules_with_kill_action(self):
+        cfg = dict(reaper.DEFAULTS)
+        policy = reaper.default_policy(cfg)
+        expected = [rule.name for rule in policy
+                    if rule.action is reaper.Action.KILL]
+        self.assertEqual(reaper.kill_rule_names(cfg), expected)
+
+    def test_contains_stuck_and_kill(self):
+        names = reaper.kill_rule_names(dict(reaper.DEFAULTS))
+        self.assertIn("stuck", names)
+        self.assertIn("kill", names)
+
+    def test_protective_rules_are_not_kill_rules(self):
+        names = reaper.kill_rule_names(dict(reaper.DEFAULTS))
+        for name in ("peer", "cpu-busy", "no-baseline", "memory-not-needed"):
+            self.assertNotIn(name, names)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

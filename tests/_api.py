@@ -95,7 +95,12 @@ from reaper.model import (  # noqa: E402,F401
     Protector,
     observed_activity,
 )
-from reaper.policy import Rule, Signals, default_policy  # noqa: E402,F401
+from reaper.policy import (  # noqa: E402,F401
+    Rule,
+    Signals,
+    default_policy,
+    kill_rule_names,
+)
 from reaper.proc import (  # noqa: E402,F401
     children_map,
     daemon_kind,

@@ -93,6 +93,18 @@ class Rule:
     protected: bool = False     # демон защищён неизвестным/наблюдателем
 
 
+def kill_rule_names(cfg: dict) -> list[str]:
+    """Имена правил, которые убивают.
+
+    Список берётся из таблицы политики, а не пишется руками: правило может
+    стать убивающим или защищающим при правке таблицы, и тогда записанный
+    где-то список разошёлся бы с реальностью. «Kill-правило не сработало»
+    и «защитное правило не сработало» — разные вещи, поэтому различать их
+    нужно по таблице, а не по памяти.
+    """
+    return [rule.name for rule in default_policy(cfg) if rule.action is Action.KILL]
+
+
 def _fmt_protectors(protectors: list[Protector]) -> str:
     return "; ".join(p.detail for p in protectors)
 
