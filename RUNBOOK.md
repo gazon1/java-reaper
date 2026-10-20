@@ -60,6 +60,8 @@ python3 ~/dev/java-reaper/tools/simulate.py --stuck-thresholds "15,30,60,120"
 | `идёт сборка Gradle — Kotlin-демоны не трогаю` | правило безопасности (сборка свежая, началась недавно) | ничего |
 | `свободной памяти хватает (N МБ), демон небольшой — не трогаю` | память не нужна — убивать незачем | ничего; если демоны жрут память, снизить `MEMORY_PRESSURE_MB` или поднять `KILL_LARGE_DAEMON_MB` |
 | `WARNING: кандидатов 0, но есть java-процессы со словом gradle/kotlin` | детектор перестал узнавать демонов | чинить: скорее всего изменился main-класс или формат логов |
+| `WARNING: конфиг: ключ IDLE_SECONDS=… расходится с порогом простоя…` | порог задан в двух местах | перенести порог в `targets.yaml` и убрать плоский ключ из конфига |
+| `WARNING: цели: не установлен PyYAML…` | файл целей не прочитан | `pip install --user -r ~/dev/java-reaper/requirements.txt`; до этого работают встроенные цели |
 
 ## Аварийный тормоз
 
@@ -134,6 +136,50 @@ MEMORY_PRESSURE_MB=0      # «всегда убирать», независим�
 Обратная настройка — `MEMORY_PRESSURE_MB=4096` (по умолчанию): убивать, только
 когда свободно меньше 4 ГБ. Крупные демоны (≥ `KILL_LARGE_DAEMON_MB`, 4 ГБ)
 убираются в любом случае.
+
+## «Хочу убирать ещё одну программу»
+
+Описание целей лежит в `~/.config/java-reaper/targets.yaml` (YAML). Файл
+необязателен: без него работают встроенные цели Gradle и Kotlin.
+
+```bash
+# 1. посмотреть, что рейпер сейчас видит
+java-reaper --status
+java-reaper --status --json | python3 -m json.tool | head -40
+
+# 2. описать цель (пример — программа без своих маркеров в логе)
+cat >> ~/.config/java-reaper/targets.yaml <<'YAML'
+targets:
+  - name: esbuild
+    label: esbuild
+    match_cmdline: "esbuild"
+    log_name_regex: '\.log$'
+    activity: mtime
+    idle_seconds: 3600
+    recreate_cost_seconds: 2
+    rebuildable: true
+YAML
+
+# 3. проверить, что цель узнаётся и пороги разрешились
+java-reaper --explain
+```
+
+**Порог обязательно измеряется, а не выбирается.** Для новой цели:
+
+```bash
+python3 ~/dev/java-reaper/tools/prune-logs.py --archive-only --min-age-hours 0
+python3 ~/dev/java-reaper/tools/simulate.py --thresholds "30,60,120,240,360"
+```
+
+Сначала — наблюдение в dry-run (как сейчас), и только потом kill-режим.
+
+**Если порог из конфига и из targets.yaml расходятся** — рейпер пишет
+предупреждение при каждом запуске. Работает значение из плоского конфига
+(`IDLE_SECONDS` и подобные): оператор правил этот ключ, значит он и главный.
+Перенесите порог в YAML и уберите плоский ключ, чтобы править в одном месте.
+
+**Если файл целей не читается** (битый YAML, нет PyYAML) — рейпер не
+падает: он использует встроенные цели и пишет об этом предупреждение.
 
 ## Kotlin-демон остался один
 
@@ -323,6 +369,9 @@ import json,sys
 d=json.load(sys.stdin)
 for k,v in d['kinds'].items():
     print(f\"{k:>7}: {v['count']} шт, {v['footprint_mb']} МБ, под удар {v['kill_footprint_mb']} МБ, порог {v['idle_limit_seconds']/3600:.0f} ч\")"
+
+# какие цели и с какими порогами сейчас действуют
+java-reaper --explain
 
 # ретроспектива: какой порог простоя оптимален (по самим логам)
 ./tools/analyze-idle.py --thresholds "30,60,120,180,360,720"

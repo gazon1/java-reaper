@@ -27,8 +27,10 @@ reaper/
   config.py    — значения по умолчанию, разбор конфига, allowlist, флаг-тормоз
   model.py     — Daemon, Decision, Protector, PeerConn, Context (контекст набора)
   proc.py      — низкоуровневый доступ к /proc (процессы, память, сокеты, дети)
-  logread.py   — инкрементальное ЧТЕНИЕ логов Gradle
-  logparse.py  — ОБЩИЙ разбор формата лога Gradle (маркеры, таймстемпы,
+  targets.py   — ЦЕЛИ: описания программ-демонов (targets.yaml) — кто это,
+                 где его лог, как его читать
+  logread.py   — инкрементальное ЧТЕНИЕ логов демонов
+  logparse.py  — ОБЩИЙ разбор формата лога (маркеры, таймстемпы,
                  сопоставление сборок) — используется и рейпером, и анализатором
   history.py   — сводки по демонам (жизнь демона в компактном виде) для истории
   collect.py   — сбор демонов и их признаков
@@ -39,7 +41,9 @@ reaper/
   state.py     — атомарное состояние (версионируемое), метрики, журнал убийств
   report.py    — таблица, JSON (версионируемая схема), вердикты, health
   cli.py       — аргументы, главный цикл
-tests/         — 251 тест (юнит, сквозные, инвариантные)
+targets.example.yaml — пример файла целей (копируется в ~/.config/java-reaper/)
+requirements.txt     — PyYAML (разбор файла целей)
+tests/         — 276 тест (юнит, сквозные, инвариантные)
   fixtures/    — срез настоящего лога Gradle (golden-фикстура)
 tools/
   analyze-idle.py   — ретроспективный анализ простоев по логам
@@ -48,6 +52,83 @@ tools/
   prune-logs.py     — уборка логов мёртвых демонов (по умолчанию dry-run)
   simulate.py       — симуляция правил по истории демонов (пороги простоя и «зависшего»)
 ```
+
+## Цели: какие программы мы убираем
+
+**Цель** (target) — описание одного вида демонов: как его узнать среди прочих
+процессов, где его лог, как по логу понять, что он работал, сколько ждать
+простоя и кого он защищает.
+
+Описание целей лежит в `~/.config/java-reaper/targets.yaml` (YAML). Файл
+необязателен: без него работают встроенные цели Gradle и Kotlin — ровно как
+раньше. Файл переопределяет встроенные цели по имени и может добавлять новые.
+
+```yaml
+version: 1
+
+targets:
+  - name: gradle
+    label: Gradle
+    match_cmdline: "org.gradle.launcher.daemon.bootstrap.GradleDaemon"
+    log_name_regex: '^daemon-\d+\.out\.log$'
+    activity: markers            # или mtime
+    build_start: "Received command: Build"
+    build_end: "Marking the daemon as idle"
+    cancel: "client disconnection detected"
+    idle_seconds: 21600
+    recreate_cost_seconds: 40
+    self_timeout_seconds: 10800
+    protects: [kotlin]
+    rebuildable: true
+```
+
+| поле | что означает |
+|---|---|
+| `match_cmdline` | подстрока в cmdline процесса, по которой мы его узнаём |
+| `log_name_regex` | регулярка на имя файла лога (лог ищем среди открытых fd `/proc/PID/fd` — точно, без эвристик) |
+| `activity` | `mtime` — активность это время последней записи в лог; `markers` — активность это маркеры начала/конца работы в тексте лога |
+| `build_start` / `build_end` / `build_end_alt` / `cancel` | маркеры для `activity: markers` |
+| `idle_seconds` | порог простоя: сколько ждать, прежде чем убирать |
+| `recreate_cost_seconds` | цена холодного старта: влияет на **порядок** уборки, не на сам факт |
+| `self_timeout_seconds` | через сколько демон умирает сам (у Gradle 180 мин: наш порог обязан быть выше, иначе мы конкурируем с Gradle за одни и те же демоны) |
+| `protects` | какие виды демонов этот вид защищает, пока сам работает |
+| `rebuildable` | «это пересоздаваемый кэш, его можно убить» |
+
+### Как добавить новую программу
+
+1. Описать цель в `~/.config/java-reaper/targets.yaml` (для программы без
+   своих маркеров достаточно `activity: mtime` — это самый простой случай);
+2. **измерить порог**, а не выбрать его: собрать историю
+   (`python3 tools/prune-logs.py --archive-only --min-age-hours 0`) и
+   прогнать `tools/simulate.py` по ней. Неизмеренный порог — это наугад;
+3. сначала понаблюдать в dry-run (`java-reaper --status`) — сколько памяти
+   держит цель и кого рейпер считает кандидатом;
+4. и только потом — kill-режим.
+
+**Чего файл целей не покрывает:** смысл самих правил политики, умение
+читать логи и таймстемпы, всё про сигналы и безопасность. Это остаётся в
+коде — конфигурировать его нельзя, и не нужно: правила должны быть одни и
+те же для всех целей, иначе их невозможно сравнивать.
+
+### Кто главнее: плоский конфиг или targets.yaml
+
+| что | где живёт | приоритет |
+|---|---|---|
+| порог простоя вида | `targets.yaml` → `idle_seconds`; плоский ключ `IDLE_SECONDS` / `KOTLIN_IDLE_SECONDS` | **явно заданный плоский ключ главнее**; если он не задан — берётся YAML; если нет и его — значение по умолчанию |
+| цена воссоздания | `targets.yaml` → `recreate_cost_seconds`; плоский `GRADLE_RECREATE_COST_SECONDS` / `KOTLIN_RECREATE_COST_SECONDS` | так же |
+| всё остальное (память, свипы, флаги, критерий пилота) | плоский конфиг | только он |
+
+Плоский ключ главнее не из упрямства: оператор десятилетиями правил
+`IDLE_SECONDS` в своём конфиге, и тихо перестать его учитывать — ловушка.
+Но если ключ и значение в YAML **расходятся**, рейпер предупреждает об этом
+при каждом запуске: молчать об этом нельзя, иначе «опечатка в конфиге»
+выглядит как «рейпер сломался».
+
+### Зависимость
+
+Для чтения `targets.yaml` нужен PyYAML (`pip install -r requirements.txt`).
+Без него рейпер работает и использует встроенные цели, но предупреждает об
+этом при каждом запуске.
 
 ## Как принимаются решения
 
@@ -108,7 +189,7 @@ java-reaper --explain
 | `stuck` | убить (завис: клиент отвалился во время сборки, прошло > `STUCK_AFTER_SECONDS`) |
 | `building` | оставить, занят (сборка идёт) |
 | `not-idle` | оставить (простой < порога простоя своего класса) |
-| `gradle-building` | оставить, защищён (идёт свежая сборка Gradle — компилятор нужен) |
+| `protected-by-build` | оставить, защищён (идёт свежая сборка другого вида — они сейчас нужны) |
 | `memory-not-needed` | оставить (памяти хватает, а демон небольшой) |
 | `kill` | убить |
 
@@ -305,13 +386,23 @@ Kotlin были неактивны дольше 3 ч, 149 — дольше 24 ч
 | 3 | правило «зависший» и защита Kotlin по свежей сборке Gradle | обнулена |
 | 4 | правило `memory-not-needed` (уборка зависит от свободной памяти) + защита «идёт сборка Gradle» только по свежей сборке (`GRADLE_BUILD_ACTIVE_SECONDS`) | обнулена |
 
+Имя правила `gradle-building` в версии 4 заменено на `protected-by-build`:
+отношение «Gradle защищает Kotlin» стало общим («этот вид защищает те виды,
+что перечислены в `protects`»), и имя перестало называть конкретную программу.
+**Решения при этом не изменились** — это проверяется тестом
+`tests/test_targets.py: TestBehaviorUnchanged`, который сравнивает решения по
+демонам с файлом целей и без него. Метрика пилота измеряет решения, а не
+имена правил, поэтому сбрасывать её из-за переименования не нужно.
+
 ## Установка
 
 ```bash
 ln -sfn ~/dev/java-reaper/java-reaper ~/.local/bin/java-reaper
 mkdir -p ~/.config/java-reaper
 cp ~/dev/java-reaper/config.example ~/.config/java-reaper/config
+cp ~/dev/java-reaper/targets.example.yaml ~/.config/java-reaper/targets.yaml
 cp ~/dev/java-reaper/config.env.example ~/.config/java-reaper/env
+pip install --user -r ~/dev/java-reaper/requirements.txt   # PyYAML: файл целей
 mkdir -p ~/.config/systemd/user
 cp ~/dev/java-reaper/systemd/java-reaper.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload
@@ -374,6 +465,12 @@ baseline пишет только рабочий свип.
 
 Текущая версия: `3` (`JSON_SCHEMA_VERSION` в `reaper/report.py`).
 
+Схема 3 не изменилась после появления целей (targets.yaml): набор целей
+меняет то, *какие* демоны видны, но не форму вывода. В `--status --json`
+добавилась секция `targets` — описание целей (подпись, порог простоя, цена
+воссоздания, модель активности, кого защищает) — чтобы потребитель видел,
+по каким правилам считалось.
+
 В версии 3 добавлены: секция `memory` (`available_mb`, `pressure_mb`,
 `large_daemon_mb`), поля `rule` (какое правило сработало) и
 `recreate_cost_seconds` (цена воссоздания) в записи демона, а также
@@ -387,7 +484,7 @@ baseline пишет только рабочий свип.
 
 | документ | ключевые поля |
 |---|---|
-| `--status --json` | `schema_version`, `now`, `config`, `kinds`, `memory`, `daemons[]`, `metric`, `rule_hits`, `rule_hits_last`, `measured_count`, `degradation`, `freed_mb`, `would_free_mb`, `would_free_pending_mb`, `last_sweep_at`, `pilot_started_at`, `stale_peer_events`, `stale_peer_daemons`, `actions[]` |
+| `--status --json` | `schema_version`, `now`, `config`, `targets`, `kinds`, `memory`, `daemons[]`, `metric`, `rule_hits`, `rule_hits_last`, `measured_count`, `degradation`, `freed_mb`, `would_free_mb`, `would_free_pending_mb`, `last_sweep_at`, `pilot_started_at`, `stale_peer_events`, `stale_peer_daemons`, `actions[]` |
 | `--pilot --json` | `schema_version`, `metric`, `events`, `reused`, `reuse_rate`, `pilot_started_at`, `freed_mb`, `would_free_mb`, `stale_peer_events`, `criterion`, `verdict_code` |
 | `--audit --json` | `schema_version`, `idle_limit_seconds` (объект по классам), `stale_daemons[]`, `total_footprint_mb`, `verdict_code` |
 
