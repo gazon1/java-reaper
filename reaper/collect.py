@@ -100,6 +100,9 @@ def collect_daemons(cfg: dict[str, Any], state: dict[str, Any],
             cpu_ticks=int(st["utime"]) + int(st["stime"]),
             rss_mb=rss // 1024,
             swap_mb=swap // 1024,
+            # Как цель измеряет активность: от этого зависит, что считать
+            # «последней работой» демона (конец сборки или mtime лога).
+            activity=spec.activity,
         )
 
         rec = prev.get(str(pid)) or {}

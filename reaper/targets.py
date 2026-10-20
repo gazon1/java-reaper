@@ -34,14 +34,16 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable
 
-from .model import GRADLE_MAIN, KOTLIN_MAIN
+from .model import (ACTIVITY_MARKERS, ACTIVITY_MTIME, GRADLE_MAIN,
+                    KOTLIN_MAIN)
 
 # Куда искать файл целей по умолчанию.
 DEFAULT_TARGETS_PATH = "~/.config/java-reaper/targets.yaml"
 
-# Как понимать активность демона по его логу.
-ACTIVITY_MTIME = "mtime"      # признак активности — mtime лога (Kotlin)
-ACTIVITY_MARKERS = "markers"  # активность — маркеры в тексте лога (Gradle)
+# Как понимать активность демона по его логу (ACTIVITY_MTIME / ACTIVITY_MARKERS)
+# — константы живут в `model`: там же живёт модель демона, которая ими
+# пользуется, а `targets` импортирует модель (иначе круг импорта).
+# Здесь они доступны как `reaper.targets.ACTIVITY_MARKERS` — как раньше.
 
 # Формат таймстемпа в начале строки лога.
 TS_ISO = "iso"        # «2026-10-19T19:36:17.864+0300» — с смещением

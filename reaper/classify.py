@@ -15,8 +15,8 @@ from dataclasses import replace
 from typing import Any
 
 from .config import allowlist, idle_limit as idle_limit_for, legacy_cost_key
-from .model import (Action, Context, Daemon, Decision, Protector,
-                    observed_activity)
+from .model import (ACTIVITY_MARKERS, ACTIVITY_MTIME, Action, Context, Daemon,
+                    Decision, Protector, observed_activity)
 from .proc import mem_available_mb
 from .policy import Rule, Signals, default_policy
 from .targets import TargetSet, builtin_targets
@@ -51,6 +51,19 @@ def idle_limit_for_kind(cfg: dict[str, Any], kind: str,
     return float(idle_limit_for(cfg, kind))
 
 
+def _activity_of(d: Daemon, targets: TargetSet | None) -> str:
+    """Как этот демон измеряет активность: по описанию цели или по полю демона.
+
+    Описание цели — источник истины; поле `activity` у демона — запасной
+    вариант (демон мог быть собран вне сборщика).
+    """
+    if targets is not None:
+        spec = targets.get(d.kind)
+        if spec is not None:
+            return spec.activity
+    return getattr(d, "activity", "") or ""
+
+
 def _measure(d: Daemon, rec: dict[str, Any], now: float,
              cfg: dict[str, Any],
              targets: TargetSet | None = None) -> Signals:
@@ -73,11 +86,17 @@ def _measure(d: Daemon, rec: dict[str, Any], now: float,
         scale = sweep / max(elapsed, 1.0)
         cpu_delta = (d.cpu_ticks - int(rec["cpu_ticks"])) / float(hz) * scale
 
+    # «Лог обновлялся недавно» — по тому, как цель измеряет активность:
+    # у целей с mtime это время записи в лог, у целей с маркерами — конец
+    # последней сборки. Раньше вид был зашит в код, и новая программа
+    # молча считалась бы «неактивной», что для kill-режима опасно.
     log_recent = False
-    if d.kind == "kotlin" and d.log_mtime is not None:
-        log_recent = (now - d.log_mtime) <= sweep
-    elif d.kind == "gradle" and d.last_build_end is not None:
-        log_recent = (now - d.last_build_end) <= sweep
+    activity = _activity_of(d, targets)
+    if activity == ACTIVITY_MTIME:
+        log_recent = d.log_mtime is not None and (now - d.log_mtime) <= sweep
+    elif activity == ACTIVITY_MARKERS:
+        log_recent = (d.last_build_end is not None
+                      and (now - d.last_build_end) <= sweep)
 
     observed = observed_activity(d)
     # Если сборка идёт (старт без конца), отсчёт простоя идёт от её старта:

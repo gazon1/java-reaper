@@ -8,6 +8,12 @@ from enum import Enum
 GRADLE_MAIN = "org.gradle.launcher.daemon.bootstrap.GradleDaemon"
 KOTLIN_MAIN = "org.jetbrains.kotlin.daemon.KotlinCompileDaemon"
 
+# Как цель измеряет активность демона. Константы живут здесь, а не в
+# `targets`, потому что модель демона тоже ими пользуется (а `targets`
+# импортирует модель — иначе получился бы круг импорта).
+ACTIVITY_MTIME = "mtime"       # признак активности — mtime лога
+ACTIVITY_MARKERS = "markers"   # активность — маркеры в тексте лога
+
 # Дети, которые не считаются «работой» и потому не защищают протухший демон.
 # Сопоставляется ТОЛЬКО имя исполняемого файла: поиск подстроки по всему
 # cmdline ловил classpath-пути вроде «…playwright-1.49.0.jar» и ошибочно
@@ -77,6 +83,10 @@ class Daemon:
     stuck_build: bool = False
     # Момент последней отмены сборки (по логу).
     canceled_at: float | None = None
+    # Как эта цель измеряет активность («mtime» или «markers»). Заполняет
+    # сборщик из описания цели (targets.yaml). Пусто — вид не описан,
+    # и тогда действует запасное правило (см. observed_activity).
+    activity: str = ""
 
     @property
     def footprint_mb(self) -> int:
@@ -94,9 +104,18 @@ class Daemon:
 def observed_activity(d: Daemon) -> float | None:
     """Когда демон последний раз что-то делал — по его логу.
 
-    У Gradle это конец последней сборки, у Kotlin — mtime его лога.
+    У цели с маркерами (activity=markers) это конец последней сборки,
+    у остальных — mtime лога. Вид активности задаёт описание цели, а не
+    код: так новая программа работает по тем же правилам, что и Gradle.
+
+    Если вид не описан (демон собран вручную, минуя сборщик), берём то,
+    что есть: конец сборки, если он есть, иначе mtime лога.
     """
-    if d.kind == "gradle":
+    if d.activity == ACTIVITY_MTIME:
+        return d.log_mtime
+    if d.activity == ACTIVITY_MARKERS:
+        return d.last_build_end
+    if d.last_build_end is not None:
         return d.last_build_end
     return d.log_mtime
 

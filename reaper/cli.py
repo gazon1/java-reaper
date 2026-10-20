@@ -163,6 +163,17 @@ def _sweep(cfg: dict[str, Any], state: dict[str, Any], now: float,
     return daemons, decisions
 
 
+def _say(args: argparse.Namespace, text: str) -> None:
+    """Человекочитаемое сообщение — в stdout, но с --json уходит в stderr.
+
+    С --json stdout должен оставаться чистым JSON: иначе его нельзя
+    разобрать (`json.loads(proc.stdout)`). Служебные сообщения (сброс
+    метрики, предупреждения, список действий) в JSON-режиме идут в stderr.
+    """
+    stream = sys.stderr if getattr(args, "json", False) else sys.stdout
+    print(text, file=stream, flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     mode = args.mode or ("dry-run" if args.dry_run else "kill")
@@ -176,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
                               explicit_keys, config_warnings)
     state = load_state(cfg)
     for w in config_warnings:
-        print(f"WARNING: {w}", flush=True)
+        _say(args, f"WARNING: {w}")
 
     # ---- команды только на чтение ----
     if args.explain:
@@ -218,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     # ---- аварийный тормоз ----
     flag = disabled_flag(cfg)
     if os.path.exists(flag):
-        print(f"java-reaper: отключён флагом {flag} — ничего не делаю", flush=True)
+        _say(args, f"java-reaper: отключён флагом {flag} — ничего не делаю")
         return 0
 
     os.makedirs(os.path.expanduser(str(cfg["STATE_DIR"])), exist_ok=True)
@@ -230,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        print("java-reaper: другой прогон уже идёт — выхожу", flush=True)
+        _say(args, "java-reaper: другой прогон уже идёт — выхожу")
         return 0
 
     now = time.time()
@@ -238,8 +249,8 @@ def main(argv: list[str] | None = None) -> int:
         # Правила изменились: метрика пилота, набранная по старым порогам,
         # измеряет другое — сбрасываем её ДО свипа, чтобы события этого
         # свипа уже записывались по новым правилам.
-        print(f"java-reaper: правила изменились (версия {RULES_VERSION}) — "
-              f"метрика пилота сброшена", flush=True)
+        _say(args, f"java-reaper: правила изменились (версия {RULES_VERSION}) — "
+                   f"метрика пилота сброшена")
     daemons, decisions = _sweep(cfg, state, now, targets)
 
     if args.status or args.audit:
@@ -274,7 +285,7 @@ def main(argv: list[str] | None = None) -> int:
                   else format_status(decisions, state, cfg, targets), flush=True)
         warn = canary(daemons, decisions, targets)
         if warn:
-            print("WARNING: " + warn, flush=True)
+            _say(args, "WARNING: " + warn)
         return 0
 
     # ---- рабочий свип ----
@@ -301,9 +312,9 @@ def main(argv: list[str] | None = None) -> int:
           else format_status(decisions, state, cfg, targets), flush=True)
     warn = canary(daemons, decisions, targets)
     if warn:
-        print("WARNING: " + warn, flush=True)
+        _say(args, "WARNING: " + warn)
     for w in warnings:
-        print(f"WARNING: {w}", flush=True)
+        _say(args, f"WARNING: {w}")
 
     write_state(cfg, state, decisions, now, trimmed_pids)
     update_metric(state, decisions, now, cfg, report)
@@ -317,8 +328,8 @@ def main(argv: list[str] | None = None) -> int:
     save_state(cfg, state)
 
     for item in report:
-        print(f"java-reaper: pid={item['pid']} {item['action']} — {item['reason']}",
-              flush=True)
+        _say(args, f"java-reaper: pid={item['pid']} {item['action']} — "
+                   f"{item['reason']}")
         if item.get("action") in ("SIGTERM", "SIGKILL"):
             append_kill(cfg, {
                 "pid": item["pid"],
@@ -329,10 +340,10 @@ def main(argv: list[str] | None = None) -> int:
                               if d.daemon.pid == item["pid"]), "?"),
             })
     killed = [i for i in report if i["action"] in ("SIGTERM", "SIGKILL")]
-    print(f"java-reaper: режим {mode}, демонов {len(decisions)}, "
-          f"сигналов отправлено {len(killed)}, "
-          f"кандидатов на убийство {sum(1 for d in decisions if d.kill)}"
-          + (f", освобождено {freed} МБ" if freed else ""), flush=True)
+    _say(args, f"java-reaper: режим {mode}, демонов {len(decisions)}, "
+               f"сигналов отправлено {len(killed)}, "
+               f"кандидатов на убийство {sum(1 for d in decisions if d.kill)}"
+               + (f", освобождено {freed} МБ" if freed else ""))
     return 0
 
 
