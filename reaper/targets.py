@@ -58,7 +58,7 @@ class TargetSpec:
     match_comm     — имя исполняемого файла (команды) процесса;
     log_name_regex — регулярка на имя файла лога (ищем среди открытых fd);
     activity       — «mtime» или «markers» (см. константы выше);
-    ts_format      — формат таймстемпа для activity=markers;
+    ts_format      — формат таймстемпа в строке лога («iso»/«local»);
     build_start    — маркер начала работы (для activity=markers);
     build_end      — маркер конца работы;
     build_end_alt  — запасной маркер конца работы;
@@ -75,7 +75,17 @@ class TargetSpec:
     rebuildable    — «это пересоздаваемый кэш, его можно убить»;
     log_trim       — «лог этого демона можно усекать» (усечение сдвигает
                      mtime, а у целей, где mtime — признак простоя, это
-                     врёт: демон выглядел бы «только что активным»).
+                     врёт: демон выглядел бы «только что активным»);
+    log_globs      — где на диске лежат логи цели (шаблоны пути);
+    log_group_regex— как файлы одного демона группируются (именованная
+                     группа «group»): у Kotlin это инстанс, у него ротация
+                     .00/.01, и открытый файл защищает всю группу;
+    log_pid_regex  — PID в имени файла (именованная группа «pid»): у Gradle
+                     он настоящий, у Kotlin — нет;
+    forbidden_prefixes — имена, которые трогать нельзя никогда (маркеры
+                     Kotlin: их создаёт и удаляет сам Kotlin);
+    bucket_seconds — ширина «корзины» активности для целей с activity=mtime
+                     (0 → значение по умолчанию).
     """
 
     name: str
@@ -99,6 +109,11 @@ class TargetSpec:
     protects: tuple[str, ...] = ()
     rebuildable: bool = False
     log_trim: bool = False
+    log_globs: tuple[str, ...] = ()
+    log_group_regex: str = ""
+    log_pid_regex: str = ""
+    forbidden_prefixes: tuple[str, ...] = ()
+    bucket_seconds: int = 0
 
     def matches(self, cmdline: str, comm: str = "") -> bool:
         """Похоже ли этот процесс на нашу цель."""
@@ -135,6 +150,16 @@ BUILTIN_TARGETS: tuple[TargetSpec, ...] = (
         # Пока идёт сборка Gradle, компилятор нужен прямо сейчас.
         protects=("kotlin",),
         rebuildable=True,
+        # Логи Gradle: стандартный каталог и отдельный GRADLE_USER_HOME
+        # (проекты часто ставят свой — там тоже копится мусор). Пути,
+        # зависящие от раскладки машины, задаются в targets.yaml.
+        log_globs=(
+            "~/.gradle/daemon/*/daemon-*.out.log",
+            "~/.gradle-user-home/daemon/*/daemon-*.out.log",
+        ),
+        # В имени лога Gradle PID настоящий — можно сверяться с живым
+        # процессом, даже если файл уже не открыт.
+        log_pid_regex=r"^daemon-(?P<pid>\d+)\.out\.log$",
         # Лог Gradle можно усекать: простой измеряется по маркерам сборок,
         # а не по mtime.
         log_trim=True,
@@ -145,7 +170,23 @@ BUILTIN_TARGETS: tuple[TargetSpec, ...] = (
         match_cmdline=KOTLIN_MAIN,
         log_name_regex=r"^kotlin-daemon\..*\.log$",
         activity=ACTIVITY_MTIME,
+        # Таймстемпы Kotlin пишутся без смещения («2026-10-20 08:55:16.690»),
+        # то есть местным временем: разбирать их как iso со смещением нельзя.
+        ts_format=TS_LOCAL,
         rebuildable=True,
+        log_globs=("/tmp/kotlin-daemon.*.log*",),
+        # Один демон пишет в несколько файлов (ротация .00/.01/.02) и держит
+        # открытым только последний: открытый файл защищает всю группу.
+        log_group_regex=(r"^(?P<group>kotlin-daemon\.\d{4}-\d{2}-\d{2}"
+                         r"\.\d{2}-\d{2}-\d{2}-\d+)\.\d+\.log"
+                         r"(?:\.lck)?$"),
+        # Эти маркеры создаёт и удаляет сам Kotlin: убийство демона их не
+        # оправдывает, а ломать может.
+        forbidden_prefixes=(
+            "kotlin-compiler-client-",
+            "kotlin-compiler-in-",
+            "kotlin-compilation-session-",
+        ),
     ),
 )
 
@@ -241,6 +282,13 @@ def _spec_from_dict(raw: dict[str, Any], warnings: list[str],
         protects=tuple(str(p) for p in protects),
         rebuildable=bool(raw.get("rebuildable", False)),
         log_trim=bool(raw.get("log_trim", False)),
+        log_globs=_str_tuple(raw.get("log_globs")),
+        log_group_regex=str(raw.get("log_group_regex") or ""),
+        log_pid_regex=str(raw.get("log_pid_regex") or ""),
+        forbidden_prefixes=_str_tuple(raw.get("forbidden_prefixes")),
+        bucket_seconds=(int(raw.get("bucket_seconds") or 0)
+                        if str(raw.get("bucket_seconds") or "0").isdigit()
+                        else 0),
     )
     if not spec.match_cmdline and not spec.match_comm:
         warnings.append(f"цели: у «{name}» нет ни match_cmdline, ни match_comm "
@@ -260,6 +308,15 @@ def _spec_from_dict(raw: dict[str, Any], warnings: list[str],
                         f"{exc}")
         spec = replace(spec, log_name_regex="")
     return spec
+
+
+def _str_tuple(value: Any) -> tuple[str, ...]:
+    """Строка или список строк → кортеж строк."""
+    if value is None or value == "":
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(str(v) for v in value)
 
 
 def _optional_float(value: Any) -> float | None:

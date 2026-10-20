@@ -37,6 +37,7 @@ def _load_tool(name: str, filename: str):
 
 watchdog = _load_tool("reaper_watchdog", "watchdog.py")
 monthly = _load_tool("reaper_monthly", "monthly-report.py")
+analyze = _load_tool("reaper_analyze_idle", "analyze-idle.py")
 
 
 class TestWatchdog(unittest.TestCase):
@@ -337,9 +338,22 @@ class TestPruneLogs(unittest.TestCase):
         os.makedirs(self.kotlin)
         self._live = prune.is_live_daemon
         self._open_fn = prune.open_paths_under
-        prune.is_live_daemon = lambda pid, kind="gradle": pid == 4242
+        prune.is_live_daemon = lambda pid, spec, targets: pid == 4242
         self._open: set[str] = set()
         prune.open_paths_under = lambda dirs: set(self._open)
+        # Цели для теста: те же, что у рейпера, но с путями в tmp.
+        self.targets = reaper.TargetSet({
+            "gradle": reaper.TargetSpec(
+                name="gradle", rebuildable=True,
+                log_globs=(os.path.join(self.gradle, "*", "daemon-*.out.log"),),
+                log_pid_regex=r"^daemon-(?P<pid>\d+)\.out\.log$"),
+            "kotlin": reaper.TargetSpec(
+                name="kotlin", rebuildable=True,
+                log_globs=(os.path.join(self.kotlin, "kotlin-daemon.*.log*"),),
+                log_group_regex=(r"^(?P<group>kotlin-daemon\.\d{4}-\d{2}-\d{2}"
+                                 r"\.\d{2}-\d{2}-\d{2}-\d+)\.\d+\.log"
+                                 r"(?:\.lck)?$")),
+        })
 
     def tearDown(self):
         prune.is_live_daemon = self._live
@@ -362,8 +376,7 @@ class TestPruneLogs(unittest.TestCase):
         return self._write(os.path.join(self.kotlin, name), **kw)
 
     def _plan(self, min_age_hours=72.0):
-        return prune.collect(self.gradle, self.kotlin, min_age_hours * 3600,
-                             time.time())
+        return prune.collect(self.targets, min_age_hours * 3600, time.time())
 
     def test_dead_daemon_log_is_planned(self):
         path = self._gradle_log(111)
@@ -496,12 +509,17 @@ class TestPruneLogs(unittest.TestCase):
         self.assertEqual(payload["removed"], 0)
 
     def test_name_parsers(self):
-        self.assertEqual(prune.parse_gradle_name("daemon-123.out.log"), 123)
-        self.assertIsNone(prune.parse_gradle_name("daemon-abc.out.log"))
+        """PID и группа берутся по регуляркам из описания цели."""
+        gradle = self.targets.get("gradle")
+        self.assertEqual(prune.pid_of(gradle, "/x/daemon-123.out.log"), 123)
+        self.assertIsNone(prune.pid_of(gradle, "/x/daemon-abc.out.log"))
+        kotlin = self.targets.get("kotlin")
         self.assertEqual(
-            prune.parse_kotlin_group("kotlin-daemon.2026-10-20.08-29-00-827.00.log"),
+            prune.group_of(kotlin,
+                           "/x/kotlin-daemon.2026-10-20.08-29-00-827.00.log"),
             "kotlin-daemon.2026-10-20.08-29-00-827")
-        self.assertIsNone(prune.parse_kotlin_group("kotlin-daemon.log"))
+        self.assertEqual(prune.group_of(kotlin, "/x/kotlin-daemon.log"),
+                         "/x/kotlin-daemon.log")
 
 
 # --------------------------------------------------------------------------- #
@@ -701,3 +719,143 @@ class TestStuckScan(unittest.TestCase):
             self.assertIn("stuck_scan", payload)
             self.assertEqual(payload["stuck_thresholds"]["60 мин"], 3600.0)
             self.assertEqual(payload["stuck_scan"]["gradle"]["60 мин"]["kills"], 1)
+
+
+# --------------------------------------------------------------------------- #
+# Ретроспективный анализ простоя — по целям (targets.yaml)
+# --------------------------------------------------------------------------- #
+
+
+class TestAnalyzeIdle(unittest.TestCase):
+    """Анализ простоя идёт по описаниям целей, а не по двум именам.
+
+    Проверяем три вещи: цель с маркерами разбирается; цель без маркеров
+    пропускается с внятной причиной (а не молча); PID демона берётся из
+    описания цели.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.logs = os.path.join(self.tmp.name, "logs")
+        os.makedirs(self.logs)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _spec(self, **kw):
+        base = dict(
+            name="mock", label="Mock",
+            match_cmdline="mock.daemon.Bootstrap",
+            log_name_regex=r"^mock-\d+\.out\.log$",
+            activity=reaper.ACTIVITY_MARKERS,
+            ts_format="iso",
+            build_start="Received command: Build",
+            build_end="Marking the daemon as idle",
+            log_globs=(os.path.join(self.logs, "mock-*.out.log"),),
+            log_pid_regex=r"^mock-(?P<pid>\d+)\.out\.log$",
+        )
+        base.update(kw)
+        return reaper.TargetSpec(**base)
+
+    def _write_log(self, pid=111, builds=((0, 60), (6600, 6660)),
+                   mtime=None):
+        """Лог с парами «сборка: (начало, конец)» в секундах от эпохи."""
+        path = os.path.join(self.logs, f"mock-{pid}.out.log")
+        lines = []
+        for start, end in builds:
+            lines.append(
+                f"{_iso(start)} [INFO] [org.gradle.launcher] "
+                f"Received command: Build{{id=1}}")
+            lines.append(
+                f"{_iso(end)} [INFO] [org.gradle.launcher] "
+                f"Marking the daemon as idle, address: []")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        stamp = mtime if mtime is not None else builds[-1][1]
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def _analyze(self, spec, thresholds=(30,)):
+        report, scan = analyze.analyze_target(
+            spec, list(thresholds), 7200, time.time(), 512 * 1024 * 1024)
+        return report, scan
+
+    def test_gap_between_builds_is_measured(self):
+        """Простой между двумя сборками = 6600 - 60 секунд."""
+        self._write_log()
+        report, scan = self._analyze(self._spec())
+        self.assertEqual(scan["files_read"], 1)
+        self.assertEqual(report["totals"]["idle_gaps"], 1)
+        self.assertAlmostEqual(report["totals"]["total_idle_hours"],
+                               6540 / 3600.0, places=3)
+
+    def test_threshold_splits_kills(self):
+        """Порог 30 мин ловит простой, порог 200 мин — нет."""
+        self._write_log()
+        report, _ = self._analyze(self._spec(), thresholds=(30, 200))
+        rows = {row["threshold_min"]: row for row in report["per_threshold"]}
+        self.assertEqual(rows[30]["kill_events"], 1)
+        self.assertEqual(rows[200]["kill_events"], 0)
+
+    def test_target_without_markers_is_skipped_with_reason(self):
+        """Цель с activity=mtime анализом не охватывается — и это сказано."""
+        reason = analyze.analyzable(self._spec(activity=reaper.ACTIVITY_MTIME,
+                                               build_start="", build_end=""))
+        self.assertIsNotNone(reason)
+        self.assertIn("mtime", reason)
+
+    def test_target_with_markers_is_analyzable(self):
+        self.assertIsNone(analyze.analyzable(self._spec()))
+
+    def test_pid_comes_from_target_description(self):
+        """PID демона берётся из log_pid_regex цели, а не из имени файла."""
+        spec = self._spec()
+        self.assertEqual(analyze.pid_from_name(spec, "/x/mock-4242.out.log"), 4242)
+        # У цели без log_pid_regex PID неизвестен — и это не «ноль».
+        spec = self._spec(log_pid_regex="")
+        self.assertIsNone(analyze.pid_from_name(spec, "/x/mock-4242.out.log"))
+
+    def test_alive_is_unknown_without_pid_regex(self):
+        spec = self._spec(log_pid_regex="")
+        self.assertIsNone(analyze.daemon_alive(spec, "/x/mock-4242.out.log"))
+
+    def test_cli_reports_skipped_target(self):
+        """CLI по файлу целей: разобранная цель — в отчёте, пропущенная — с причиной."""
+        targets_path = os.path.join(self.tmp.name, "targets.yaml")
+        with open(targets_path, "w", encoding="utf-8") as fh:
+            fh.write(
+                "targets:\n"
+                "  - name: mock\n"
+                "    label: Mock\n"
+                "    match_cmdline: mock.daemon.Bootstrap\n"
+                "    log_name_regex: '^mock-\\d+\\.out\\.log$'\n"
+                "    activity: markers\n"
+                "    ts_format: iso\n"
+                "    build_start: 'Received command: Build'\n"
+                "    build_end: 'Marking the daemon as idle'\n"
+                f"    log_globs: ['{os.path.join(self.logs, 'mock-*.out.log')}']\n"
+                "    log_pid_regex: '^mock-(?P<pid>\\d+)\\.out\\.log$'\n"
+                "  - name: other\n"
+                "    label: Other\n"
+                "    match_cmdline: other.daemon.Bootstrap\n"
+                "    activity: mtime\n"
+            )
+        self._write_log()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = analyze.main(["--targets", targets_path, "--thresholds", "30",
+                                 "--json"])
+        self.assertEqual(code, 0)
+        payload = json.loads(out.getvalue())
+        self.assertIn("mock", payload["targets"])
+        self.assertNotIn("other", payload["targets"])
+        skipped = {item["kind"]: item["reason"] for item in payload["skipped"]}
+        self.assertIn("other", skipped)
+        self.assertIn("mtime", skipped["other"])
+
+
+def _iso(seconds: float) -> str:
+    """Таймстемп в формате Gradle (iso со смещением) из секунд эпохи."""
+    import datetime as _dt
+    moment = _dt.datetime.fromtimestamp(seconds, _dt.timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.000+0000")

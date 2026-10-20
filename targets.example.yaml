@@ -61,6 +61,15 @@ targets:
     build_end_alt: "after build finished"
     cancel: "client disconnection detected"
     self_timeout_seconds: 10800  # Gradle убивает демона сам через 180 мин
+    # Где лежат логи цели (шаблоны пути). Список подставляется в targets.yaml,
+    # потому что раскладка — свойство машины, а не программы.
+    log_globs:
+      - "~/.gradle/daemon/*/daemon-*.out.log"
+      - "~/.gradle-user-home/daemon/*/daemon-*.out.log"
+      # Проекты часто ставят свой GRADLE_USER_HOME — логи копятся и там.
+      - "~/orca/workspaces/*/*/.gradle-user-home/daemon/*/daemon-*.out.log"
+    # PID в имени лога настоящий — можно сверяться с живым процессом.
+    log_pid_regex: '^daemon-(?P<pid>\d+)\.out\.log$'
     protects: [kotlin]           # пока идёт сборка, компилятор нужен
     rebuildable: true
     log_trim: true               # лог можно усекать: простой меряется по маркерам
@@ -81,6 +90,16 @@ targets:
     log_name_regex: '^kotlin-daemon\..*\.log$'
     activity: mtime            # своих маркеров у Kotlin нет
     rebuildable: true
+    log_globs:
+      - "/tmp/kotlin-daemon.*.log*"
+    # Один демон пишет в несколько файлов (ротация .00/.01) и держит
+    # открытым только последний: открытый файл защищает всю группу.
+    log_group_regex: '^(?P<group>kotlin-daemon\.\d{4}-\d{2}-\d{2}\.\d{2}-\d{2}-\d{2}-\d+)\.\d+\.log(?:\.lck)?$'
+    # Эти маркеры создаёт и удаляет сам Kotlin — трогать нельзя.
+    forbidden_prefixes:
+      - "kotlin-compiler-client-"
+      - "kotlin-compiler-in-"
+      - "kotlin-compilation-session-"
     # log_trim: false — у Kotlin mtime лога и есть признак простоя,
     # усечение сдвинуло бы его (демон выглядел бы «только что активным»).
     # Пороги — в config (KOTLIN_IDLE_SECONDS=7200, …).

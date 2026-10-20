@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ретроспективный анализ простоев Gradle-демонов по их логам.
+Ретроспективный анализ простоев демонов по их логам.
 
 Задача скрипта: ответить на вопрос «какой порог простоя (idle threshold)
-оптимален, если убивать демоны, простаивающие дольше порога».
+оптимален, если убивать демонов, простаивающих дольше порога».
 
-Логи демонов:
-  ~/.gradle/daemon/<version>/daemon-<pid>.out.log
-  /home/max/orca/workspaces/*/*/.gradle-user-home/daemon/<version>/daemon-<pid>.out.log
+Анализ идёт ПО ЦЕЛЯМ (targets.yaml), а не по двум прописаным программам:
 
-Маркеры в логе (уровень INFO, есть во всех версиях Gradle):
-  <ts> [INFO] [...] Received command: Build{id=..., currentDir=...}  — начало сборки
-  <ts> [INFO] [...] Marking the daemon as idle, address: [...]        — демон освободился
+  * где лежат логи цели — `log_globs` в описании цели;
+  * как понять, что демон работал, — `activity: markers` и сами маркеры
+    `build_start` / `build_end` в описании цели;
+  * как разбирать таймстемпы — `ts_format` в описании цели;
+  * PID демона (нужен, чтобы отличить живой демон от умершего) —
+    `log_pid_regex` в описании цели.
 
-Формат лога разбирает общий модуль `reaper/logparse.py` — тот же, что
-использует сам рейпер. Одна реализация формата вместо двух: при смене
-формата Gradle правится в одном месте.
+Цели, у которых активность измеряется по mtime лога (`activity: mtime`),
+этим анализом НЕ охватываются: там нет маркеров начала и конца работы,
+а значит нет «простоя между сборками». Такие цели пропускаются с явным
+сообщением — молча пропустить было бы хуже, чем сказать.
 
 Модель данных:
   Сборка i одного демона = интервал [start_i, end_i].
@@ -44,23 +46,24 @@ import glob as globmod
 import json
 import os
 import re
-import time
 import sys
-from typing import Dict, List, Optional, Sequence, Tuple
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-# Общий разбор формата лога (тот же, что у рейпера).
+# Пакет reaper лежит в родительском каталоге — нужен ради описаний целей.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from reaper.logparse import FileScan, scan_file  # noqa: E402
+from reaper.config import load_config, resolve_targets  # noqa: E402
+from reaper.logparse import FileScan, Markers, scan_file  # noqa: E402
+from reaper.targets import (  # noqa: E402
+    ACTIVITY_MARKERS,
+    TargetSet,
+    TargetSpec,
+    load_targets,
+)
 
 # ---------------------------------------------------------------------------
 # Константы
 # ---------------------------------------------------------------------------
-
-# Шаблоны поиска логов по умолчанию.
-DEFAULT_GLOBS: Tuple[str, ...] = (
-    "~/.gradle/daemon/*/daemon-*.out.log",
-    "/home/max/orca/workspaces/*/*/.gradle-user-home/daemon/*/daemon-*.out.log",
-)
 
 # Окно «понадобился снова» для длинной метрики (24 ч).
 LONG_REUSE_WINDOW_S = 86400
@@ -151,24 +154,44 @@ def build_gaps(scan: FileScan) -> List[Gap]:
     return gaps
 
 
-def daemon_pid(path: str) -> Optional[int]:
-    """PID демона из имени файла daemon-<pid>.out.log."""
-    base = os.path.basename(path)
-    m = re.search(r"daemon-(\d+)\.out\.log", base)
-    return int(m.group(1)) if m else None
+def pid_from_name(spec: TargetSpec, path: str) -> Optional[int]:
+    """PID демона из имени файла — по описанию цели (log_pid_regex).
+
+    У цели, у которой PID в имени настоящий (Gradle), вернётся число; у
+    цели без такой регулярки — None, и живость демона определить нельзя.
+    """
+    if not spec.log_pid_regex:
+        return None
+    try:
+        pattern = re.compile(spec.log_pid_regex)
+    except re.error:
+        return None
+    match = pattern.match(os.path.basename(path))
+    if not match:
+        return None
+    try:
+        return int(match.groupdict().get("pid"))
+    except (TypeError, ValueError):
+        return None
 
 
-def daemon_alive(path: str) -> bool:
-    """Жив ли демон прямо сейчас.
+def daemon_alive(spec: TargetSpec, path: str) -> Optional[bool]:
+    """Жив ли демон прямо сейчас (None — определить нельзя).
 
     ВНИМАНИЕ: PID мог быть переиспользован другим процессом — тогда alive
     покажет «да» ошибочно. Для оценки объёма это приемлемо.
+
+    None возвращается, когда у цели в имени файла нет PID: тогда угадывать
+    нечего, и молча считать демона мёртвым нельзя.
     """
-    pid = daemon_pid(path)
-    return pid is not None and os.path.isdir(f"/proc/{pid}")
+    pid = pid_from_name(spec, path)
+    if pid is None:
+        return None
+    return os.path.isdir(f"/proc/{pid}")
 
 
-def build_tail_gap(scan: FileScan, now: float) -> Optional[Gap]:
+def build_tail_gap(scan: FileScan, now: float,
+                   alive: Optional[bool]) -> Optional[Gap]:
     """Хвостовой простой: от конца последней закрытой сборки до конца жизни демона.
 
     Это и есть главный класс «вечных» демонов: они перестали работать и
@@ -178,8 +201,8 @@ def build_tail_gap(scan: FileScan, now: float) -> Optional[Gap]:
     if not scan.builds or scan.builds[-1].end is None:
         return None  # последняя сборка не закрыта — хвост включал бы её время
     end_of_idle = float(scan.builds[-1].end)
-    alive = daemon_alive(scan.path)
-    observation_end = now if alive else scan.mtime
+    is_alive = bool(alive)
+    observation_end = now if is_alive else scan.mtime
     duration = observation_end - end_of_idle
     if duration <= 0:
         return None
@@ -190,7 +213,7 @@ def build_tail_gap(scan: FileScan, now: float) -> Optional[Gap]:
         duration=duration,
         reuse_delta=None,   # после последней сборки «повторной нужности» не бывает
         is_tail=True,
-        alive=alive,
+        alive=is_alive,
     )
 
 
@@ -340,6 +363,182 @@ def aggregate(
 
 
 # ---------------------------------------------------------------------------
+# Сбор данных по цели
+# ---------------------------------------------------------------------------
+
+
+def analyzable(spec: TargetSpec) -> Optional[str]:
+    """Можно ли анализировать простой этой цели. None — можно.
+
+    Возвращает причину, если нельзя: по «activity: mtime» маркеров нет,
+    а без них «простоя между сборками» не существует.
+    """
+    if spec.activity != ACTIVITY_MARKERS:
+        return (f"активность измеряется по mtime лога (activity={spec.activity}) — "
+                f"маркеров начала/конца работы нет, простой между сборками "
+                f"не определить")
+    if not spec.build_start:
+        return "в описании цели нет маркера начала работы (build_start)"
+    if not spec.build_end and not spec.build_end_alt:
+        return "в описании цели нет маркера конца работы (build_end)"
+    return None
+
+
+def discover_files(spec: TargetSpec,
+                   overrides: Optional[Sequence[str]] = None) -> List[str]:
+    """Раскрывает шаблоны путей цели в список существующих файлов (без дублей)."""
+    patterns = list(overrides) if overrides else list(spec.log_globs)
+    found: List[str] = []
+    seen = set()
+    for pattern in patterns:
+        for path in sorted(globmod.glob(os.path.expanduser(pattern), recursive=True)):
+            if path in seen:
+                continue
+            if not os.path.isfile(path):
+                continue
+            seen.add(path)
+            found.append(path)
+    return found
+
+
+def analyze_target(spec: TargetSpec, thresholds: List[int], reuse_window: int,
+                   now: float, max_bytes: int,
+                   overrides: Optional[Sequence[str]] = None
+                   ) -> Tuple[Dict[str, object], Dict[str, object]]:
+    """Читает логи цели и считает статистику простоя по ним."""
+    files = discover_files(spec, overrides)
+    markers = Markers.from_spec(spec)
+    ts_format = spec.ts_format
+
+    scan_stats: Dict[str, object] = {
+        "files_found": len(files),
+        "files_read": 0,
+        "files_skipped": 0,
+        "files_failed": 0,
+        "files_without_markers": 0,
+        "builds_total": 0,
+        "builds_closed": 0,
+        "builds_unclosed": 0,
+        "idle_without_start": 0,
+        "bad_timestamp_lines": 0,
+        "tail_idle_hours": 0.0,
+        "tail_idle_files": 0,
+        "tail_observation_hours": 0.0,
+        "tail_observation_files": 0,
+        "alive_unknown_files": 0,
+    }
+
+    all_gaps: List[Gap] = []
+    scans: List[Tuple[FileScan, Optional[bool]]] = []
+
+    for path in files:
+        try:
+            size = os.path.getsize(path)
+        except OSError as exc:
+            scan_stats["files_failed"] = int(scan_stats["files_failed"]) + 1
+            print(f"ПРЕДУПРЕЖДЕНИЕ: не удалось получить размер {path}: {exc}", file=sys.stderr)
+            continue
+
+        if size > max_bytes:
+            scan_stats["files_skipped"] = int(scan_stats["files_skipped"]) + 1
+            print(
+                f"ПРЕДУПРЕЖДЕНИЕ: пропущен большой лог {path}"
+                f" ({size / 1024 / 1024:.1f} МБ > {max_bytes / 1024 / 1024:.0f} МБ)",
+                file=sys.stderr,
+            )
+            continue
+
+        try:
+            scan = scan_file(path, markers=markers, ts_format=ts_format)
+        except OSError as exc:
+            # Битый/нечитаемый лог не должен ронять весь прогон.
+            scan_stats["files_failed"] = int(scan_stats["files_failed"]) + 1
+            print(f"ПРЕДУПРЕЖДЕНИЕ: не удалось прочитать {path}: {exc}", file=sys.stderr)
+            continue
+        except Exception as exc:  # noqa: BLE001 — единичный битый файл не валит прогон
+            scan_stats["files_failed"] = int(scan_stats["files_failed"]) + 1
+            print(f"ПРЕДУПРЕЖДЕНИЕ: ошибка разбора {path}: {exc}", file=sys.stderr)
+            continue
+
+        scan_stats["files_read"] = int(scan_stats["files_read"]) + 1
+        scan_stats["builds_total"] = int(scan_stats["builds_total"]) + len(scan.builds)
+        scan_stats["builds_unclosed"] = int(scan_stats["builds_unclosed"]) + scan.unclosed_builds
+        scan_stats["builds_closed"] = int(scan_stats["builds_closed"]) + (
+            len(scan.builds) - scan.unclosed_builds
+        )
+        scan_stats["idle_without_start"] = int(scan_stats["idle_without_start"]) + (
+            scan.idle_without_start
+        )
+        scan_stats["bad_timestamp_lines"] = int(scan_stats["bad_timestamp_lines"]) + (
+            scan.bad_timestamp_lines
+        )
+
+        if not scan.builds:
+            scan_stats["files_without_markers"] = int(scan_stats["files_without_markers"]) + 1
+
+        alive = daemon_alive(spec, path)
+        if alive is None:
+            scan_stats["alive_unknown_files"] = int(scan_stats["alive_unknown_files"]) + 1
+        scans.append((scan, alive))
+        all_gaps.extend(build_gaps(scan))
+
+        # Хвост наблюдения: от последнего события в логе до mtime файла.
+        # ВАЖНО: если последняя сборка не закрыта (лог оборван), хвост включает
+        # время её выполнения, поэтому это верхняя оценка «чистого» простоя.
+        last_event: Optional[float] = None
+        for build in scan.builds:
+            if last_event is None or build.start > last_event:
+                last_event = build.start
+            if build.end is not None and (last_event is None or build.end > last_event):
+                last_event = build.end
+        if last_event is not None:
+            tail = scan.mtime - last_event
+            if tail > 0:
+                scan_stats["tail_observation_hours"] = (
+                    float(scan_stats["tail_observation_hours"]) + tail / 3600.0
+                )
+                scan_stats["tail_observation_files"] = int(
+                    scan_stats["tail_observation_files"]
+                ) + 1
+
+        # Чистый простой: только для логов, чья последняя сборка закрыта
+        # маркером idle — тогда хвост гарантированно простой.
+        if scan.builds and scan.builds[-1].end is not None:
+            tail = scan.mtime - float(scan.builds[-1].end)
+            if tail > 0:
+                scan_stats["tail_idle_hours"] = float(scan_stats["tail_idle_hours"]) + tail / 3600.0
+                scan_stats["tail_idle_files"] = int(scan_stats["tail_idle_files"]) + 1
+
+    tail_gaps: List[Gap] = []
+    for scan, alive in scans:
+        gap = build_tail_gap(scan, now, alive)
+        if gap is not None:
+            tail_gaps.append(gap)
+
+    report = aggregate(all_gaps, thresholds, reuse_window, tail_gaps)
+    report["recommendation"] = pick_recommendation(
+        report["per_threshold"], thresholds,  # type: ignore[arg-type]
+        report.get("per_threshold_all"))
+
+    totals: Dict[str, object] = report["totals"]  # type: ignore[assignment]
+    totals["files"] = int(scan_stats["files_read"])
+    totals["builds"] = int(scan_stats["builds_total"])
+    totals["files_found"] = int(scan_stats["files_found"])
+    totals["files_skipped"] = int(scan_stats["files_skipped"])
+    totals["files_failed"] = int(scan_stats["files_failed"])
+    totals["files_without_markers"] = int(scan_stats["files_without_markers"])
+    totals["builds_closed"] = int(scan_stats["builds_closed"])
+    totals["builds_unclosed"] = int(scan_stats["builds_unclosed"])
+    totals["tail_idle_hours"] = round(float(scan_stats["tail_idle_hours"]), 3)
+    totals["tail_observation_hours"] = round(float(scan_stats["tail_observation_hours"]), 3)
+    totals["idle_without_start"] = int(scan_stats["idle_without_start"])
+    totals["bad_timestamp_lines"] = int(scan_stats["bad_timestamp_lines"])
+    totals["alive_unknown_files"] = int(scan_stats["alive_unknown_files"])
+
+    return report, scan_stats
+
+
+# ---------------------------------------------------------------------------
 # Вывод
 # ---------------------------------------------------------------------------
 
@@ -349,13 +548,14 @@ def fmt(value: float, digits: int = 1) -> str:
     return f"{value:,.{digits}f}".replace(",", " ")
 
 
-def print_report(report: Dict[str, object], scan_stats: Dict[str, object]) -> None:
-    """Печатает человекочитаемую таблицу."""
+def print_report(label: str, report: Dict[str, object],
+                 scan_stats: Dict[str, object]) -> None:
+    """Печатает человекочитаемую таблицу по одной цели."""
     totals: Dict[str, object] = report["totals"]  # type: ignore[assignment]
     per_threshold: List[Dict[str, object]] = report["per_threshold"]  # type: ignore[assignment]
 
     print("=" * 78)
-    print("Ретроспективный анализ простоев Gradle-демонов")
+    print(f"Ретроспективный анализ простоев демонов: {label}")
     print("=" * 78)
     print(
         f"Логов прочитано:        {scan_stats['files_read']}"
@@ -380,6 +580,12 @@ def print_report(report: Dict[str, object], scan_stats: Dict[str, object]) -> No
         f" {fmt(scan_stats['tail_idle_hours'], 1)} демо-часов"
         f" в {scan_stats['tail_idle_files']} логах"
     )
+    unknown_alive = int(scan_stats.get("alive_unknown_files", 0) or 0)
+    if unknown_alive:
+        print(
+            f"Живость не определялась:  {unknown_alive} логов без PID в имени "
+            f"(у цели нет log_pid_regex) — хвостовые простои посчитаны по mtime"
+        )
     print()
 
     print("Распределение длительности простоев:")
@@ -547,26 +753,12 @@ def parse_thresholds(raw: str) -> List[int]:
     return sorted(set(values))
 
 
-def discover_files(patterns: Sequence[str]) -> List[str]:
-    """Раскрывает шаблоны путей в список существующих файлов (без дублей)."""
-    found: List[str] = []
-    seen = set()
-    for pattern in patterns:
-        for path in sorted(globmod.glob(os.path.expanduser(pattern), recursive=True)):
-            if path in seen:
-                continue
-            if not os.path.isfile(path):
-                continue
-            seen.add(path)
-            found.append(path)
-    return found
-
-
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Ретроспективный анализ простоев Gradle-демонов по логам: "
-            "подбор оптимального порога простоя для kill по таймауту."
+            "Ретроспективный анализ простоев демонов по логам (по целям "
+            "из targets.yaml): подбор оптимального порога простоя для kill "
+            "по таймауту."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -590,13 +782,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="машинно-читаемый вывод в stdout (JSON), предупреждения — в stderr",
     )
     parser.add_argument(
+        "--targets",
+        default=None,
+        help="путь к файлу целей (YAML); по умолчанию — ~/.config/java-reaper/targets.yaml",
+    )
+    parser.add_argument(
+        "--kind",
+        action="append",
+        dest="kinds",
+        help=(
+            "разбирать только указанный вид демонов (можно указать несколько). "
+            "По умолчанию — все, которые этим анализом охватываются."
+        ),
+    )
+    parser.add_argument(
         "--glob",
         action="append",
         dest="globs",
         help=(
-            "шаблон путей к логам (можно указать несколько). "
-            "По умолчанию: ~/.gradle/daemon/*/daemon-*.out.log и "
-            "/home/max/orca/workspaces/*/*/.gradle-user-home/daemon/*/daemon-*.out.log"
+            "шаблон путей к логам (можно указать несколько) — перекрывает "
+            "log_globs цели. Полезно, чтобы разобрать логи одной машины, "
+            "не правя описание цели."
         ),
     )
     parser.add_argument(
@@ -618,167 +824,72 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("Ошибка: --reuse-window должен быть положительным", file=sys.stderr)
         return 2
 
-    patterns = args.globs if args.globs else list(DEFAULT_GLOBS)
-    files = discover_files(patterns)
-    max_bytes = args.max_log_mb * 1024 * 1024
+    warnings: List[str] = []
+    cfg = load_config(None, warnings)
+    targets: TargetSet = resolve_targets(load_targets(args.targets, warnings),
+                                        cfg, set(), warnings)
+    for w in warnings:
+        print(f"WARNING: {w}", file=sys.stderr)
 
-    scan_stats: Dict[str, object] = {
-        "files_found": len(files),
-        "files_read": 0,
-        "files_skipped": 0,
-        "files_failed": 0,
-        "files_without_markers": 0,
-        "builds_total": 0,
-        "builds_closed": 0,
-        "builds_unclosed": 0,
-        "idle_without_start": 0,
-        "bad_timestamp_lines": 0,
-        "tail_idle_hours": 0.0,
-        "tail_idle_files": 0,
-        "tail_observation_hours": 0.0,
-        "tail_observation_files": 0,
-    }
+    if args.kinds:
+        wanted = set(args.kinds)
+        unknown = wanted - set(targets.names())
+        if unknown:
+            print(f"Ошибка: неизвестные виды демонов: {', '.join(sorted(unknown))}",
+                  file=sys.stderr)
+            return 2
+        specs = [spec for spec in targets.specs() if spec.name in wanted]
+    else:
+        specs = list(targets.specs())
 
-    all_gaps: List[Gap] = []
-    scans: List[FileScan] = []
+    max_bytes = int(args.max_log_mb * 1024 * 1024)
     now = time.time()
 
-    for path in files:
-        try:
-            size = os.path.getsize(path)
-        except OSError as exc:
-            scan_stats["files_failed"] = int(scan_stats["files_failed"]) + 1
-            print(f"ПРЕДУПРЕЖДЕНИЕ: не удалось получить размер {path}: {exc}", file=sys.stderr)
+    reports: Dict[str, Any] = {}
+    skipped: List[Dict[str, str]] = []
+    for spec in specs:
+        reason = analyzable(spec)
+        if reason is not None:
+            skipped.append({"kind": spec.name, "reason": reason})
             continue
+        report, scan_stats = analyze_target(spec, thresholds, args.reuse_window,
+                                            now, max_bytes, args.globs)
+        reports[spec.name] = {"report": report, "scan": scan_stats}
 
-        if size > max_bytes:
-            scan_stats["files_skipped"] = int(scan_stats["files_skipped"]) + 1
-            print(
-                f"ПРЕДУПРЕЖДЕНИЕ: пропущен большой лог {path}"
-                f" ({size / 1024 / 1024:.1f} МБ > {args.max_log_mb} МБ)",
-                file=sys.stderr,
-            )
-            continue
-
-        try:
-            scan = scan_file(path)
-        except OSError as exc:
-            # Битый/нечитаемый лог не должен ронять весь прогон.
-            scan_stats["files_failed"] = int(scan_stats["files_failed"]) + 1
-            print(f"ПРЕДУПРЕЖДЕНИЕ: не удалось прочитать {path}: {exc}", file=sys.stderr)
-            continue
-        except Exception as exc:  # noqa: BLE001 — единичный битый файл не валит прогон
-            scan_stats["files_failed"] = int(scan_stats["files_failed"]) + 1
-            print(f"ПРЕДУПРЕЖДЕНИЕ: ошибка разбора {path}: {exc}", file=sys.stderr)
-            continue
-
-        scan_stats["files_read"] = int(scan_stats["files_read"]) + 1
-        scan_stats["builds_total"] = int(scan_stats["builds_total"]) + len(scan.builds)
-        scan_stats["builds_unclosed"] = int(scan_stats["builds_unclosed"]) + scan.unclosed_builds
-        scan_stats["builds_closed"] = int(scan_stats["builds_closed"]) + (
-            len(scan.builds) - scan.unclosed_builds
-        )
-        scan_stats["idle_without_start"] = int(scan_stats["idle_without_start"]) + (
-            scan.idle_without_start
-        )
-        scan_stats["bad_timestamp_lines"] = int(scan_stats["bad_timestamp_lines"]) + (
-            scan.bad_timestamp_lines
-        )
-
-        if not scan.builds:
-            scan_stats["files_without_markers"] = int(scan_stats["files_without_markers"]) + 1
-
-        scans.append(scan)
-        all_gaps.extend(build_gaps(scan))
-
-        # Хвост наблюдения: от последнего события в логе до mtime файла.
-        # ВАЖНО: если последняя сборка не закрыта (лог оборван), хвост включает
-        # время её выполнения, поэтому это верхняя оценка «чистого» простоя.
-        last_event: Optional[float] = None
-        for build in scan.builds:
-            if last_event is None or build.start > last_event:
-                last_event = build.start
-            if build.end is not None and (last_event is None or build.end > last_event):
-                last_event = build.end
-        if last_event is not None:
-            tail = scan.mtime - last_event
-            if tail > 0:
-                scan_stats["tail_observation_hours"] = (
-                    float(scan_stats["tail_observation_hours"]) + tail / 3600.0
-                )
-                scan_stats["tail_observation_files"] = int(
-                    scan_stats["tail_observation_files"]
-                ) + 1
-
-        # Чистый простой: только для логов, чья последняя сборка закрыта
-        # маркером idle — тогда хвост гарантированно простой.
-        if scan.builds and scan.builds[-1].end is not None:
-            tail = scan.mtime - float(scan.builds[-1].end)
-            if tail > 0:
-                scan_stats["tail_idle_hours"] = float(scan_stats["tail_idle_hours"]) + tail / 3600.0
-                scan_stats["tail_idle_files"] = int(scan_stats["tail_idle_files"]) + 1
-
-    if not all_gaps and int(scan_stats["builds_total"]) == 0:
+    if not reports:
         message = (
-            "Маркеры не найдены: ни в одном из "
-            f"{scan_stats['files_found']} логов не встретилось ни «Received command: Build», "
-            "ни «Marking the daemon as idle». Проверьте шаблоны --glob и пути к логам."
+            "Ни одна цель не охватывается этим анализом. "
+            + "; ".join(f"{s['kind']}: {s['reason']}" for s in skipped)
         )
         if args.json:
-            print(
-                json.dumps(
-                    {
-                        "thresholds": thresholds,
-                        "per_threshold": [],
-                        "totals": {"files": int(scan_stats["files_read"]), "builds": 0, "idle_gaps": 0},
-                        "message": message,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
+            print(json.dumps({"thresholds": thresholds, "targets": {},
+                              "skipped": skipped, "message": message},
+                             ensure_ascii=False, indent=2))
         else:
             print(message)
         return 0
 
-    tail_gaps: List[Gap] = []
-    for scan in scans:
-        gap = build_tail_gap(scan, now)
-        if gap is not None:
-            tail_gaps.append(gap)
-
-    report = aggregate(all_gaps, thresholds, args.reuse_window, tail_gaps)
-    report["recommendation"] = pick_recommendation(
-        report["per_threshold"], thresholds,  # type: ignore[arg-type]
-        report.get("per_threshold_all"))
-
-    totals: Dict[str, object] = report["totals"]  # type: ignore[assignment]
-    totals["files"] = int(scan_stats["files_read"])
-    totals["builds"] = int(scan_stats["builds_total"])
-    totals["files_found"] = int(scan_stats["files_found"])
-    totals["files_skipped"] = int(scan_stats["files_skipped"])
-    totals["files_failed"] = int(scan_stats["files_failed"])
-    totals["files_without_markers"] = int(scan_stats["files_without_markers"])
-    totals["builds_closed"] = int(scan_stats["builds_closed"])
-    totals["builds_unclosed"] = int(scan_stats["builds_unclosed"])
-    totals["tail_idle_hours"] = round(float(scan_stats["tail_idle_hours"]), 3)
-    totals["tail_observation_hours"] = round(float(scan_stats["tail_observation_hours"]), 3)
-    totals["idle_without_start"] = int(scan_stats["idle_without_start"])
-    totals["bad_timestamp_lines"] = int(scan_stats["bad_timestamp_lines"])
-
     if args.json:
         payload = {
             "thresholds": thresholds,
-            "per_threshold": report["per_threshold"],
-            "per_threshold_all": report["per_threshold_all"],
-            "tail": report["tail"],
-            "totals": totals,
-            "recommendation": report["recommendation"],
+            "targets": {
+                kind: {"report": data["report"], "scan": data["scan"]}
+                for kind, data in reports.items()
+            },
+            "skipped": skipped,
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
-    else:
-        print_report(report, scan_stats)
+        return 0
 
+    labels = targets.labels()
+    for kind, data in reports.items():
+        print_report(labels.get(kind, kind), data["report"], data["scan"])
+        print()
+
+    if skipped:
+        print("Пропущены цели (этим анализом не охватываются):")
+        for item in skipped:
+            print(f"  {item['kind']}: {item['reason']}")
     return 0
 
 

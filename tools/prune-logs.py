@@ -7,18 +7,19 @@ Gradle и Kotlin не убирают свои логи: `~/.gradle/daemon` ра�
 
 Инструмент удаляет ТОЛЬКО логи процессов, которых уже не существует.
 
-Как определяется «лог мёртвого демона»:
+Как определяется «лог мёртвого демона» (для каждой цели — по её описанию
+в targets.yaml):
 
   * ЛОГ ЖИВ, если его держит открытым какой-либо процесс. Это главная и
     достаточная проверка: пока демон жив, он держит свой лог открытым.
     Проверка делается один раз: собираем все файлы, открытые процессами
     машины, и сверяем с кандидатами.
-  * Для Gradle дополнительно сверяется PID из имени (`daemon-<pid>.out.log`
-    — там PID настоящий) с живым процессом-демоном.
-  * Для Kotlin PID в имени НЕ настоящий: имя вида
-    `kotlin-daemon.2026-10-20.08-29-00-827.00.log` содержит номер
-    инстанса, а не PID (проверено: живой демон с PID 35498 пишет в лог
-    `…-827.00.log`). Поэтому для Kotlin решает только проверка «файл открыт».
+  * Если у цели в имени файла есть настоящий PID (у Gradle — `daemon-<pid>.
+    out.log`, там PID настоящий), дополнительно сверяем его с живым
+    процессом-демоном этой же цели.
+  * Если у цели файлы группируются по инстансу (у Kotlin — ротация
+    `.00`, `.01`, `.02`), открытый файл защищает ВСЮ группу: живой демон
+    держит открытым только последний файл, а прежние остаются на диске.
 
 По умолчанию инструмент НИЧЕГО НЕ УДАЛЯЕТ, а только показывает план
 (режим dry-run). Удаление включает флаг `--apply`.
@@ -34,14 +35,16 @@ Gradle и Kotlin не убирают свои логи: `~/.gradle/daemon` ра�
   * маркеры Kotlin (`kotlin-compiler-client-*-is-running`,
     `kotlin-compiler-in-*.alive`, `kotlin-compilation-session-*-is-running`) —
     их в жизни создаёт и удаляет сам Kotlin, убийство демона их не
-    оправдывает, а ломать может;
+    оправдывает, а ломать может (список — в описании цели,
+    `forbidden_prefixes`);
   * логи живых демонов (проверка «файл открыт»);
-  * что-либо, чьё имя не совпадает с известными шаблонами.
+  * что-либо, чьё имя не совпадает с шаблонами цели.
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -52,38 +55,14 @@ from typing import Any
 # Пакет reaper лежит в родительском каталоге — нужен ради сводок истории.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from reaper.config import load_config, resolve_targets  # noqa: E402
 from reaper.history import (  # noqa: E402
     append_history,
     default_history_path,
     history_keys,
-    summarize_gradle,
-    summarize_kotlin,
+    summarize_by_path,
 )
-
-# Главные классы демонов: по ним видно, что процесс — тот самый демон.
-GRADLE_MAIN = "org.gradle.launcher.daemon.bootstrap.GradleDaemon"
-KOTLIN_MAIN = "org.jetbrains.kotlin.daemon.KotlinCompileDaemon"
-
-# Шаблоны имён логов.
-GRADLE_LOG_RE = re.compile(r"^daemon-(?P<pid>\d+)\.out\.log$")
-# В имени Kotlin-лога PID нет: последнее число — инстанс, а не процесс.
-# Один демон пишет в несколько файлов (.00, .01, .02 — ротация), поэтому
-# шаблон выделяет ГРУППУ файлов одного демона: префикс до номера файла.
-KOTLIN_GROUP_RE = re.compile(
-    r"^(?P<group>kotlin-daemon\.\d{4}-\d{2}-\d{2}\.\d{2}-\d{2}-\d{2}-\d+)"
-    r"\.\d+\.log(?:\.lck)?$")
-
-# Маркеры Kotlin: трогать нельзя никогда.
-FORBIDDEN_PREFIXES = (
-    "kotlin-compiler-client-",
-    "kotlin-compiler-in-",
-    "kotlin-compilation-session-",
-)
-
-
-def is_forbidden(name: str) -> bool:
-    """Файл из «неприкосновенного» списка Kotlin."""
-    return any(name.startswith(p) for p in FORBIDDEN_PREFIXES)
+from reaper.targets import TargetSet, load_targets  # noqa: E402
 
 
 def proc_cmdline(pid: int) -> str:
@@ -95,17 +74,18 @@ def proc_cmdline(pid: int) -> str:
         return ""
 
 
-def is_live_daemon(pid: int, kind: str = "gradle") -> bool:
-    """Жив ли демон этого класса с таким PID.
+def is_live_daemon(pid: int, spec: Any, targets: TargetSet) -> bool:
+    """Жив ли демон этой цели с таким PID.
 
     PID мог быть переиспользован другим процессом — тогда демон мёртв,
-    даже если PID существует.
+    даже если PID существует. Поэтому проверяем не «существует ли PID», а
+    «похож ли процесс на демон этой цели».
     """
     cmdline = proc_cmdline(pid)
     if not cmdline:
         return False
-    main = GRADLE_MAIN if kind == "gradle" else KOTLIN_MAIN
-    return main in cmdline
+    matched = targets.match(cmdline)
+    return matched is not None and matched.name == spec.name
 
 
 def open_paths_under(dirs: list[str]) -> set[str]:
@@ -137,109 +117,118 @@ def open_paths_under(dirs: list[str]) -> set[str]:
     return out
 
 
-def iter_gradle_logs(gradle_dir: str):
-    """Все логи Gradle: (путь, pid)."""
-    if not os.path.isdir(gradle_dir):
-        return
-    for version in sorted(os.listdir(gradle_dir)):
-        sub = os.path.join(gradle_dir, version)
-        if not os.path.isdir(sub):
-            continue
-        for name in sorted(os.listdir(sub)):
-            pid = parse_gradle_name(name)
-            if pid is None:
+def _expand(pattern: str) -> list[str]:
+    """Раскрывает шаблон пути с «~» и wildcards."""
+    return sorted(glob.glob(os.path.expanduser(pattern)))
+
+
+def iter_logs(spec: Any, overrides: dict[str, list[str]] | None = None
+              ) -> list[str]:
+    """Все файлы логов цели — по её шаблонам (log_globs)."""
+    patterns = (overrides or {}).get(spec.name) or list(spec.log_globs)
+    out: list[str] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        for path in _expand(pattern):
+            if path in seen or not os.path.isfile(path):
                 continue
-            yield os.path.join(sub, name), pid
+            seen.add(path)
+            out.append(path)
+    return out
 
 
-def kotlin_groups(kotlin_dir: str) -> dict[str, list[str]]:
-    """Группы файлов одного демона Kotlin: префикс → список путей.
+def group_of(spec: Any, path: str) -> str:
+    """Ключ группы файлов одного демона.
 
-    Группировка обязательна: живой демон держит открытым только последний
-    файл (.NN), а предыдущие (.00, .01) остаются на диске. Если судить
-    по каждому файлу отдельно, мы удалили бы логи живого демона.
+    У Kotlin один демон пишет в несколько файлов (ротация .00/.01/.02),
+    и живой демон держит открытым только последний. Если судить по каждому
+    файлу отдельно, мы удалили бы логи живого демона. Поэтому у цели есть
+    регулярка группировки; если её нет — файл сам себе группа.
     """
-    groups: dict[str, list[str]] = {}
-    if not os.path.isdir(kotlin_dir):
-        return groups
-    for name in sorted(os.listdir(kotlin_dir)):
-        if is_forbidden(name):
-            continue
-        m = KOTLIN_GROUP_RE.match(name)
-        if not m:
-            continue
-        groups.setdefault(m.group("group"), []).append(
-            os.path.join(kotlin_dir, name))
-    return groups
+    if not spec.log_group_regex:
+        return path
+    try:
+        pattern = re.compile(spec.log_group_regex)
+    except re.error:
+        return path
+    match = pattern.match(os.path.basename(path))
+    if not match:
+        return path
+    return match.groupdict().get("group") or path
 
 
-def parse_gradle_name(name: str) -> int | None:
-    """PID из имени лога Gradle (в имени он настоящий)."""
-    m = GRADLE_LOG_RE.match(name)
-    return int(m.group("pid")) if m else None
+def pid_of(spec: Any, path: str) -> int | None:
+    """PID демона из имени файла (если у цели он настоящий)."""
+    if not spec.log_pid_regex:
+        return None
+    try:
+        pattern = re.compile(spec.log_pid_regex)
+    except re.error:
+        return None
+    match = pattern.match(os.path.basename(path))
+    if not match:
+        return None
+    try:
+        return int(match.groupdict().get("pid"))
+    except (TypeError, ValueError):
+        return None
 
 
-def parse_kotlin_group(name: str) -> str | None:
-    """Префикс группы файлов демона Kotlin (если имя подходит под шаблон)."""
-    m = KOTLIN_GROUP_RE.match(name)
-    return m.group("group") if m else None
+def is_forbidden(spec: Any, name: str) -> bool:
+    """Файл из «неприкосновенного» списка цели."""
+    return any(name.startswith(prefix) for prefix in spec.forbidden_prefixes)
 
 
-def collect(gradle_dir: str, kotlin_dir: str, min_age_seconds: float,
-            now: float, open_paths: set[str] | None = None
+def collect(targets: TargetSet, min_age_seconds: float, now: float,
+            open_paths: set[str] | None = None,
+            overrides: dict[str, list[str]] | None = None
             ) -> list[dict[str, Any]]:
     """Собирает план уборки: логи мёртвых демонов, которые не жалко удалить."""
-    if open_paths is None:
-        open_paths = open_paths_under([gradle_dir, kotlin_dir])
     plan: list[dict[str, Any]] = []
+    for spec in targets.specs():
+        paths = iter_logs(spec, overrides)
+        if not paths:
+            continue
+        if open_paths is None:
+            open_paths = open_paths_under(
+                [os.path.dirname(p) for p in paths])
 
-    # Gradle: один демон — один файл, и PID в имени настоящий.
-    for path, pid in iter_gradle_logs(gradle_dir):
-        try:
-            st = os.stat(path)
-        except OSError:
-            continue
-        if (now - st.st_mtime) < min_age_seconds:
-            # Свежий лог: демон умер только что, лог ещё может быть
-            # нужен для разбора (и наш рейпер его читает).
-            continue
-        if path in open_paths:
-            continue
-        if is_live_daemon(pid):
-            continue
-        plan.append({
-            "path": path,
-            "kind": "gradle",
-            "pid": pid,
-            "size_bytes": st.st_size,
-            "age_hours": round((now - st.st_mtime) / 3600.0, 1),
-        })
-
-    # Kotlin: файлы группируются по демону. Живой демон держит открытым
-    # только последний файл группы — поэтому открытый файл защищает
-    # ВСЮ группу, а не себя.
-    for group, paths in kotlin_groups(kotlin_dir).items():
-        if any(p in open_paths for p in paths):
-            continue
+        # Группируем: открытый файл защищает всю группу.
+        groups: dict[str, list[str]] = {}
         for path in paths:
-            try:
-                st = os.stat(path)
-            except OSError:
-                continue
-            if (now - st.st_mtime) < min_age_seconds:
-                continue
-            plan.append({
-                "path": path,
-                "kind": "kotlin",
-                "pid": None,
-                "size_bytes": st.st_size,
-                "age_hours": round((now - st.st_mtime) / 3600.0, 1),
-                "lock": path.endswith(".lck"),
-            })
+            groups.setdefault(group_of(spec, path), []).append(path)
+
+        for _group, group_paths in groups.items():
+            if any(p in open_paths for p in group_paths):
+                continue  # живой демон держит свой лог открытым
+            for path in group_paths:
+                name = os.path.basename(path)
+                if is_forbidden(spec, name):
+                    continue
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                if (now - st.st_mtime) < min_age_seconds:
+                    # Свежий лог: демон умер только что, лог ещё может быть
+                    # нужен для разбора (и наш рейпер его читает).
+                    continue
+                pid = pid_of(spec, path)
+                if pid is not None and is_live_daemon(pid, spec, targets):
+                    continue
+                plan.append({
+                    "path": path,
+                    "kind": spec.name,
+                    "pid": pid,
+                    "size_bytes": st.st_size,
+                    "age_hours": round((now - st.st_mtime) / 3600.0, 1),
+                    "lock": name.endswith(".lck"),
+                })
     return plan
 
 
-def summarize_for_history(item: dict[str, Any]) -> dict[str, Any] | None:
+def summarize_for_history(item: dict[str, Any],
+                          targets: TargetSet | None = None) -> dict[str, Any] | None:
     """Сводка по логу, который собираемся удалить.
 
     Лог — это десятки мегабайт, сводка — килобайты. Сводка остаётся
@@ -247,16 +236,13 @@ def summarize_for_history(item: dict[str, Any]) -> dict[str, Any] | None:
     """
     path = item["path"]
     try:
-        if item["kind"] == "gradle":
-            version = os.path.basename(os.path.dirname(path))
-            return summarize_gradle(path, pid=item.get("pid"), version=version)
-        instance = os.path.basename(path).split("-")[-1].split(".")[0]
-        return summarize_kotlin(path, instance=instance)
+        return summarize_by_path(path, item.get("kind"), targets)
     except OSError:
         return None
 
 
-def write_history(plan: list[dict[str, Any]], history_path: str) -> int:
+def write_history(plan: list[dict[str, Any]], history_path: str,
+                  targets: TargetSet | None = None) -> int:
     """Пишет сводки по всем кандидатам в JSONL-историю. Возвращает число.
 
     Повторный прогон по тем же файлам не добавляет дубликатов: ключ
@@ -268,7 +254,7 @@ def write_history(plan: list[dict[str, Any]], history_path: str) -> int:
     for item in plan:
         if item.get("lock"):
             continue  # замок — не демон
-        record = summarize_for_history(item)
+        record = summarize_for_history(item, targets)
         if record is None:
             continue
         key = (str(record.get("path")), float(record.get("mtime") or 0.0))
@@ -328,16 +314,18 @@ def format_plan(plan: list[dict[str, Any]], dry_run: bool) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Уборка логов мёртвых Gradle/Kotlin-демонов "
+        description="Уборка логов мёртвых демонов "
                     "(по умолчанию — dry-run)")
     parser.add_argument("--apply", action="store_true",
                         help="реально удалить (по умолчанию только показать план)")
     parser.add_argument("--min-age-hours", type=float, default=72.0,
                         help="удалять только логи старше N часов (по умолчанию 72)")
-    parser.add_argument("--gradle-dir", default=os.path.expanduser("~/.gradle/daemon"),
-                        help="каталог логов Gradle")
-    parser.add_argument("--kotlin-dir", default="/tmp",
-                        help="каталог логов Kotlin")
+    parser.add_argument("--targets", default=None,
+                        help="путь к файлу целей (YAML)")
+    parser.add_argument("--gradle-dir", default=None,
+                        help="каталог логов Gradle (перекрывает описание цели)")
+    parser.add_argument("--kotlin-dir", default=None,
+                        help="каталог логов Kotlin (перекрывает описание цели)")
     parser.add_argument("--json", action="store_true",
                         help="машиночитаемый вывод")
     parser.add_argument("--history", default=None,
@@ -350,16 +338,31 @@ def main(argv: list[str] | None = None) -> int:
                         help="только сохранить сводки, ничего не удалять")
     args = parser.parse_args(argv)
 
+    warnings: list[str] = []
+    cfg = load_config(args.config if hasattr(args, "config") else None, warnings)
+    targets = resolve_targets(load_targets(args.targets, warnings), cfg,
+                              set(), warnings)
+    for w in warnings:
+        print(f"WARNING: {w}", file=sys.stderr, flush=True)
+
+    # Старые ключи командной строки перекрывают описание цели: оператор
+    # привык ими пользоваться.
+    overrides: dict[str, list[str]] = {}
+    if args.gradle_dir:
+        overrides["gradle"] = [os.path.join(os.path.expanduser(args.gradle_dir),
+                                            "*", "daemon-*.out.log")]
+    if args.kotlin_dir:
+        overrides["kotlin"] = [os.path.join(os.path.expanduser(args.kotlin_dir),
+                                            "kotlin-daemon.*.log*")]
+
     now = time.time()
-    open_paths = open_paths_under([args.gradle_dir, args.kotlin_dir])
-    plan = collect(args.gradle_dir, args.kotlin_dir,
-                   args.min_age_hours * 3600.0, now, open_paths)
+    plan = collect(targets, args.min_age_hours * 3600.0, now, None, overrides)
 
     # Сводки — ДО удаления: после удаления лога данные исчезнут.
     history_path = args.history or default_history_path()
     archived = 0
     if not args.no_history and plan:
-        archived = write_history(plan, history_path)
+        archived = write_history(plan, history_path, targets)
 
     if args.apply and not args.archive_only:
         removed, freed, errors = apply_plan(plan)

@@ -22,34 +22,47 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any
 
-from .logparse import Markers, parse_local_timestamp, scan_file
+from .logparse import Markers, parse_line_ts, scan_file
 from .targets import ACTIVITY_MARKERS, TargetSet, builtin_targets
 
 # Ширина «корзины» активности для Kotlin: 5 минут. Заметно мельче порога
 # простоя (2 ч), поэтому простой и последующее оживение видны точно.
 KOTLIN_BUCKET_SECONDS = 300
 
+# Ширина «корзины» активности по умолчанию (у конкретной цели — в targets.yaml,
+# поле bucket_seconds). Прежнее имя оставлено для совместимости.
+DEFAULT_BUCKET_SECONDS = KOTLIN_BUCKET_SECONDS
 
-def parse_kotlin_ts(line: bytes) -> float | None:
-    """Таймстемп строки лога Kotlin → epoch.
 
-    Формат лога Kotlin другой, чем у Gradle («2026-10-20 08:55:16.690»),
-    поэтому и разбор свой. Сам разбор живёт в `logparse` (общий модуль
-    форматов), здесь — совместимое имя.
+def parse_activity_ts(line: bytes, ts_format: str = "local") -> float | None:
+    """Таймстемп строки лога → epoch (секунды).
+
+    Формат задаёт цель (targets.yaml → ts_format): у Gradle это iso со
+    смещением, у Kotlin — local (местное время, без смещения). Раньше разбор
+    был зашит под Kotlin, и любая другая программа с логом без смещения
+    разбиралась бы неверно.
+
+    Сам разбор живёт в `logparse` (общий модуль форматов), здесь — тонкая
+    обёртка под имя цели.
     """
-    return parse_local_timestamp(line)
+    return parse_line_ts(line, ts_format)
 
 
-def kotlin_activity(path: str, bucket_seconds: int = KOTLIN_BUCKET_SECONDS
-                   ) -> tuple[float | None, float | None, list[list[float]]]:
-    """Активность демона Kotlin по логу.
+def activity_buckets(path: str, bucket_seconds: int = DEFAULT_BUCKET_SECONDS,
+                     ts_format: str = "local"
+                     ) -> tuple[float | None, float | None, list[list[float]]]:
+    """Активность демона по логу — корзинами.
 
     Возвращает (первая активность, последняя активность, корзины активности).
     Корзина — [время начала интервала, сколько секунд активности в нём].
     Корзины идут подряд, без пустых, — это и есть интервалы жизни.
+
+    Имя больше не «kotlin»: приём общий для всех целей, у которых признак
+    активности — время записи в лог (activity=mtime).
     """
     first: float | None = None
     last: float | None = None
@@ -57,7 +70,7 @@ def kotlin_activity(path: str, bucket_seconds: int = KOTLIN_BUCKET_SECONDS
     try:
         with open(path, "rb") as fh:
             for line in fh:
-                ts = parse_kotlin_ts(line)
+                ts = parse_activity_ts(line, ts_format)
                 if ts is None:
                     continue
                 if first is None:
@@ -69,6 +82,17 @@ def kotlin_activity(path: str, bucket_seconds: int = KOTLIN_BUCKET_SECONDS
         return None, None, []
     spans = [[float(k), float(v)] for k, v in sorted(buckets.items())]
     return first, last, spans
+
+
+def parse_kotlin_ts(line: bytes) -> float | None:
+    """Совместимое имя: разбор таймстемпа в формате Kotlin (local)."""
+    return parse_activity_ts(line, "local")
+
+
+def kotlin_activity(path: str, bucket_seconds: int = KOTLIN_BUCKET_SECONDS
+                   ) -> tuple[float | None, float | None, list[list[float]]]:
+    """Совместимое имя: активность по логу в формате Kotlin (local)."""
+    return activity_buckets(path, bucket_seconds, "local")
 
 
 def summarize_builds(path: str, spec: Any, pid: int | None = None,
@@ -109,9 +133,10 @@ def summarize_activity(path: str, spec: Any, instance: str | None = None
     Признак активности — время последней записи в лог; промежутки жизни
     восстанавливаются корзинами активности.
     """
-    bucket_seconds = int(getattr(spec, "bucket_seconds", None)
-                         or KOTLIN_BUCKET_SECONDS)
-    first, last, spans = kotlin_activity(path, bucket_seconds)
+    bucket_seconds = int(getattr(spec, "bucket_seconds", 0)
+                         or DEFAULT_BUCKET_SECONDS)
+    ts_format = str(getattr(spec, "ts_format", "local") or "local")
+    first, last, spans = activity_buckets(path, bucket_seconds, ts_format)
     try:
         size = os.path.getsize(path)
         mtime = os.path.getmtime(path)
@@ -181,7 +206,7 @@ def intervals(record: dict[str, Any]) -> list[tuple[float, float]]:
             else:
                 out.append((start, float(end)))
         return out
-    bucket = float(record.get("bucket_seconds") or KOTLIN_BUCKET_SECONDS)
+    bucket = float(record.get("bucket_seconds") or DEFAULT_BUCKET_SECONDS)
     for span in record.get("activity") or []:
         start = float(span[0])
         out.append((start, start + bucket))
@@ -247,9 +272,9 @@ def summarize_by_path(path: str, kind: str | None = None,
         try:
             if spec.activity == ACTIVITY_MARKERS:
                 return summarize_builds(path, spec,
-                                        pid=_pid_from_log_name(path))
+                                        pid=_pid_for(path, spec))
             return summarize_activity(path, spec,
-                                      instance=_instance_from_log_name(path))
+                                      instance=_instance_for(path, spec))
         except OSError:
             return None
 
@@ -268,6 +293,47 @@ def summarize_by_path(path: str, kind: str | None = None,
         except OSError:
             return None
     return None
+
+
+def _pid_for(path: str, spec: Any) -> int | None:
+    """PID демона — по описанию цели (log_pid_regex).
+
+    У цели PID в имени лога может быть настоящим (Gradle), а может и нет
+    (Kotlin) — тогда это «неизвестно», а не «демон без PID».
+    """
+    pattern = str(getattr(spec, "log_pid_regex", "") or "")
+    if pattern:
+        try:
+            match = re.compile(pattern).match(os.path.basename(path))
+        except re.error:
+            match = None
+        if match:
+            raw = match.groupdict().get("pid")
+            try:
+                return int(raw)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return None
+    return _pid_from_log_name(path)
+
+
+def _instance_for(path: str, spec: Any) -> str | None:
+    """Инстанс демона — по описанию цели, а не по имени файла.
+
+    У цели может быть log_group_regex с именованной группой «group»: в ней
+    инстанс (у Kotlin — метка инстанса, у неё ротация файлов .00/.01).
+    Если регулярки нет — берём имя файла, как раньше.
+    """
+    pattern = str(getattr(spec, "log_group_regex", "") or "")
+    if pattern:
+        try:
+            match = re.compile(pattern).match(os.path.basename(path))
+        except re.error:
+            match = None
+        if match:
+            group = match.groupdict().get("group")
+            if group:
+                return group
+    return _instance_from_log_name(path)
 
 
 def _pid_from_log_name(path: str) -> int | None:
