@@ -278,6 +278,23 @@ class TestArchiveVanished(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["kind"], "kotlin")
 
+    def test_archive_records_last_seen_as_lower_bound(self):
+        """Нижняя граница смерти: демон точно жил в конце прошлого свипа.
+
+        Считать, что демон жил до момента обнаружения пропажи, — значит
+        завышать его простой. Поэтому запоминаем и «когда видели в
+        последний раз».
+        """
+        path = self._kotlin_log()
+        last_sweep = time.time() - 300
+        state = {"daemons": {"4242": {"kind": "kotlin", "log_path": path}},
+                 "last_sweep_at": last_sweep}
+        reaper.archive_vanished(self.cfg, state, [], time.time())
+        history = os.path.join(self.state_dir, "logs-history.jsonl")
+        record = reaper.read_history(history)[0]
+        self.assertAlmostEqual(record["last_seen_at"], last_sweep, places=3)
+        self.assertGreater(record["death_observed_at"], record["last_seen_at"])
+
     def test_archive_records_observed_death(self):
         """Момент пропажи демона — это его смерть: лог-то молчит давно."""
         path = self._kotlin_log()
