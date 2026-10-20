@@ -55,16 +55,20 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from reaper.config import load_config, resolve_targets  # noqa: E402
 from reaper.history import (  # noqa: E402
     default_history_path,
     effective_canceled,
     intervals as history_intervals,
     read_history,
 )
+from reaper.targets import TargetSet, builtin_targets, load_targets  # noqa: E402
 
-# Порог простоя Gradle-демона, при котором его убивает САМ Gradle
-# (idleTimeout=10800000 мс = 180 мин). Демон, простоявший дольше, до нашего
-# свипа просто не доживает.
+# Порог простоя, при котором демона убивает САМА программа. У Gradle это
+# idleTimeout=10800000 мс = 180 мин: демон, простоявший дольше, до нашего
+# свипа просто не доживает. Значение приходит из спецификации цели
+# (targets.yaml → self_timeout_seconds) и пишется в сводку демона, поэтому
+# симулятор не знает про конкретные программы.
 GRADLE_SELF_TIMEOUT = 180 * 60
 
 
@@ -98,8 +102,9 @@ def _first(record: dict[str, Any]) -> float:
     return 0.0
 
 
-def _gradle_self_death(spans: list[tuple[float, float]]) -> float:
-    """Когда Gradle убьёт демона СВОИМ idle-таймаутом.
+def _self_death(spans: list[tuple[float, float]],
+                self_timeout: float) -> float:
+    """Когда демона убьёт САМА программа (свой idle-таймаут).
 
     У Gradle есть собственный таймаут (180 мин): демон, простоявший дольше,
     умирает сам. Значит, наш порог выше 180 мин бесполезен для Gradle —
@@ -108,11 +113,12 @@ def _gradle_self_death(spans: list[tuple[float, float]]) -> float:
     closed = [end for _start, end in spans if end != float("inf")]
     if not closed:
         return float("inf")
-    return max(closed) + GRADLE_SELF_TIMEOUT
+    return max(closed) + self_timeout
 
 
 def kill_time(record: dict[str, Any], threshold: float,
-              stuck_threshold: float = 3600.0) -> float | None:
+              stuck_threshold: float = 3600.0,
+              self_timeout: float | None = None) -> float | None:
     """Момент, когда рейпер убил бы демона (или None — не убил бы).
 
     threshold      — порог простоя в секундах;
@@ -135,8 +141,11 @@ def kill_time(record: dict[str, Any], threshold: float,
     # Граница жизни демона: собственная смерть или таймаут Gradle — что
     # раньше.
     limit = death
-    if record.get("kind") == "gradle":
-        limit = min(limit, _gradle_self_death(spans))
+    own_timeout = record.get("self_timeout_seconds")
+    if own_timeout is None:
+        own_timeout = self_timeout
+    if own_timeout:
+        limit = min(limit, _self_death(spans, float(own_timeout)))
 
     cursor = _first(record)
     for start, end in spans:
@@ -207,7 +216,7 @@ def simulate_stuck(records: list[dict[str, Any]],
     безопасности правила — это слепое пятно измерения.
     """
     out: dict[str, Any] = {}
-    for kind in ("gradle", "kotlin"):
+    for kind in _kinds(records):
         items = [r for r in records if r.get("kind") == kind]
         stuck_items = [r for r in items if effective_canceled(r) is not None]
         lifetimes = [stuck_lifetime(r) or 0.0 for r in stuck_items]
@@ -248,9 +257,7 @@ def format_stuck_report(result: dict[str, Any]) -> str:
              "  не убирает (таймаут не действует, пока демон «в сборке»),",
              "  поэтому убираем мы — и порог должен быть измерен, а не выбран.",
              ""]
-    for kind in ("gradle", "kotlin"):
-        if kind not in result:
-            continue
+    for kind in result:
         lines.append(f"  {kind}:")
         lines.append(f"    {'порог':>10} {'зависших':>9} {'убито':>7} "
                      f"{'ложных':>8} {'доля':>7} {'медиана':>9} {'максимум':>9}")
@@ -264,12 +271,26 @@ def format_stuck_report(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _kinds(records: list[dict[str, Any]]) -> list[str]:
+    """Виды демонов в корпусе — в порядке появления."""
+    seen: list[str] = []
+    for record in records:
+        kind = str(record.get("kind") or "")
+        if kind and kind not in seen:
+            seen.append(kind)
+    return seen
+
+
 def simulate(records: list[dict[str, Any]], thresholds: dict[str, float],
-             stuck_threshold: float = 3600.0) -> dict[str, Any]:
+             stuck_threshold: float = 3600.0,
+             targets: TargetSet | None = None) -> dict[str, Any]:
     """Прогоняет пороги по истории и считает убийства и ложные срабатывания."""
+    target_set = targets or builtin_targets()
     out: dict[str, Any] = {}
-    for kind in ("gradle", "kotlin"):
+    for kind in _kinds(records):
         items = [r for r in records if r.get("kind") == kind]
+        spec = target_set.get(kind)
+        self_timeout = spec.self_timeout_seconds if spec is not None else None
         for label, threshold in thresholds.items():
             kills = 0
             false_positives = 0
@@ -278,7 +299,7 @@ def simulate(records: list[dict[str, Any]], thresholds: dict[str, float],
             for rec in items:
                 if effective_canceled(rec) is not None:
                     stuck += 1
-                kt = kill_time(rec, threshold, stuck_threshold)
+                kt = kill_time(rec, threshold, stuck_threshold, self_timeout)
                 if kt is None:
                     died_own += 1
                     continue
@@ -312,9 +333,7 @@ def format_report(result: dict[str, Any], records: list[dict[str, Any]],
     lines.append("  Модель не знает про размер, клиентов и CPU → убийств тут "
                  "верхняя оценка, а доля ложных — консервативная.")
     lines.append("")
-    for kind in ("gradle", "kotlin"):
-        if kind not in result:
-            continue
+    for kind in result:
         lines.append(f"  {kind}:")
         lines.append(f"    {'порог':>10} {'убито':>7} {'ложных':>8} {'доля':>7} "
                      f"{'зависших':>9} {'умерли сами':>13}")
@@ -340,6 +359,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="пороги «зависшего» в минутах через запятую; "
                              "сканирует STUCK_AFTER_SECONDS по накопленной "
                              "истории (по умолчанию — из конфига)")
+    parser.add_argument("--targets", default=None,
+                        help="путь к файлу целей (YAML)")
     parser.add_argument("--json", action="store_true",
                         help="машиночитаемый вывод")
     args = parser.parse_args(argv)
@@ -352,6 +373,14 @@ def main(argv: list[str] | None = None) -> int:
 
     thresholds: dict[str, float] = {}
     stuck_threshold = 3600.0
+    # Цели (targets.yaml) — те же, что у рейпера: пороги простоя берём
+    # оттуда, чтобы симулятор считал по тем же правилам, что и живой свип.
+    warnings: list[str] = []
+    cfg = load_config(None, warnings)
+    targets = resolve_targets(load_targets(args.targets, warnings), cfg,
+                              set(), warnings)
+    for w in warnings:
+        print(f"WARNING: {w}", file=sys.stderr, flush=True)
     if args.thresholds:
         for token in args.thresholds.replace(",", " ").split():
             try:
@@ -360,14 +389,11 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             thresholds[f"{minutes:g} мин"] = minutes * 60
     else:
-        sys.path.insert(0, os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__))))
-        from reaper.config import load_config
-
-        cfg = load_config(None)
-        gradle = float(cfg["IDLE_SECONDS"]) / 60
-        kotlin = float(cfg.get("KOTLIN_IDLE_SECONDS", cfg["IDLE_SECONDS"])) / 60
-        thresholds = {f"{gradle:g} мин": gradle * 60, f"{kotlin:g} мин": kotlin * 60}
+        for name, spec in targets.specs_by_name().items():
+            limit = spec.idle_seconds
+            if limit is None:
+                continue
+            thresholds[f"{limit / 60:g} мин"] = limit
         stuck_threshold = float(cfg.get("STUCK_AFTER_SECONDS", 3600))
 
     # Скан порога «зависшего»: по умолчанию — сам порог из конфига плюс
@@ -385,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
         stuck_thresholds = {f"{stuck_threshold / 60:g} мин": stuck_threshold}
     stuck_result = simulate_stuck(records, stuck_thresholds)
 
-    result = simulate(records, thresholds, stuck_threshold)
+    result = simulate(records, thresholds, stuck_threshold, targets)
     if args.json:
         print(json.dumps({"history": history_path, "records": len(records),
                           "thresholds": thresholds,

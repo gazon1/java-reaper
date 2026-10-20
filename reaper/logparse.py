@@ -23,10 +23,11 @@ mtime лога — не признак активности, а маркеры �
 from __future__ import annotations
 
 import os
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Iterable
+from typing import Any, Iterable
 
 # Маркеры в логе Gradle-демона.
 #   «Received command: Build»    — INFO, начало сборки.
@@ -51,6 +52,45 @@ MARK_BUILD_END_ALT_BYTES = MARK_BUILD_END_ALT.encode()
 # (его idle-таймаут не действует, пока демон «в сборке»).
 MARK_BUILD_CANCELED = b"client disconnection detected"
 MARK_BUILD_CANCELED_STR = MARK_BUILD_CANCELED.decode()
+
+
+@dataclass(frozen=True)
+class Markers:
+    """Маркеры событий в логе демона.
+
+    Раньше маркеры были константами модуля — то есть формат лога Gradle был
+    зашит в код. Теперь формат описывается целью (targets.yaml), и разбор
+    лога не знает, чей это лог.
+    """
+
+    build_start: bytes = b""
+    build_end: bytes = b""
+    build_end_alt: bytes = b""
+    cancel: bytes = b""
+
+    @classmethod
+    def from_spec(cls, spec: Any) -> "Markers":
+        """Маркеры из спецификации цели (пустые строки → нет маркера)."""
+        return cls(
+            build_start=str(spec.build_start or "").encode(),
+            build_end=str(spec.build_end or "").encode(),
+            build_end_alt=str(spec.build_end_alt or "").encode(),
+            cancel=str(spec.cancel or "").encode(),
+        )
+
+    @property
+    def usable(self) -> bool:
+        """Есть ли хоть один маркер (иначе активность по логу не определить)."""
+        return bool(self.build_start or self.build_end or self.cancel)
+
+
+# Маркеры Gradle — то, что было зашито в код до появления targets.yaml.
+GRADLE_MARKERS = Markers(
+    build_start=MARK_BUILD_BYTES,
+    build_end=MARK_IDLE_BYTES,
+    build_end_alt=MARK_BUILD_END_ALT_BYTES,
+    cancel=MARK_BUILD_CANCELED,
+)
 
 # Число дней между 1970-01-01 и 0001-01-01 (proleptic Gregorian ordinal).
 _EPOCH_ORDINAL = 719163
@@ -126,6 +166,41 @@ def parse_ts(text: str) -> float | None:
         return None
 
 
+# Таймстемп без смещения: «2026-10-20 08:55:16.690» — так пишет Kotlin.
+# Время местное, поэтому и разбираем как местное.
+_LOCAL_TS_RE = re.compile(
+    rb"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})[.,](\d{1,6})")
+
+
+def parse_local_timestamp(line: bytes) -> float | None:
+    """Таймстемп строки лога без смещения → epoch (секунды).
+
+    Формат «2026-10-20 08:55:16.690» (Kotlin и подобные). Разбираем вручную:
+    на сотнях тысяч строк это заметно быстрее datetime.fromisoformat.
+    """
+    match = _LOCAL_TS_RE.match(line)
+    if not match:
+        return None
+    year, month, day, hour, minute, second, frac = (
+        group.decode("ascii", "replace") for group in match.groups())
+    try:
+        stamp = datetime(int(year), int(month), int(day), int(hour),
+                         int(minute), int(second))
+    except ValueError:
+        return None
+    return stamp.timestamp() + int(frac.ljust(6, "0")) / 1_000_000.0
+
+
+def parse_line_ts(line: bytes, ts_format: str = "iso") -> float | None:
+    """Таймстемп строки лога в заданном формате.
+
+    «iso» — со смещением (Gradle), «local» — без смещения (Kotlin).
+    """
+    if ts_format == "local":
+        return parse_local_timestamp(line)
+    return parse_timestamp(line)
+
+
 @dataclass
 class Build:
     """Сборка в логе демона: начало и (возможно) конец."""
@@ -179,8 +254,10 @@ class LineScan:
 
 
 def scan_lines(lines: Iterable[bytes], prev_start: float | None = None,
-               prev_canceled: float | None = None) -> LineScan:
-    """Разбирает последовательность строк лога Gradle.
+               prev_canceled: float | None = None,
+               markers: Markers = GRADLE_MARKERS,
+               ts_format: str = "iso") -> LineScan:
+    """Разбирает последовательность строк лога демона.
 
     Единая реализация для всех потребителей: и для полного файла
     (`scan_file`), и для инкрементального чтения (только новые байты).
@@ -190,27 +267,34 @@ def scan_lines(lines: Iterable[bytes], prev_start: float | None = None,
 
     prev_start / prev_canceled — состояние из прошлого чтения: начало
     последней сборки и момент отмены, если они были раньше в этом же логе.
+
+    markers — маркеры событий цели (targets.yaml); по умолчанию — Gradle.
     """
     scan = LineScan(canceled_at=prev_canceled)
     pending_starts: deque[float] = deque()
     last_start = prev_start
+    mark_start = markers.build_start
+    mark_end = markers.build_end
+    mark_end_alt = markers.build_end_alt
+    mark_cancel = markers.cancel
 
     for line in lines:
-        if MARK_BUILD_CANCELED in line:
+        if mark_cancel and mark_cancel in line:
             # Клиент отвалился. Своего таймстемпа у строки нет — берём
             # начало последней сборки: отмена случилась во время неё.
-            ts = parse_timestamp(line)
+            ts = parse_line_ts(line, ts_format)
             scan.canceled_at = ts if ts is not None else (last_start or ts)
             continue
-        if MARK_BUILD_BYTES in line:
-            ts = parse_timestamp(line)
+        if mark_start and mark_start in line:
+            ts = parse_line_ts(line, ts_format)
             if ts is None:
                 scan.bad_timestamp_lines += 1
                 continue
             pending_starts.append(ts)
             last_start = ts
-        elif MARK_IDLE_BYTES in line:
-            ts = parse_timestamp(line)
+        elif (mark_end and mark_end in line) or (mark_end_alt
+                                                  and mark_end_alt in line):
+            ts = parse_line_ts(line, ts_format)
             if ts is None:
                 scan.bad_timestamp_lines += 1
                 continue
@@ -234,7 +318,8 @@ def scan_lines(lines: Iterable[bytes], prev_start: float | None = None,
     return scan
 
 
-def scan_file(path: str) -> FileScan:
+def scan_file(path: str, markers: Markers = GRADLE_MARKERS,
+              ts_format: str = "iso") -> FileScan:
     """Потоково (построчно) читает лог и собирает последовательность сборок.
 
     Файл целиком в память не загружается — логи бывают десятки мегабайт.
@@ -244,7 +329,7 @@ def scan_file(path: str) -> FileScan:
     """
     stat = os.stat(path)
     with open(path, "rb") as handle:
-        scan = scan_lines(handle)
+        scan = scan_lines(handle, markers=markers, ts_format=ts_format)
     return FileScan(
         path=path,
         mtime=stat.st_mtime,

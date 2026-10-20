@@ -50,8 +50,12 @@ class Signals:
     # Сколько секунд прошло с момента отмены сборки.
     stuck_age: float = 0.0
     # Контекст всего набора демонов: свободная память, свежая сборка
-    # Gradle. Правила читают его, а не каждый демон сам по себе.
+    # (по видам демонов). Правила читают его, а не каждый демон сам по себе.
     context: Context = field(default_factory=Context)
+    # Какие виды демонов защищают этого, пока сами работают (из targets.yaml).
+    protector_kinds: list[str] = field(default_factory=list)
+    # То же самое человеческими именами («Gradle», а не «gradle») — для отчёта.
+    protector_labels: list[str] = field(default_factory=list)
     # Цена ошибки: сколько секунд стоит воссоздать этого демона (холодный
     # старт). Влияет на порядок уборки, а не на сам факт.
     recreate_cost_seconds: float = 0.0
@@ -130,24 +134,27 @@ def default_policy(cfg: dict) -> list[Rule]:
     def not_idle(s: Signals) -> bool:
         return s.age < s.idle_limit
 
-    def gradle_building(s: Signals) -> bool:
-        """Защита Kotlin-демонов, пока идёт сборка Gradle.
+    def protected_by_build(s: Signals) -> bool:
+        """Защита демонов одного вида, пока идёт свежая сборка другого.
 
         Правило живёт в таблице, а не в исполнителе: тогда решение,
         отчёт и метрика говорят одно и то же (раньше исполнитель резал
         кандидатов в последний момент, а отчёт и метрика считали их
         «убитыми»).
 
+        Кто кого защищает — отношение между видами (`protects` в
+        targets.yaml), а не знание о конкретной программе: так правило
+        работает и для новых целей.
+
         Защищает только СВЕЖАЯ сборка (началась недавно): сборка,
         начавшаяся несколько часов назад и не завершившаяся, — это
         зависший демон, и он сам подлежит уборке.
         """
-        if s.daemon.kind != "kotlin":
-            return False
-        age = s.context.gradle_build_age
-        if age is None:
-            return False
-        return age <= build_active
+        for protector in s.protector_kinds:
+            age = s.context.build_ages.get(protector)
+            if age is not None and age <= build_active:
+                return True
+        return False
 
     def always(s: Signals) -> bool:
         return True
@@ -234,7 +241,7 @@ def default_policy(cfg: dict) -> list[Rule]:
              lambda s: f"footprint {s.daemon.footprint_mb} МБ < {min_footprint} МБ"),
         Rule("stuck",
              "Зависший демон: клиент отвалился во время сборки. Работать "
-             "некому, и работать уже некому — Gradle такой демон не убирает "
+             "некому, и работать уже некому — сам демон такой не убирает "
              "(его idle-таймаут не действует, пока демон «в сборке»).",
              f"была отмена сборки (клиент отвалился), сборка не завершилась, "
              f"и с отмены прошло > {stuck_after / 60:.0f} мин",
@@ -251,12 +258,14 @@ def default_policy(cfg: dict) -> list[Rule]:
              "простой < порога простоя для этого класса демона",
              Action.KEEP, not_idle,
              lambda s: f"простой {s.age / 60:.0f} мин < {s.idle_limit / 60:.0f} мин"),
-        Rule("gradle-building",
-             "Идёт свежая сборка Gradle — компилятор нужен прямо сейчас.",
-             f"есть Gradle-демон со сборкой без конца, начавшейся не позже "
-             f"{build_active / 60:.0f} мин назад",
-             Action.KEEP, gradle_building,
-             lambda s: "идёт сборка Gradle — Kotlin-демоны не трогаю",
+        Rule("protected-by-build",
+             "Идёт свежая сборка другого вида демонов — они сейчас нужны.",
+             f"есть демон вида, который защищает этот вид, со сборкой без конца, "
+             f"начавшейся не позже {build_active / 60:.0f} мин назад",
+             Action.KEEP, protected_by_build,
+             lambda s: ("идёт сборка "
+                        + ", ".join(s.protector_labels or s.protector_kinds)
+                        + " — не трогаю"),
              protected=True),
         Rule("memory-not-needed",
              "Свободной памяти хватает, а демон небольшой: убивать его — "

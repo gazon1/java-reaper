@@ -101,32 +101,50 @@ def proc_comm(pid: int) -> str:
 
 
 def daemon_kind(cmdline: str) -> str | None:
-    if GRADLE_MAIN in cmdline:
-        return "gradle"
-    if KOTLIN_MAIN in cmdline:
-        return "kotlin"
-    return None
+    """Вид демона по cmdline — по встроенным целям (Gradle, Kotlin).
+
+    Совместимая обёртка: настоящий путь — `targets.TargetSet.match`, где
+    цели берутся из targets.yaml. Эта функция нужна там, где набора целей
+    нет (разовые разборы, тесты).
+    """
+    from .targets import builtin_targets  # noqa: PLC0415 — во избежание цикла
+
+    spec = builtin_targets().match(cmdline)
+    return spec.name if spec is not None else None
 
 
-def find_log_path(pid: int) -> str | None:
+def find_log_path(pid: int, name_regex: str | None = None) -> str | None:
     """Путь к логу демона — точно, через открытые дескрипторы.
 
     Gradle держит свой daemon-<pid>.out.log на stdout, Kotlin — свой
     kotlin-daemon.*.log. Никаких эвристик по времени старта.
+
+    `name_regex` — регулярка на имя файла из спецификации цели
+    (targets.yaml). Без неё — как раньше: Gradle- и Kotlin-имена.
     """
     fddir = f"/proc/{pid}/fd"
     try:
         fds = os.listdir(fddir)
     except OSError:
         return None
+    pattern = None
+    if name_regex:
+        try:
+            pattern = re.compile(name_regex)
+        except re.error:
+            pattern = None
     for fd in fds:
         try:
             target = os.readlink(os.path.join(fddir, fd))
         except OSError:
             continue
+        base = os.path.basename(target)
+        if pattern is not None:
+            if pattern.search(base):
+                return target
+            continue
         if not target.endswith(".log"):
             continue
-        base = os.path.basename(target)
         if base.startswith("daemon-") and base.endswith(".out.log"):
             return target
         if base.startswith("kotlin-daemon."):

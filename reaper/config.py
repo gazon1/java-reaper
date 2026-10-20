@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from .targets import TargetSet, TargetSpec
+
 DEFAULTS: dict[str, Any] = {
     # Порог простоя, разный для Gradle и Kotlin (см. README «Пороги»).
     #
@@ -55,6 +57,9 @@ DEFAULTS: dict[str, Any] = {
     # уборки: сначала те, чьё пересоздание дешевле.
     "GRADLE_RECREATE_COST_SECONDS": 40,
     "KOTLIN_RECREATE_COST_SECONDS": 5,
+    # Общая цена воссоздания — для видов демонов, которых нет в плоских
+    # ключах (то есть для новых целей, описанных в targets.yaml).
+    "RECREATE_COST_SECONDS": 40,
     "MIN_FOOTPRINT_MB": 128,      # RSS+swap ниже — не жалко
     "BUSY_CPU_SECONDS": 3.0,      # 3 с CPU за свип = «занят»
     "SWEEP_SECONDS": 300,         # интервал свипа
@@ -108,7 +113,8 @@ def expand(path: str) -> str:
 
 
 def load_config(path: str | None,
-                warnings: list[str] | None = None) -> dict[str, Any]:
+                warnings: list[str] | None = None,
+                explicit: set[str] | None = None) -> dict[str, Any]:
     """Читает KEY=VALUE-конфиг. Неизвестные ключи игнорируются, битые значения
     не ломают работу: остаётся значение по умолчанию.
 
@@ -116,6 +122,12 @@ def load_config(path: str | None,
     (битое значение, неизвестный ключ). Раньше оба случая проходили молча:
     оператор думал, что настроил порог, а действовал дефолт — и это
     выглядело как «рейпер сломался», а не как «опечатка в конфиге».
+
+    `explicit` — множество, в которое попадают ключи, реально написанные в
+    файле. Оно нужно, чтобы отличить «оператор задал значение» от «это
+    просто значение по умолчанию»: плоский ключ, заданный явно, должен
+    перекрывать значение из targets.yaml (и мы предупреждаем об этом),
+    а ненаписанный — не должен.
     """
     cfg = dict(DEFAULTS)
     cfg_path = expand(path or DEFAULTS["CONFIG_PATH"])
@@ -148,7 +160,85 @@ def load_config(path: str | None,
                         warnings.append(f"конфиг: значение {key!r} = {value!r} "
                                         f"не подходит — взят дефолт "
                                         f"{default!r} (строка {number})")
+                else:
+                    if explicit is not None:
+                        explicit.add(key)
     return cfg
+
+
+# Плоские ключи конфига, через которые задавались пороги ДО появления
+# targets.yaml. Оставлены, чтобы не сломать оператора: если ключ реально
+# написан в файле конфига, он главнее значения из targets.yaml (и мы
+# предупреждаем, что порог пора перенести в targets.yaml).
+LEGACY_IDLE_KEYS = {"kotlin": "KOTLIN_IDLE_SECONDS"}
+LEGACY_COST_KEYS = {
+    "gradle": "GRADLE_RECREATE_COST_SECONDS",
+    "kotlin": "KOTLIN_RECREATE_COST_SECONDS",
+}
+
+
+def legacy_idle_key(kind: str) -> str:
+    """Плоский ключ конфига с порогом простоя для данного вида."""
+    return LEGACY_IDLE_KEYS.get(kind, "IDLE_SECONDS")
+
+
+def legacy_cost_key(kind: str) -> str:
+    """Плоский ключ конфига с ценой воссоздания для данного вида."""
+    return LEGACY_COST_KEYS.get(kind, "RECREATE_COST_SECONDS")
+
+
+def resolve_targets(targets: "TargetSet", cfg: dict[str, Any],
+                    explicit: set[str] | None = None,
+                    warnings: list[str] | None = None) -> "TargetSet":
+    """Подставляет в цели пороги простоя и цену воссоздания.
+
+    Порядок приоритета:
+      1. плоский ключ конфига (IDLE_SECONDS и т. п.), если он ЯВНО задан в
+         файле конфига — оператор правил его, значит он и главный;
+      2. значение из targets.yaml — там живут пороги целей, которых нет в
+         плоском конфиге (то есть новых);
+      3. значение по умолчанию.
+
+    Если ключ конфига и значение из YAML расходятся — рейпер предупреждает:
+    иначе оператор правил бы одно место, а действовало бы другое, и это
+    выглядело бы как «рейпер сломался».
+    """
+    from dataclasses import replace as _replace
+
+    explicit = explicit or set()
+    resolved: dict[str, Any] = {}
+    for name, spec in targets.specs_by_name().items():
+        idle_key = legacy_idle_key(name)
+        cost_key = legacy_cost_key(name)
+        flat_idle = float(cfg.get(idle_key, DEFAULTS["IDLE_SECONDS"]))
+        flat_cost = float(cfg.get(cost_key, DEFAULTS["RECREATE_COST_SECONDS"]))
+        idle = spec.idle_seconds
+        cost = spec.recreate_cost_seconds
+        if idle is None:
+            idle = flat_idle
+        elif idle_key in explicit:
+            if float(cfg.get(idle_key, idle)) != idle:
+                if warnings is not None:
+                    warnings.append(
+                        f"конфиг: ключ {idle_key}={cfg.get(idle_key)} расходится "
+                        f"с порогом простоя для «{name}» в targets.yaml "
+                        f"({idle:.0f} с) — работает значение из конфига; "
+                        f"перенесите порог в targets.yaml, чтобы править "
+                        f"в одном месте")
+            idle = float(cfg.get(idle_key, idle))
+        if cost is None:
+            cost = flat_cost
+        elif cost_key in explicit:
+            if float(cfg.get(cost_key, cost)) != cost:
+                if warnings is not None:
+                    warnings.append(
+                        f"конфиг: ключ {cost_key}={cfg.get(cost_key)} расходится "
+                        f"с ценой воссоздания для «{name}» в targets.yaml "
+                        f"({cost:.0f} с) — работает значение из конфига")
+            cost = float(cfg.get(cost_key, cost))
+        resolved[name] = _replace(spec, idle_seconds=float(idle),
+                                   recreate_cost_seconds=float(cost))
+    return TargetSet(resolved)
 
 
 def idle_limit(cfg: dict[str, Any], kind: str) -> float:
@@ -158,6 +248,9 @@ def idle_limit(cfg: dict[str, Any], kind: str) -> float:
     у Gradle есть собственный idle-таймаут (180 мин) — наш порог обязан быть
     выше него; у Kotlin такого таймаута нет вовсе, его не убирает никто, и
     2 ч — заведомо выше «живого» простоя (p99.9 = 100 мин).
+
+    Это плоская (legacy) версия: она читает только плоский конфиг и не знает
+    про targets.yaml. Основной путь — `resolve_targets`.
     """
     if kind == "kotlin":
         return float(cfg.get("KOTLIN_IDLE_SECONDS", cfg["IDLE_SECONDS"]))

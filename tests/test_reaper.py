@@ -720,7 +720,7 @@ class TestExecuteDryRun(unittest.TestCase):
         decisions = {d.daemon.pid: d
                      for d in reaper.classify([g, k], state, NOW, self.cfg)}
         self.assertFalse(decisions[1002].kill)
-        self.assertEqual(decisions[1002].rule, "gradle-building")
+        self.assertEqual(decisions[1002].rule, "protected-by-build")
         self.assertIn("сборка Gradle", decisions[1002].reason)
 
     def test_kotlin_killed_when_no_gradle_build(self):

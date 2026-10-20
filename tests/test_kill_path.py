@@ -112,7 +112,10 @@ class FakeDaemon:
 
 
 def run_reaper(cfg_path: str, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run([sys.executable, SCRIPT, "--config", cfg_path, *args],
+    # --targets указывает на несуществующий файл: тест не должен зависеть от
+    # того, что лежит в ~/.config/java-reaper/targets.yaml на машине.
+    return subprocess.run([sys.executable, SCRIPT, "--config", cfg_path,
+                           "--targets", cfg_path + ".targets", *args],
                           capture_output=True, text=True, timeout=120)
 
 

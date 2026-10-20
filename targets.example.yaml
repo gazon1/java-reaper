@@ -1,0 +1,75 @@
+# Цели рейпера: какие программы-демоны мы убираем и как их читать.
+#
+# Файл необязателен: если его нет, работают встроенные цели Gradle и Kotlin
+# (ровно как раньше). Файл переопределяет встроенные цели по имени и может
+# добавлять новые.
+#
+# Что здесь описывается (и что НЕ описывается):
+#   match_cmdline        — подстрока в cmdline процесса, по которой мы его узнаём;
+#   log_name_regex       — регулярка на ИМЯ файла лога (лог ищем среди открытых
+#                          дескрипторов /proc/PID/fd — точно, без эвристик);
+#   activity             — как понять по логу, что демон работал:
+#                            mtime    — признак активности = время последней
+#                                       записи в лог (для программ без своих
+#                                       маркеров; просто и надёжно);
+#                            markers  — активность = маркеры начала/конца
+#                                       работы в тексте лога;
+#   build_start/end/cancel — сами маркеры (для activity: markers);
+#   idle_seconds         — порог простоя: сколько ждать, прежде чем убирать;
+#   recreate_cost_seconds — цена холодного старта: влияет на ПОРЯДОК уборки
+#                          (первым убирается тот, кто даёт больше памяти на
+#                          секунду потраченного времени), но не на сам факт;
+#   self_timeout_seconds — через сколько демон умирает САМ (у Gradle 180 мин:
+#                          наш порог обязан быть выше, иначе мы конкурируем с
+#                          Gradle за одни и те же демоны и проигрываем);
+#   protects             — какие виды демонов этот вид защищает, пока сам
+#                          работает («идёт сборка Gradle → компилятор нужен»);
+#   rebuildable          — «это пересоздаваемый кэш, его можно убить».
+#                          Для сервисов и баз данных это неправда: их убийство
+#                          стоит дороже, чем память, которую они держат.
+#
+# ВАЖНО: пороги для новой цели сначала измеряются (tools/simulate.py по
+# накопленной истории), и только потом выкатываются. Неизмеренный порог —
+# это наугад.
+
+version: 1
+
+targets:
+  # ---- Gradle ----
+  - name: gradle
+    label: Gradle
+    match_cmdline: "org.gradle.launcher.daemon.bootstrap.GradleDaemon"
+    log_name_regex: '^daemon-\d+\.out\.log$'
+    activity: markers
+    ts_format: iso
+    build_start: "Received command: Build"
+    build_end: "Marking the daemon as idle"
+    build_end_alt: "after build finished"
+    cancel: "client disconnection detected"
+    idle_seconds: 21600        # 6 ч — выше его собственного idle-таймаута
+    recreate_cost_seconds: 40  # холодный старт Gradle (измерено: 41.6 с)
+    self_timeout_seconds: 10800  # Gradle убивает демона сам через 180 мин
+    protects: [kotlin]         # пока идёт сборка, компилятор нужен
+    rebuildable: true
+
+  # ---- Kotlin ----
+  - name: kotlin
+    label: Kotlin
+    match_cmdline: "org.jetbrains.kotlin.daemon.KotlinCompileDaemon"
+    log_name_regex: '^kotlin-daemon\..*\.log$'
+    activity: mtime            # своих маркеров у Kotlin нет
+    idle_seconds: 7200         # 2 ч — своего таймаута нет, его не убирает никто
+    recreate_cost_seconds: 5   # дешёвый: это просто старт JVM
+    protects: []
+    rebuildable: true
+
+  # ---- Пример новой цели (закомментирован) ----
+  #
+  # - name: esbuild
+  #   label: esbuild
+  #   match_cmdline: "esbuild"
+  #   log_name_regex: '\.log$'
+  #   activity: mtime
+  #   idle_seconds: 3600
+  #   recreate_cost_seconds: 2
+  #   rebuildable: true

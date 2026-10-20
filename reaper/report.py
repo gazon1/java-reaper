@@ -11,6 +11,7 @@ from .config import idle_limit as idle_limit_for
 from .model import Decision
 from .policy import default_policy
 from .state import read_kills
+from .targets import TargetSet, builtin_targets
 
 # Версия схемы машинного вывода: потребитель (агент, скрипт) обязан понимать,
 # что формат изменился, а не молча получить «поле пропало».
@@ -22,28 +23,40 @@ JSON_SCHEMA_VERSION = 3
 PILOT_MAX_REUSE_RATE = 0.60
 PILOT_MIN_EVENTS = 8
 
-# Классы демонов и их подписи в отчётах.
+# Классы демонов и их подписи в отчётах. Основной путь — набор целей
+# (targets.yaml); эти константы нужны там, где набора целей нет.
 KINDS = ("gradle", "kotlin")
 KIND_LABELS = {"gradle": "Gradle", "kotlin": "Kotlin"}
 
 
-def kind_summary(decisions: list[Decision], cfg: dict[str, Any]) -> dict[str, Any]:
+def _targets(targets: TargetSet | None) -> TargetSet:
+    return targets if targets is not None else builtin_targets()
+
+
+def kind_summary(decisions: list[Decision], cfg: dict[str, Any],
+                 targets: TargetSet | None = None) -> dict[str, Any]:
     """Сводка по классам демонов: сколько, сколько памяти, кого под удар.
 
     Классы живут по разным правилам (у Gradle есть свой idle-таймаут,
     у Kotlin — нет), поэтому в отчёте они видны отдельными строками.
     """
+    target_set = _targets(targets)
+    labels = target_set.labels()
     out: dict[str, Any] = {}
-    for kind in KINDS:
+    for kind in target_set.names():
         items = [d for d in decisions if d.daemon.kind == kind]
         kill = [d for d in items if d.kill]
+        spec = target_set.get(kind)
+        limit = (spec.idle_seconds if spec is not None
+                 and spec.idle_seconds is not None
+                 else idle_limit_for(cfg, kind))
         out[kind] = {
-            "label": KIND_LABELS[kind],
+            "label": labels.get(kind, kind),
             "count": len(items),
             "footprint_mb": sum(d.daemon.footprint_mb for d in items),
             "kill_count": len(kill),
             "kill_footprint_mb": sum(d.daemon.footprint_mb for d in kill),
-            "idle_limit_seconds": idle_limit_for(cfg, kind),
+            "idle_limit_seconds": limit,
         }
     return out
 
@@ -56,8 +69,11 @@ def _stale_note(dec: Decision) -> str:
 
 
 def format_status(decisions: list[Decision], state: dict[str, Any],
-                  cfg: dict[str, Any] | None = None) -> str:
+                  cfg: dict[str, Any] | None = None,
+                  targets: TargetSet | None = None) -> str:
     cfg = cfg if cfg is not None else {}
+    target_set = _targets(targets)
+    labels = target_set.labels()
     lines = [f"{'PID':>8} {'класс':>7} {'footprint':>10} {'простой':>9}  решение / причина"]
     lines.append("-" * 96)
     for dec in sorted(decisions, key=lambda d: -d.daemon.footprint_mb):
@@ -76,14 +92,17 @@ def format_status(decisions: list[Decision], state: dict[str, Any],
         lines.append(f"свободной памяти: {available} МБ "
                      f"(порог давления {cfg.get('MEMORY_PRESSURE_MB')} МБ)")
     # Сводка по классам: у них разные пороги простоя и разная судьба.
-    for kind in KINDS:
+    for kind in target_set.names():
         items = [d for d in decisions if d.daemon.kind == kind]
         if not items:
             continue
         kill = [d for d in items if d.kill]
-        limit = idle_limit_for(cfg, kind) if cfg else 0.0
+        spec = target_set.get(kind)
+        limit = (spec.idle_seconds if spec is not None
+                 and spec.idle_seconds is not None
+                 else (idle_limit_for(cfg, kind) if cfg else 0.0))
         limit_txt = f", порог простоя {limit / 3600:.0f} ч" if limit else ""
-        lines.append(f"  {KIND_LABELS[kind]}: {len(items)} шт, "
+        lines.append(f"  {labels.get(kind, kind)}: {len(items)} шт, "
                      f"{sum(d.daemon.footprint_mb for d in items)} МБ, "
                      f"под убийство {sum(d.daemon.footprint_mb for d in kill)} МБ"
                      f" ({len(kill)} шт){limit_txt}")
@@ -155,8 +174,10 @@ def decision_to_dict(dec: Decision) -> dict[str, Any]:
 def format_json(decisions: list[Decision], state: dict[str, Any],
                 cfg: dict[str, Any], report: list[dict[str, Any]] | None = None,
                 now: float | None = None, extra: dict[str, Any] | None = None,
+                targets: TargetSet | None = None,
                 ) -> str:
     now = time.time() if now is None else now
+    target_set = _targets(targets)
     payload = {
         "schema_version": JSON_SCHEMA_VERSION,
         "now": now,
@@ -170,7 +191,18 @@ def format_json(decisions: list[Decision], state: dict[str, Any],
             "PEER_MAX_AGE_SECONDS": cfg.get("PEER_MAX_AGE_SECONDS"),
             "PID_ALLOWLIST": cfg.get("PID_ALLOWLIST", ""),
         },
-        "kinds": kind_summary(decisions, cfg),
+        "targets": {
+            name: {
+                "label": target_set.labels().get(name, name),
+                "idle_limit_seconds": spec.idle_seconds,
+                "recreate_cost_seconds": spec.recreate_cost_seconds,
+                "activity": spec.activity,
+                "protects": list(spec.protects),
+                "rebuildable": spec.rebuildable,
+            }
+            for name, spec in target_set.specs_by_name().items()
+        },
+        "kinds": kind_summary(decisions, cfg, target_set),
         "memory": {
             "available_mb": state.get("mem_available_mb"),
             "pressure_mb": cfg.get("MEMORY_PRESSURE_MB"),
@@ -196,9 +228,12 @@ def format_json(decisions: list[Decision], state: dict[str, Any],
     return json.dumps(payload, indent=1, ensure_ascii=False, sort_keys=True)
 
 
-def format_explain(cfg: dict[str, Any]) -> str:
+def format_explain(cfg: dict[str, Any],
+                   targets: TargetSet | None = None) -> str:
     """Печатает таблицу правил политики — документация и отладочный инструмент."""
     rules = default_policy(cfg)
+    target_set = _targets(targets)
+    labels = target_set.labels()
     lines = ["Правила политики (в порядке приоритета; срабатывает первое подходящее):", ""]
     for i, rule in enumerate(rules, 1):
         lines.append(f"{i:>2}. [{rule.action.value}] {rule.name}")
@@ -209,12 +244,20 @@ def format_explain(cfg: dict[str, Any]) -> str:
         if rule.protected:
             lines.append("    следствие: демон считается защищённым")
     lines.append("")
-    gradle_limit = idle_limit_for(cfg, "gradle")
-    kotlin_limit = idle_limit_for(cfg, "kotlin")
-    lines.append(f"Порог простоя: Gradle {gradle_limit / 60:.0f} мин "
-                 f"(выше его собственного idle-таймаута в 180 мин), "
-                 f"Kotlin {kotlin_limit / 60:.0f} мин (своего таймаута нет — "
-                 f"его не убирает никто);")
+    limits = []
+    for name, spec in target_set.specs_by_name().items():
+        limit = spec.idle_seconds
+        if limit is None:
+            limit = idle_limit_for(cfg, name)
+        notes = []
+        if spec.self_timeout_seconds:
+            notes.append(f"свой idle-таймаут {spec.self_timeout_seconds / 60:.0f} мин")
+        if spec.protects:
+            notes.append("защищает: "
+                         + ", ".join(labels.get(k, k) for k in spec.protects))
+        suffix = f" ({'; '.join(notes)})" if notes else ""
+        limits.append(f"{labels.get(name, name)} {limit / 60:.0f} мин{suffix}")
+    lines.append("Порог простоя: " + "; ".join(limits) + ";")
     lines.append(f"минимум памяти: {cfg['MIN_FOOTPRINT_MB']} МБ; "
                  f"лимит убийств за свип: {cfg.get('MAX_KILLS_PER_SWEEP')}; "
                  f"возраст «зависшего клиента»: "
@@ -225,9 +268,11 @@ def format_explain(cfg: dict[str, Any]) -> str:
     lines.append(f"давление по памяти: убираем, когда {pressure_txt}; "
                  f"крупные демоны (≥ {cfg.get('KILL_LARGE_DAEMON_MB')} МБ) — "
                  f"всегда")
-    lines.append(f"цена воссоздания: Gradle {cfg.get('GRADLE_RECREATE_COST_SECONDS')} с, "
-                 f"Kotlin {cfg.get('KOTLIN_RECREATE_COST_SECONDS')} с "
-                 f"(влияет на порядок уборки)")
+    costs = ", ".join(f"{labels.get(name, name)} "
+                      f"{spec.recreate_cost_seconds:.0f} с"
+                      for name, spec in target_set.specs_by_name().items()
+                      if spec.recreate_cost_seconds)
+    lines.append(f"цена воссоздания: {costs} (влияет на порядок уборки)")
     return "\n".join(lines)
 
 
@@ -299,20 +344,30 @@ def pilot_report(cfg: dict[str, Any], state: dict[str, Any],
 
 
 def audit_report(cfg: dict[str, Any], decisions: list[Decision],
-                 state: dict[str, Any]) -> tuple[str, int]:
+                 state: dict[str, Any],
+                 targets: TargetSet | None = None) -> tuple[str, int]:
     """Критерий приёмки из плана: демонов с простоями длиннее порога
     не должно остаться. Ноль — цель, неноль — недоработанный рейпер.
 
     Порог свой у каждого класса (Gradle / Kotlin), поэтому сравнение идёт
     с порогом того демона, а не с одним общим числом.
     """
+    target_set = _targets(targets)
+    labels = target_set.labels()
+
+    def limit_of(kind: str) -> float:
+        spec = target_set.get(kind)
+        if spec is not None and spec.idle_seconds is not None:
+            return float(spec.idle_seconds)
+        return float(idle_limit_for(cfg, kind))
+
     stale = [dec for dec in decisions
              if dec.idle_seconds is not None
-             and dec.idle_seconds > idle_limit_for(cfg, dec.daemon.kind)]
+             and dec.idle_seconds > limit_of(dec.daemon.kind)]
     stale.sort(key=lambda d: -d.daemon.footprint_mb)
-    total = sum(dec.daemon.footprint_mb for dec in stale)
-    limits = ", ".join(f"{KIND_LABELS[k]} {idle_limit_for(cfg, k) / 3600:.0f} ч"
-                       for k in KINDS)
+    total = sum(d.daemon.footprint_mb for d in stale)
+    limits = ", ".join(f"{labels.get(k, k)} {limit_of(k) / 3600:.0f} ч"
+                       for k in target_set.names())
     lines = [f"Аудит: демоны с простоями длиннее порога ({limits})", "=" * 60]
     if not stale:
         lines.append("  таких демонов нет — критерий приёмки выполнен (footprint = 0)")

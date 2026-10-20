@@ -22,15 +22,11 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import time
 from typing import Any
 
-from .logparse import scan_file
-
-# Время жизни демона в логе Kotlin: «2026-10-20 08:55:16.690 [daemon] …»
-_KOTLIN_TS_RE = re.compile(
-    rb"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})[.,](\d{1,6})")
+from .logparse import Markers, parse_local_timestamp, scan_file
+from .targets import ACTIVITY_MARKERS, TargetSet, builtin_targets
 
 # Ширина «корзины» активности для Kotlin: 5 минут. Заметно мельче порога
 # простоя (2 ч), поэтому простой и последующее оживение видны точно.
@@ -41,24 +37,10 @@ def parse_kotlin_ts(line: bytes) -> float | None:
     """Таймстемп строки лога Kotlin → epoch.
 
     Формат лога Kotlin другой, чем у Gradle («2026-10-20 08:55:16.690»),
-    поэтому и разбор свой. Разбираем вручную — на сотнях тысяч строк
-    это заметно быстрее datetime.fromisoformat.
+    поэтому и разбор свой. Сам разбор живёт в `logparse` (общий модуль
+    форматов), здесь — совместимое имя.
     """
-    m = _KOTLIN_TS_RE.match(line)
-    if not m:
-        return None
-    year, month, day, hour, minute, second, frac = (
-        g.decode("ascii", "replace") for g in m.groups())
-    try:
-        import datetime
-
-        # В логе Kotlin смещения нет — время местное, поэтому и разбираем
-        # как местное (naive datetime → .timestamp() трактует его как local).
-        dt = datetime.datetime(int(year), int(month), int(day),
-                               int(hour), int(minute), int(second))
-    except ValueError:
-        return None
-    return dt.timestamp() + int(frac.ljust(6, "0")) / 1_000_000.0
+    return parse_local_timestamp(line)
 
 
 def kotlin_activity(path: str, bucket_seconds: int = KOTLIN_BUCKET_SECONDS
@@ -89,17 +71,22 @@ def kotlin_activity(path: str, bucket_seconds: int = KOTLIN_BUCKET_SECONDS
     return first, last, spans
 
 
-def summarize_gradle(path: str, pid: int | None = None,
-                     version: str | None = None) -> dict[str, Any]:
-    """Сводка по логу Gradle-демона."""
-    scan = scan_file(path)
+def summarize_builds(path: str, spec: Any, pid: int | None = None,
+                    version: str | None = None) -> dict[str, Any]:
+    """Сводка по логу демона, у которого есть маркеры сборок.
+
+    Маркеры берутся из спецификации цели: тот же код обслуживает Gradle и
+    любую новую программу с похожим форматом лога.
+    """
+    scan = scan_file(path, markers=Markers.from_spec(spec),
+                     ts_format=getattr(spec, "ts_format", "iso"))
     builds = [[b.start, b.end] for b in scan.builds]
     starts = [b.start for b in scan.builds]
     ends = [b.end for b in scan.builds if b.end is not None]
     first = min(starts) if starts else None
     last = max(ends) if ends else (max(starts) if starts else None)
     record: dict[str, Any] = {
-        "kind": "gradle",
+        "kind": spec.name,
         "pid": pid,
         "version": version,
         "path": path,
@@ -115,16 +102,23 @@ def summarize_gradle(path: str, pid: int | None = None,
     return record
 
 
-def summarize_kotlin(path: str, instance: str | None = None) -> dict[str, Any]:
-    """Сводка по логу Kotlin-демона."""
-    first, last, spans = kotlin_activity(path)
+def summarize_activity(path: str, spec: Any, instance: str | None = None
+                       ) -> dict[str, Any]:
+    """Сводка по логу демона без маркеров сборок.
+
+    Признак активности — время последней записи в лог; промежутки жизни
+    восстанавливаются корзинами активности.
+    """
+    bucket_seconds = int(getattr(spec, "bucket_seconds", None)
+                         or KOTLIN_BUCKET_SECONDS)
+    first, last, spans = kotlin_activity(path, bucket_seconds)
     try:
         size = os.path.getsize(path)
         mtime = os.path.getmtime(path)
     except OSError:
         size, mtime = 0, 0.0
     return {
-        "kind": "kotlin",
+        "kind": spec.name,
         "pid": None,
         "instance": instance,
         "path": path,
@@ -133,8 +127,22 @@ def summarize_kotlin(path: str, instance: str | None = None) -> dict[str, Any]:
         "first_activity": first,
         "last_activity": last,
         "activity": spans,
+        "bucket_seconds": bucket_seconds,
         "summary_at": time.time(),
     }
+
+
+def summarize_gradle(path: str, pid: int | None = None,
+                     version: str | None = None) -> dict[str, Any]:
+    """Сводка по логу Gradle-демона."""
+    return summarize_builds(path, builtin_targets().get("gradle"), pid=pid,
+                            version=version)
+
+
+def summarize_kotlin(path: str, instance: str | None = None) -> dict[str, Any]:
+    """Сводка по логу Kotlin-демона."""
+    return summarize_activity(path, builtin_targets().get("kotlin"),
+                              instance=instance)
 
 
 def effective_canceled(record: dict[str, Any]) -> float | None:
@@ -154,13 +162,16 @@ def effective_canceled(record: dict[str, Any]) -> float | None:
 
 
 def intervals(record: dict[str, Any]) -> list[tuple[float, float]]:
-    """Интервалы активности демона из сводки — единая модель для обоих классов.
+    """Интервалы активности демона из сводки — единая модель для всех видов.
 
-    Gradle: интервалы сборок. Kotlin: интервалы активности (корзины).
+    Два вида моделей, и выбирается по содержанию сводки, а не по имени вида:
+      * «builds» — интервалы сборок (демон пишет маркеры начала/конца);
+      * «activity» — корзины активности (признак активности — mtime лога).
     """
     out: list[tuple[float, float]] = []
-    if record.get("kind") == "gradle":
-        for build in record.get("builds") or []:
+    builds = record.get("builds")
+    if builds:
+        for build in builds:
             start = float(build[0])
             end = build[1]
             if end is None:
@@ -170,9 +181,10 @@ def intervals(record: dict[str, Any]) -> list[tuple[float, float]]:
             else:
                 out.append((start, float(end)))
         return out
+    bucket = float(record.get("bucket_seconds") or KOTLIN_BUCKET_SECONDS)
     for span in record.get("activity") or []:
-        bucket = float(span[0])
-        out.append((bucket, bucket + KOTLIN_BUCKET_SECONDS))
+        start = float(span[0])
+        out.append((start, start + bucket))
     return out
 
 
@@ -217,27 +229,40 @@ def history_keys(path: str) -> set[tuple[str, float]]:
     return keys
 
 
-def summarize_by_path(path: str, kind: str | None = None
+def summarize_by_path(path: str, kind: str | None = None,
+                      targets: TargetSet | None = None
                       ) -> dict[str, Any] | None:
-    """Сводка по логу демона — вид лога определяется по имени или по классу.
+    """Сводка по логу демона — вид лога берётся из набора целей.
+
+    Если вид известен (targets.yaml или встроенные цели) — сводка строится по
+    его спецификации: маркеры сборок или корзины активности. Если вид не
+    известен — вид лога определяется по имени файла, как раньше.
 
     Имя лога Gradle — `daemon-<pid>.out.log`, лога Kotlin —
     `kotlin-daemon.<дата>.<время>-<инстанс>.<N>.log`.
     """
+    target_set = targets or builtin_targets()
+    spec = target_set.get(kind) if kind else None
+    if spec is not None:
+        try:
+            if spec.activity == ACTIVITY_MARKERS:
+                return summarize_builds(path, spec,
+                                        pid=_pid_from_log_name(path))
+            return summarize_activity(path, spec,
+                                      instance=_instance_from_log_name(path))
+        except OSError:
+            return None
+
     name = os.path.basename(path)
     if kind == "gradle" or name.startswith("daemon-"):
         version = os.path.basename(os.path.dirname(path))
-        pid = None
-        try:
-            pid = int(name.split("-")[1].split(".")[0])
-        except (IndexError, ValueError):
-            pid = None
+        pid = _pid_from_log_name(path)
         try:
             return summarize_gradle(path, pid=pid, version=version)
         except OSError:
             return None
     if name.startswith("kotlin-daemon."):
-        instance = name.split("-")[-1].split(".")[0]
+        instance = _instance_from_log_name(path)
         try:
             return summarize_kotlin(path, instance=instance)
         except OSError:
@@ -245,8 +270,27 @@ def summarize_by_path(path: str, kind: str | None = None
     return None
 
 
+def _pid_from_log_name(path: str) -> int | None:
+    """PID из имени лога Gradle (`daemon-<pid>.out.log`)."""
+    name = os.path.basename(path)
+    try:
+        return int(name.split("-")[1].split(".")[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def _instance_from_log_name(path: str) -> str | None:
+    """Инстанс из имени лога Kotlin (`kotlin-daemon.…-<инстанс>.<N>.log`)."""
+    name = os.path.basename(path)
+    try:
+        return name.split("-")[-1].split(".")[0]
+    except IndexError:
+        return None
+
+
 def archive_daemon_log(path: str, kind: str | None, history_path: str,
-                       death_observed_at: float | None = None) -> bool:
+                       death_observed_at: float | None = None,
+                       targets: TargetSet | None = None) -> bool:
     """Сохраняет сводку по логу демона в историю. True — сохранили.
 
     Нужно для демонов, которых больше нет: их логи в `/tmp` исчезают при
@@ -258,7 +302,7 @@ def archive_daemon_log(path: str, kind: str | None, history_path: str,
     и без этой отметки простой не виден вовсе (симулятор посчитал бы
     демона умершим сразу после последней активности).
     """
-    record = summarize_by_path(path, kind)
+    record = summarize_by_path(path, kind, targets)
     if record is None:
         return False
     if death_observed_at is not None:

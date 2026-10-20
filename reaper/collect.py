@@ -6,11 +6,11 @@ import os
 import time
 from typing import Any
 
-from .logread import scan_gradle_log
+from .logread import scan_log
+from .logparse import Markers
 from .model import Daemon, PeerConn
 from .proc import (
     children_map,
-    daemon_kind,
     find_log_path,
     find_socket_owners,
     is_ignored_child,
@@ -21,6 +21,7 @@ from .proc import (
     socket_inodes,
     tcp_table,
 )
+from .targets import ACTIVITY_MARKERS, TargetSet, builtin_targets
 
 
 def _max_ts(*values: Any) -> float | None:
@@ -47,11 +48,15 @@ def peer_key(conn: PeerConn) -> str:
 
 
 def collect_daemons(cfg: dict[str, Any], state: dict[str, Any],
-                    now: float | None = None) -> list[Daemon]:
+                    now: float | None = None,
+                    targets: TargetSet | None = None) -> list[Daemon]:
     """Собирает список демонов и их признаки.
 
     Состояние используется для двух вещей: инкрементального разбора лога
     (смещение) и возраста peer-соединений (когда мы их увидели впервые).
+
+    `targets` — набор целей (targets.yaml): кто считается демоном, где его
+    лог и как по нему понять активность. Без него — встроенные цели.
 
     Порядок обхода /proc выбран из-за цены: сначала находим демонов и их
     сокеты, потом — только нужных владельцев peer-соединений (прицельный
@@ -59,6 +64,7 @@ def collect_daemons(cfg: dict[str, Any], state: dict[str, Any],
     на машине с 600 процессами ради одного-двух нужных inode.
     """
     now = time.time() if now is None else now
+    targets = targets or builtin_targets()
     tcp = tcp_table()
     kids = children_map()
     prev = state.get("daemons", {})
@@ -78,9 +84,11 @@ def collect_daemons(cfg: dict[str, Any], state: dict[str, Any],
         if not entry.isdigit():
             continue
         pid = int(entry)
-        kind = daemon_kind(proc_cmdline(pid))
-        if kind is None:
+        cmdline = proc_cmdline(pid)
+        spec = targets.match(cmdline, proc_comm(pid))
+        if spec is None:
             continue
+        kind = spec.name
         st = read_proc_stat(pid)
         if st is None:
             continue
@@ -99,14 +107,16 @@ def collect_daemons(cfg: dict[str, Any], state: dict[str, Any],
             # PID переиспользован — прежние накопления не про этот процесс.
             rec = {}
 
-        d.log_path = find_log_path(pid)
+        d.log_path = find_log_path(pid, spec.log_name_regex or None)
         if d.log_path is None:
             d.log_ok = False
-        elif kind == "gradle":
-            res = scan_gradle_log(d.log_path, int(rec.get("log_offset", 0)),
-                                  int(cfg["LOG_SCAN_MAX_BYTES"]),
-                                  prev_start=rec.get("last_build_start"),
-                                  prev_canceled=rec.get("canceled_at"))
+        elif spec.activity == ACTIVITY_MARKERS:
+            res = scan_log(d.log_path, int(rec.get("log_offset", 0)),
+                           int(cfg["LOG_SCAN_MAX_BYTES"]),
+                           prev_start=rec.get("last_build_start"),
+                           prev_canceled=rec.get("canceled_at"),
+                           markers=Markers.from_spec(spec),
+                           ts_format=spec.ts_format)
             d.log_offset = int(res["offset"])
             d.idle_known = bool(res["complete"])
             d.last_build_start = _max_ts(rec.get("last_build_start"), res["start"])
@@ -115,7 +125,7 @@ def collect_daemons(cfg: dict[str, Any], state: dict[str, Any],
                 _max_ts(rec.get("canceled_at"), res.get("canceled")),
                 d.last_build_start)
             # Отмена сборки без последующей сборки = демон «завис»:
-            # клиент отвалился, работать некому, Gradle его не уберёт.
+            # клиент отвалился, работать некому, а сам демон себя не уберёт.
             d.stuck_build = bool(d.canceled_at)
         else:
             try:

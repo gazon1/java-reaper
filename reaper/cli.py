@@ -12,7 +12,8 @@ from typing import Any
 
 from .classify import classify
 from .collect import collect_daemons
-from .config import RULES_VERSION, disabled_flag, idle_limit as idle_limit_for, load_config
+from .config import (RULES_VERSION, disabled_flag,
+                    idle_limit as idle_limit_for, load_config, resolve_targets)
 from .execute import execute
 from .history import archive_daemon_log
 from .housekeeping import trim_idle_logs
@@ -29,6 +30,7 @@ from .report import (
     health,
     pilot_report,
 )
+from .targets import TargetSet, load_targets
 from .state import (
     append_kill,
     append_sweep,
@@ -65,6 +67,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--explain", action="store_true",
                         help="напечатать таблицу правил политики")
     parser.add_argument("--config", help="путь к конфигу")
+    parser.add_argument("--targets", help="путь к файлу целей (YAML); "
+                                          "по умолчанию — "
+                                          "~/.config/java-reaper/targets.yaml")
     return parser
 
 
@@ -117,7 +122,8 @@ def write_state(cfg: dict[str, Any], state: dict[str, Any],
 
 
 def archive_vanished(cfg: dict[str, Any], state: dict[str, Any],
-                     daemons: list[Any], now: float | None = None) -> int:
+                     daemons: list[Any], now: float | None = None,
+                     targets: TargetSet | None = None) -> int:
     """Архивирует сводки по демонам, которых больше нет.
 
     Логи Kotlin-демонов живут в /tmp и умирают вместе с перезагрузкой.
@@ -142,17 +148,18 @@ def archive_vanished(cfg: dict[str, Any], state: dict[str, Any],
             continue
         try:
             if archive_daemon_log(str(path), rec.get("kind"), history_path,
-                                  death_observed_at=seen_at):
+                                  death_observed_at=seen_at, targets=targets):
                 archived += 1
         except OSError:
             continue
     return archived
 
 
-def _sweep(cfg: dict[str, Any], state: dict[str, Any], now: float):
+def _sweep(cfg: dict[str, Any], state: dict[str, Any], now: float,
+           targets: TargetSet | None = None):
     """Один свип: собрать → классифицировать. Состояние здесь не меняется."""
-    daemons = collect_daemons(cfg, state, now)
-    decisions = classify(daemons, state, now, cfg)
+    daemons = collect_daemons(cfg, state, now, targets)
+    decisions = classify(daemons, state, now, cfg, targets=targets)
     return daemons, decisions
 
 
@@ -161,14 +168,19 @@ def main(argv: list[str] | None = None) -> int:
     mode = args.mode or ("dry-run" if args.dry_run else "kill")
 
     config_warnings: list[str] = []
-    cfg = load_config(args.config, config_warnings)
+    explicit_keys: set[str] = set()
+    cfg = load_config(args.config, config_warnings, explicit_keys)
+    # Цели (targets.yaml): кто считается демоном, где его лог, как его читать.
+    # Файл необязателен — без него работают встроенные цели Gradle и Kotlin.
+    targets = resolve_targets(load_targets(args.targets, config_warnings), cfg,
+                              explicit_keys, config_warnings)
     state = load_state(cfg)
     for w in config_warnings:
         print(f"WARNING: {w}", flush=True)
 
     # ---- команды только на чтение ----
     if args.explain:
-        print(format_explain(cfg), flush=True)
+        print(format_explain(cfg, targets), flush=True)
         return 0
 
     if args.pilot:
@@ -227,20 +239,24 @@ def main(argv: list[str] | None = None) -> int:
         # свипа уже записывались по новым правилам.
         print(f"java-reaper: правила изменились (версия {RULES_VERSION}) — "
               f"метрика пилота сброшена", flush=True)
-    daemons, decisions = _sweep(cfg, state, now)
+    daemons, decisions = _sweep(cfg, state, now, targets)
 
     if args.status or args.audit:
         # --status/--audit — только чтение: состояние не трогаем.
         if args.audit:
-            text, code = audit_report(cfg, decisions, state)
+            text, code = audit_report(cfg, decisions, state, targets)
             if args.json:
+                limits = {k: (spec.idle_seconds
+                              if spec.idle_seconds is not None
+                              else idle_limit_for(cfg, k))
+                          for k, spec in targets.specs_by_name().items()}
                 stale = [d for d in decisions
                          if d.idle_seconds is not None
-                         and d.idle_seconds > idle_limit_for(cfg, d.daemon.kind)]
+                         and d.idle_seconds > limits.get(
+                             d.daemon.kind, idle_limit_for(cfg, d.daemon.kind))]
                 print(json.dumps({
                     "schema_version": JSON_SCHEMA_VERSION,
-                    "idle_limit_seconds": {k: idle_limit_for(cfg, k)
-                                           for k in ("gradle", "kotlin")},
+                    "idle_limit_seconds": limits,
                     "stale_daemons": [
                         {"pid": d.daemon.pid, "kind": d.daemon.kind,
                          "footprint_mb": d.daemon.footprint_mb,
@@ -252,8 +268,9 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(text, flush=True)
         else:
-            print(format_json(decisions, state, cfg, now=now) if args.json
-                  else format_status(decisions, state, cfg), flush=True)
+            print(format_json(decisions, state, cfg, now=now, targets=targets)
+                  if args.json
+                  else format_status(decisions, state, cfg, targets), flush=True)
         warn = canary(daemons, decisions)
         if warn:
             print("WARNING: " + warn, flush=True)
@@ -262,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
     # ---- рабочий свип ----
     # Демоны, которых больше нет, архивируем в историю: их логи в /tmp
     # исчезают при перезагрузке, и без сводки они исчезнут навсегда.
-    archived = archive_vanished(cfg, state, daemons, now)
+    archived = archive_vanished(cfg, state, daemons, now, targets)
 
     report = execute(decisions, state, now, cfg, dry_run=(mode == "dry-run"))
     trim_report = trim_idle_logs(decisions, cfg, now)
@@ -278,8 +295,9 @@ def main(argv: list[str] | None = None) -> int:
     warnings = degradation_warnings(state, cfg, measured, total)
     state["degradation"] = warnings
 
-    print(format_json(decisions, state, cfg, report, now) if args.json
-          else format_status(decisions, state, cfg), flush=True)
+    print(format_json(decisions, state, cfg, report, now, targets=targets)
+          if args.json
+          else format_status(decisions, state, cfg, targets), flush=True)
     warn = canary(daemons, decisions)
     if warn:
         print("WARNING: " + warn, flush=True)

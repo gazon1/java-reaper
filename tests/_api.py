@@ -25,7 +25,10 @@ from reaper.config import (  # noqa: E402,F401
     disabled_flag,
     expand,
     idle_limit,
+    legacy_cost_key,
+    legacy_idle_key,
     load_config,
+    resolve_targets,
 )
 from reaper.execute import (  # noqa: E402,F401
     execute,
@@ -52,17 +55,32 @@ from reaper.history import (  # noqa: E402,F401
 from reaper.logparse import (  # noqa: E402,F401
     Build,
     FileScan,
+    GRADLE_MARKERS,
     MARK_BUILD_BYTES,
     MARK_BUILD_END,
     MARK_BUILD_END_ALT,
     MARK_BUILD_START,
     MARK_IDLE_BYTES,
+    Markers,
+    parse_line_ts,
+    parse_local_timestamp,
     parse_timestamp,
     scan_file,
+    scan_lines,
+)
+from reaper.targets import (  # noqa: E402,F401
+    ACTIVITY_MARKERS,
+    ACTIVITY_MTIME,
+    TargetSet,
+    TargetSpec,
+    builtin_targets,
+    load_targets,
+    parse_targets,
 )
 from reaper.logread import (  # noqa: E402,F401
     parse_gradle_log,
     scan_gradle_log,
+    scan_log,
     scan_markers,
 )
 from reaper.model import (  # noqa: E402,F401

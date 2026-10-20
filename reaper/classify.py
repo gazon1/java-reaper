@@ -14,32 +14,51 @@ import os
 from dataclasses import replace
 from typing import Any
 
-from .config import allowlist, idle_limit as idle_limit_for
+from .config import allowlist, idle_limit as idle_limit_for, legacy_cost_key
 from .model import (Action, Context, Daemon, Decision, Protector,
                     observed_activity)
 from .proc import mem_available_mb
 from .policy import Rule, Signals, default_policy
+from .targets import TargetSet, builtin_targets
 
 
-def recreate_cost(cfg: dict[str, Any], kind: str) -> float:
+def recreate_cost(cfg: dict[str, Any], kind: str,
+                  targets: TargetSet | None = None) -> float:
     """Сколько секунд стоит воссоздать демона этого класса (холодный старт).
 
     Измерено: Gradle — 41.6 с против 2.4 с тёплого. Kotlin дешёв: это
     старт JVM. Значение нужно, чтобы при нехватке памяти первым убирать
     того, чьё пересоздание дешевле.
+
+    Если вид описан в наборе целей — берём цену оттуда (targets.yaml),
+    иначе — из плоского конфига.
     """
-    key = ("GRADLE_RECREATE_COST_SECONDS" if kind == "gradle"
-           else "KOTLIN_RECREATE_COST_SECONDS")
+    if targets is not None:
+        spec = targets.get(kind)
+        if spec is not None and spec.recreate_cost_seconds is not None:
+            return float(spec.recreate_cost_seconds)
+    key = legacy_cost_key(kind)
     return float(cfg.get(key, 0) or 0)
 
 
+def idle_limit_for_kind(cfg: dict[str, Any], kind: str,
+                        targets: TargetSet | None = None) -> float:
+    """Порог простоя для вида демона (секунды)."""
+    if targets is not None:
+        spec = targets.get(kind)
+        if spec is not None and spec.idle_seconds is not None:
+            return float(spec.idle_seconds)
+    return float(idle_limit_for(cfg, kind))
+
+
 def _measure(d: Daemon, rec: dict[str, Any], now: float,
-             cfg: dict[str, Any]) -> Signals:
+             cfg: dict[str, Any],
+             targets: TargetSet | None = None) -> Signals:
     """Все измерения по одному демону."""
-    # Порог простоя разный для Gradle и Kotlin: у Kotlin нет своего
+    # Порог простоя разный для разных видов демонов: у Kotlin нет своего
     # idle-таймаута (его не убирает никто), у Gradle есть — и тот равен
     # 180 мин, поэтому наш порог должен быть выше.
-    idle_limit = idle_limit_for(cfg, d.kind)
+    idle_limit = idle_limit_for_kind(cfg, d.kind, targets)
     sweep = float(cfg["SWEEP_SECONDS"])
     hz = os.sysconf("SC_CLK_TCK")
 
@@ -187,7 +206,7 @@ def build_context(daemons: list[Daemon], now: float,
     """Собирает контекст всего набора демонов.
 
     Контекст — то, что невозможно знать по одному демону: сколько памяти
-    доступно системе и идёт ли где-то свежая сборка Gradle.
+    доступно системе и идёт ли где-то свежая сборка (по видам демонов).
 
     `context` можно передать явно — тогда тесты не зависят от того, сколько
     памяти свободно на машине, где они идут. Не передан — берём из системы.
@@ -197,22 +216,30 @@ def build_context(daemons: list[Daemon], now: float,
         ctx.mem_available_mb = mem_available_mb()
     ctx.daemon_count = len(daemons)
     ctx.total_footprint_mb = sum(d.footprint_mb for d in daemons)
-    # Пока идёт СВЕЖАЯ сборка — компилятор нужен, и Kotlin-демоны трогать
+    # Пока идёт СВЕЖАЯ сборка — компилятор нужен, и защищаемые виды трогать
     # нельзя. Зависшая сборка (началась давно и не кончилась) защиты не
     # даёт: такой демон сам подлежит уборке.
-    if ctx.gradle_build_age is None:
-        ages = [now - d.last_build_start for d in daemons
-                if d.kind == "gradle" and d.build_in_progress
-                and d.last_build_start is not None]
-        if ages:
-            ctx.gradle_build_age = min(ages)
+    ages: dict[str, float] = {}
+    for d in daemons:
+        if not d.build_in_progress or d.last_build_start is None:
+            continue
+        age = now - d.last_build_start
+        current = ages.get(d.kind)
+        if current is None or age < current:
+            ages[d.kind] = age
+    for kind, age in ages.items():
+        known = ctx.build_ages.get(kind)
+        if known is None or age < known:
+            ctx.build_ages[kind] = age
     return ctx
 
 
 def classify(daemons: list[Daemon], state: dict[str, Any], now: float,
              cfg: dict[str, Any],
-             context: Context | None = None) -> list[Decision]:
+             context: Context | None = None,
+             targets: TargetSet | None = None) -> list[Decision]:
     """Решает, кого убивать. Чистая функция: не трогает систему."""
+    targets = targets or builtin_targets()
     rules = default_policy(cfg)
     peer_max_age = float(cfg["PEER_MAX_AGE_SECONDS"])
     prev = state.get("daemons", {})
@@ -224,9 +251,13 @@ def classify(daemons: list[Daemon], state: dict[str, Any], now: float,
         rec = prev.get(str(d.pid)) or {}
         if rec.get("starttime") is not None and rec["starttime"] != d.starttime:
             rec = {}  # PID переиспользован
-        sig = _measure(d, rec, now, cfg)
+        sig = _measure(d, rec, now, cfg, targets)
         sig.context = ctx
-        sig.recreate_cost_seconds = recreate_cost(cfg, d.kind)
+        sig.recreate_cost_seconds = recreate_cost(cfg, d.kind, targets)
+        # Кто защищает этот вид демонов, пока сам работает (targets.yaml).
+        sig.protector_kinds = targets.protectors_of(d.kind)
+        labels = targets.labels()
+        sig.protector_labels = [labels.get(k, k) for k in sig.protector_kinds]
         signals[d.pid] = sig
 
     protection, stale = _peer_protection(signals, peer_max_age)

@@ -18,36 +18,48 @@ import os
 from typing import Any
 
 from .logparse import (
+    GRADLE_MARKERS,
     MARK_BUILD_CANCELED,
     MARK_BUILD_END,
     MARK_BUILD_END_ALT,
     MARK_BUILD_START,
+    Markers,
+    parse_line_ts,
     parse_ts,
     scan_lines,
     scan_markers,
 )
 
 __all__ = [
+    "GRADLE_MARKERS",
     "MARK_BUILD_CANCELED",
     "MARK_BUILD_END",
     "MARK_BUILD_END_ALT",
     "MARK_BUILD_START",
+    "Markers",
+    "parse_line_ts",
     "parse_ts",
     "scan_markers",
+    "scan_log",
     "scan_gradle_log",
     "parse_gradle_log",
 ]
 
 
-def scan_gradle_log(path: str, offset: int, max_bytes: int,
-                    prev_start: float | None = None,
-                    prev_canceled: float | None = None) -> dict[str, Any]:
-    """Разбор лога Gradle-демона.
+def scan_log(path: str, offset: int, max_bytes: int,
+             prev_start: float | None = None,
+             prev_canceled: float | None = None,
+             markers: Markers = GRADLE_MARKERS,
+             ts_format: str = "iso") -> dict[str, Any]:
+    """Разбор лога демона заданной цели.
 
     offset — сколько байт уже разобрано (из состояния).
     prev_start / prev_canceled — начало последней сборки и момент отмены
     из прошлого чтения: маркер отмены может попасть в новый кусок, а
     таймстемпа у него нет (см. reaper.logparse.scan_lines).
+
+    markers / ts_format — из спецификации цели (targets.yaml): чужой лог
+    может иметь и другие маркеры, и другой формат таймстемпа.
 
     Возвращает:
       offset   — новое смещение;
@@ -61,7 +73,7 @@ def scan_gradle_log(path: str, offset: int, max_bytes: int,
         return {"offset": offset, "start": None, "end": None,
                 "canceled": None, "complete": False}
     if offset > size:
-        offset = 0  # лог усечён или перезаписан
+        offset = 0  # лог усечён или переписан
     if offset <= 0:
         if size <= max_bytes:
             start, complete = 0, True
@@ -79,7 +91,8 @@ def scan_gradle_log(path: str, offset: int, max_bytes: int,
     # Разбор — тем же сканером, что и полный файл (reaper.logparse):
     # формат лога знает одно место, а не два.
     scan = scan_lines(blob.splitlines(), prev_start=prev_start,
-                      prev_canceled=prev_canceled)
+                      prev_canceled=prev_canceled, markers=markers,
+                      ts_format=ts_format)
     starts = [b.start for b in scan.builds]
     ends = [b.end for b in scan.builds if b.end is not None]
     if scan.last_end is not None:
@@ -95,6 +108,18 @@ def scan_gradle_log(path: str, offset: int, max_bytes: int,
         new_offset = size
     return {"offset": new_offset, "start": s, "end": e, "canceled": canceled,
             "complete": complete or e is not None}
+
+
+def scan_gradle_log(path: str, offset: int, max_bytes: int,
+                    prev_start: float | None = None,
+                    prev_canceled: float | None = None) -> dict[str, Any]:
+    """Разбор лога Gradle-демона (маркеры Gradle).
+
+    Совместимая обёртка над scan_log — осталась, чтобы не ломать вызовы.
+    """
+    return scan_log(path, offset, max_bytes, prev_start=prev_start,
+                    prev_canceled=prev_canceled, markers=GRADLE_MARKERS,
+                    ts_format="iso")
 
 
 def parse_gradle_log(path: str, tail_bytes: int) -> tuple[float | None, float | None]:
