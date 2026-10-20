@@ -178,8 +178,9 @@ class TestKillPath(unittest.TestCase):
     def test_stubborn_kotlin_daemon_is_sigkilled_after_grace(self):
         """Kotlin-демон, игнорирующий SIGTERM, получает SIGKILL.
 
-        Через CLI результат зависит от машины: если где-то идёт сборка Gradle,
-        рейпер по правилу «сборка Gradle ⇒ Kotlin не трогаю» пропускает цель.
+        Через CLI результат зависит от машины: если где-то идёт свежая
+        сборка Gradle, рейпер по правилу «сборка Gradle ⇒ Kotlin не трогаю»
+        защищает цель — и это правильный исход (компилятор нужен сборке).
         Поэтому проверяем оба допустимых исхода, а сам механизм эскалации —
         детерминированно, прямым вызовом execute() (см. следующий тест).
         """
@@ -187,8 +188,10 @@ class TestKillPath(unittest.TestCase):
         self.write_cfg(str(fake.proc.pid))
         run_reaper(self.cfg, "--mode=dry-run")
         proc = run_reaper(self.cfg, "--mode=kill")
-        if "skipped" in proc.stdout:
-            self.assertIn("идёт сборка Gradle", proc.stdout)
+        if "идёт сборка Gradle" in proc.stdout:
+            # Цель защищена правилом: демон остался жив — это допустимый
+            # исход (компилятор нужен идущей сборке).
+            self.assertTrue(fake.alive())
             return
         self.assertIn("SIGTERM", proc.stdout)
         self.assertIn("SIGKILL", proc.stdout)

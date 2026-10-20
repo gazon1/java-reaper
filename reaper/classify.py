@@ -173,9 +173,18 @@ def classify(daemons: list[Daemon], state: dict[str, Any], now: float,
     prev = state.get("daemons", {})
 
     # Контекст всего набора: идёт ли где-то сборка Gradle. Пока идёт —
-    # компилятор нужен, и Kotlin-демоны трогать нельзя.
-    gradle_building = any(d.kind == "gradle" and d.build_in_progress
-                           for d in daemons)
+    # компилятор нужен, и Kotlin-демоны трогать нельзя. Защита действует
+    # только для свежей сборки: зависшая (началась давно и не кончилась)
+    # — не причина блокировать уборку Kotlin-навсегда.
+    gradle_build_age: float | None = None
+    for d in daemons:
+        if d.kind != "gradle" or not d.build_in_progress:
+            continue
+        if d.last_build_start is None:
+            continue
+        age = now - d.last_build_start
+        if gradle_build_age is None or age < gradle_build_age:
+            gradle_build_age = age
 
     signals: dict[int, Signals] = {}
     for d in daemons:
@@ -183,7 +192,8 @@ def classify(daemons: list[Daemon], state: dict[str, Any], now: float,
         if rec.get("starttime") is not None and rec["starttime"] != d.starttime:
             rec = {}  # PID переиспользован
         sig = _measure(d, rec, now, cfg)
-        sig.gradle_building = gradle_building
+        sig.gradle_building = gradle_build_age is not None
+        sig.gradle_build_age = gradle_build_age
         signals[d.pid] = sig
 
     protection, stale = _peer_protection(signals, peer_max_age)

@@ -53,6 +53,10 @@ class Signals:
     # признак самого демона: пока идёт сборка, компилятор нужен, и убивать
     # Kotlin-демоны нельзя (иначе сборка упадёт посреди компиляции).
     gradle_building: bool = False
+    # Сколько секунд прошло с начала той сборки Gradle (None — сборки нет).
+    # Защита действует только пока сборка «свежая»: зависшая намертво
+    # сборка — не причина блокировать уборку Kotlin-навсегда.
+    gradle_build_age: float | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +93,7 @@ def default_policy(cfg: dict) -> list[Rule]:
     """
     idle_limit = float(cfg["IDLE_SECONDS"])
     stuck_after = float(cfg.get("STUCK_AFTER_SECONDS", 3600))
+    build_active = float(cfg.get("GRADLE_BUILD_ACTIVE_SECONDS", 1800))
     min_footprint = int(cfg["MIN_FOOTPRINT_MB"])
     peer_max_age = float(cfg.get("PEER_MAX_AGE_SECONDS", 21600))
 
@@ -132,8 +137,16 @@ def default_policy(cfg: dict) -> list[Rule]:
         отчёт и метрика говорят одно и то же (раньше исполнитель резал
         кандидатов в последний момент, а отчёт и метрика считали их
         «убитыми»).
+
+        Защищает только СВЕЖАЯ сборка (началась недавно): сборка,
+        начавшаяся несколько часов назад и не завершившаяся, — это
+        зависший демон, и он сам подлежит уборке.
         """
-        return s.gradle_building and s.daemon.kind == "kotlin"
+        if not s.gradle_building or s.daemon.kind != "kotlin":
+            return False
+        if s.gradle_build_age is None:
+            return True
+        return s.gradle_build_age <= build_active
 
     def always(s: Signals) -> bool:
         return True
