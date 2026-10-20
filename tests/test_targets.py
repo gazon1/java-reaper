@@ -618,5 +618,65 @@ class TestOverrideInheritsBuiltin(unittest.TestCase):
         self.assertEqual(spec.ts_format, tg.TS_ISO)
 
 
+class TestModuleStructure(unittest.TestCase):
+    """Цели разнесены по модулям — но публичный контракт не изменился.
+
+    Проверяем не «как именно разделено», а две вещи, которые важны
+    посторонним: `reaper.targets` остаётся точкой входа с теми же именами,
+    и новые модули не замыкаются кругом на фасад.
+    """
+
+    def test_facade_reexports_the_same_objects(self):
+        """Фасад отдаёт те же объекты, а не копии."""
+        from reaper import target_registry, target_spec, target_yaml
+
+        self.assertIs(tg.TargetSpec, target_spec.TargetSpec)
+        self.assertIs(tg.TargetSet, target_registry.TargetSet)
+        self.assertIs(tg.builtin_targets, target_registry.builtin_targets)
+        self.assertIs(tg.BUILTIN_TARGETS, target_registry.BUILTIN_TARGETS)
+        self.assertIs(tg.load_targets, target_yaml.load_targets)
+        self.assertIs(tg.parse_targets, target_yaml.parse_targets)
+        self.assertIs(tg.TS_ISO, target_spec.TS_ISO)
+        self.assertIs(tg.TS_LOCAL, target_spec.TS_LOCAL)
+        self.assertIs(tg.DEFAULT_TARGETS_PATH, target_yaml.DEFAULT_TARGETS_PATH)
+
+    def test_facade_keeps_public_names(self):
+        """Все имена, которыми пользовались раньше, доступны и теперь."""
+        for name in ("TargetSpec", "TargetSet", "ACTIVITY_MARKERS",
+                     "ACTIVITY_MTIME", "GRADLE_MAIN", "KOTLIN_MAIN",
+                     "TS_ISO", "TS_LOCAL", "BUILTIN_TARGETS",
+                     "DEFAULT_TARGETS_PATH", "builtin_targets", "load_targets",
+                     "parse_targets"):
+            with self.subTest(name=name):
+                self.assertTrue(hasattr(tg, name))
+
+    def test_no_module_imports_the_facade_back(self):
+        """Цикла импорта нет: новые модули не тянут `reaper.targets`.
+
+        Если бы кто-то из них импортировал фасад, то фасад (он импортирует
+        их) замкнул бы круг — и обычный `import reaper.targets` сломался бы
+        в зависимости от порядка импорта.
+        """
+        import ast
+
+        package = os.path.dirname(os.path.abspath(tg.__file__))
+        for module in ("target_spec.py", "target_registry.py", "target_yaml.py"):
+            with self.subTest(module=module):
+                with open(os.path.join(package, module), encoding="utf-8") as fh:
+                    tree = ast.parse(fh.read())
+                imported = set()
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ImportFrom):
+                        if node.level and node.module:
+                            imported.add(node.module)
+                        for alias in node.names:
+                            imported.add(alias.name)
+                    elif isinstance(node, ast.Import):
+                        for alias in node.names:
+                            imported.add(alias.name)
+                self.assertNotIn("targets", imported)
+                self.assertNotIn("reaper.targets", imported)
+
+
 if __name__ == "__main__":
     unittest.main()
