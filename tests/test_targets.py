@@ -341,5 +341,27 @@ class TestBehaviorUnchanged(unittest.TestCase):
         self.assertIn("Gradle", decisions[2].reason)
 
 
+class TestLogLookup(unittest.TestCase):
+    """Лог ищется по регулярке цели — и только по ней.
+
+    Дефект, который закрывает этот тест: цель без своей регулярки
+    получала ЧУЖОЙ лог (Gradle-овский) по старой эвристике, и простой
+    этой цели измерялся бы по чужому файлу.
+    """
+
+    def test_empty_regex_means_no_log(self):
+        self.assertIsNone(reaper.find_log_path(os.getpid(), ""))
+
+    def test_regex_limits_the_search(self):
+        """Регулярка цели — единственный источник лога."""
+        path = reaper.find_log_path(os.getpid(), r"^нет-такого-файла\.log$")
+        self.assertIsNone(path)
+
+    def test_none_keeps_legacy_mode(self):
+        """Без регулярки — старый режим (Gradle/Kotlin-имена)."""
+        # Текущий процесс не держит логов Gradle/Kotlin → None.
+        self.assertIsNone(reaper.find_log_path(os.getpid(), None))
+
+
 if __name__ == "__main__":
     unittest.main()

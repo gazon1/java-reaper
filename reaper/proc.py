@@ -120,8 +120,16 @@ def find_log_path(pid: int, name_regex: str | None = None) -> str | None:
     kotlin-daemon.*.log. Никаких эвристик по времени старта.
 
     `name_regex` — регулярка на имя файла из спецификации цели
-    (targets.yaml). Без неё — как раньше: Gradle- и Kotlin-имена.
+    (targets.yaml):
+      * None — старый режим: ищем Gradle- и Kotlin-имена (для вызовов,
+        где набора целей нет);
+      * пустая строка — у цели своего лога нет, искать нечего: возвращаем
+        None. Иначе цель без лога получила бы ЧУЖОЙ лог (например,
+        Gradle-овский) и мы бы измеряли её простой по чужому файлу;
+      * непустая — ищем только по этой регулярке.
     """
+    if name_regex is not None and not name_regex:
+        return None
     fddir = f"/proc/{pid}/fd"
     try:
         fds = os.listdir(fddir)

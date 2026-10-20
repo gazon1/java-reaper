@@ -107,7 +107,7 @@ def collect_daemons(cfg: dict[str, Any], state: dict[str, Any],
             # PID переиспользован — прежние накопления не про этот процесс.
             rec = {}
 
-        d.log_path = find_log_path(pid, spec.log_name_regex or None)
+        d.log_path = find_log_path(pid, spec.log_name_regex)
         if d.log_path is None:
             d.log_ok = False
         elif spec.activity == ACTIVITY_MARKERS:
