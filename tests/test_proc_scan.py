@@ -105,13 +105,19 @@ class TestFindSocketOwners(unittest.TestCase):
                 def full():
                     reaper.inode_owner_map()
 
-                t0 = time.perf_counter()
-                targeted()
-                targeted_time = time.perf_counter() - t0
+                def best(fn, runs=3):
+                    # Минимум из нескольких замеров: на общей загруженной
+                    # машине единичный замер шумит сильнее самой разницы,
+                    # которую тест хочет увидеть.
+                    times = []
+                    for _ in range(runs):
+                        t0 = time.perf_counter()
+                        fn()
+                        times.append(time.perf_counter() - t0)
+                    return min(times)
 
-                t0 = time.perf_counter()
-                full()
-                full_time = time.perf_counter() - t0
+                targeted_time = best(targeted)
+                full_time = best(full)
 
                 self.assertLessEqual(targeted_time, full_time * 1.2,
                                      f"прицельный {targeted_time:.3f} с, "
