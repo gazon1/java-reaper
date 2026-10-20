@@ -31,6 +31,26 @@ def socket_inode_of(sock: socket.socket) -> str:
     return ""
 
 
+class _CountingOs:
+    """Обёртка над `os`, считающая прочитанные каталоги `fd`.
+
+    Нужна, чтобы измерить работу, а не время: на загруженной машине время
+    врёт, а число прочитанных каталогов — нет.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.fd_dirs = 0
+
+    def listdir(self, path):
+        if isinstance(path, str) and path.startswith("/proc/") and path.endswith("/fd"):
+            self.fd_dirs += 1
+        return self._real.listdir(path)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
 class TestFindSocketOwners(unittest.TestCase):
     def test_empty_request_returns_empty(self):
         self.assertEqual(reaper.find_socket_owners(set()), {})
@@ -84,10 +104,20 @@ class TestFindSocketOwners(unittest.TestCase):
         self.assertNotIn("999999999", owners)
 
     def test_search_is_faster_than_full_map(self):
-        """Прицельный поиск не должен быть медленнее полного обхода.
+        """Прицельный поиск не должен быть дороже полного обхода.
 
         Полный обход читает fd каждого процесса; прицельный идёт по тем же
         каталогам, но с ранним выходом, когда нужное найдено.
+
+        Сравнение по времени здесь ненадёжно: полный обход идёт вторым и
+        получает тёплый кэш страниц, поэтому выигрывает даже там, где
+        работы больше. Поэтому главная проверка — работа, а не время:
+        прицельный поиск не должен читать заметно больше каталогов `fd`,
+        чем полный обход. Счётчики снимаются в один и тот же момент по
+       очереди, но машина живёт: между двумя замерами какие-то процессы
+        успевают появиться, а какие-то — исчезнуть, поэтому допуск есть.
+        Время проверяется отдельно и с большим запасом: так отлавливается
+        грубая регрессия, а не шум загруженной машины.
         """
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.bind(("127.0.0.1", 0))
@@ -105,10 +135,23 @@ class TestFindSocketOwners(unittest.TestCase):
                 def full():
                     reaper.inode_owner_map()
 
+                def fd_dirs_read(fn):
+                    """Сколько каталогов `fd` прочитано — это и есть работа."""
+                    counter = _CountingOs(os)
+                    import reaper.proc as proc_mod
+                    real_os = proc_mod.os
+                    proc_mod.os = counter
+                    try:
+                        fn()
+                    finally:
+                        proc_mod.os = real_os
+                    return counter.fd_dirs
+
                 def best(fn, runs=3):
                     # Минимум из нескольких замеров: на общей загруженной
                     # машине единичный замер шумит сильнее самой разницы,
                     # которую тест хочет увидеть.
+                    fn()  # прогрев кэша, иначе первым идёт «холодный» замер
                     times = []
                     for _ in range(runs):
                         t0 = time.perf_counter()
@@ -116,10 +159,17 @@ class TestFindSocketOwners(unittest.TestCase):
                         times.append(time.perf_counter() - t0)
                     return min(times)
 
+                targeted_dirs = fd_dirs_read(targeted)
+                full_dirs = fd_dirs_read(full)
+                # Допуск — на разницу «живой» машины между замерами.
+                self.assertLessEqual(targeted_dirs, full_dirs * 1.2 + 20,
+                                     f"прицельный прочитал {targeted_dirs} "
+                                     f"каталогов, полный — {full_dirs}")
+
                 targeted_time = best(targeted)
                 full_time = best(full)
 
-                self.assertLessEqual(targeted_time, full_time * 1.2,
+                self.assertLessEqual(targeted_time, full_time * 2.0,
                                      f"прицельный {targeted_time:.3f} с, "
                                      f"полный {full_time:.3f} с")
             finally:
