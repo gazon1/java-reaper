@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# One run per ref; a new push cancels the previous run on the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests + smoke run (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Tests
+        timeout-minutes: 10
+        run: python3 -m unittest discover -s tests
+
+      # Smoke run: every tool must exit 0 on a machine without
+      # ~/.config/java-reaper and without collected state. The tools report
+      # "no data" and exit 0 — missing history is not a failure of the tool.
+      - name: Smoke run of the tools
+        timeout-minutes: 10
+        run: |
+          python3 -m reaper.cli --status
+          python3 -m reaper.cli --explain
+          python3 -m reaper.cli --status --json
+          python3 tools/measure-thresholds.py
+          python3 tools/simulate.py
+          python3 tools/simulate.py --json
+          python3 tools/monthly-report.py
+          python3 tools/analyze-idle.py --json
+          python3 tools/prune-logs.py --archive-only --min-age-hours 0
