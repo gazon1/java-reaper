@@ -250,6 +250,12 @@ def _coverage_lines(state: dict[str, Any], cfg: dict[str, Any]) -> list[str]:
     if not fired and not coverage["never_fired"]:
         return []
     lines = []
+    # Если свипов ещё не было, «ни разу не сработало» — это не «порог не
+    # проверен», а «наблюдать было нечего». Разница принципиальная: в первом
+    # случае порог вызывает сомнение, во втором — данных просто нет.
+    if not state.get("last_sweep_at") and not fired:
+        return ["покрытие правил: свипов ещё не было — ни одно правило не "
+                "проверено"]
     if fired:
         parts = ", ".join(f"{name} ×{count}" for name, count in
                           sorted(fired.items(), key=lambda kv: -kv[1]))

@@ -402,6 +402,13 @@ class TestPilotReport(unittest.TestCase):
         text, _ = reaper.pilot_report(self.cfg, state, now=NOW)
         self.assertNotIn("не из чего набирать события", _verdict_line(text))
 
+    def test_no_sweeps_yet_says_nothing_was_observed(self):
+        """Свипов не было — это «наблюдать было нечего», а не «порог не проверен»."""
+        text = reaper.format_status([], {"metric": {}, "rule_hits": {}},
+                                    reaper.DEFAULTS)
+        self.assertIn("свипов ещё не было", text)
+        self.assertNotIn("НИ РАЗУ не сработали", text)
+
     def test_high_reuse_rate_blocks(self):
         text, code = reaper.pilot_report(self.cfg, self._state(20, 0.9), now=NOW)
         self.assertEqual(code, 1)
