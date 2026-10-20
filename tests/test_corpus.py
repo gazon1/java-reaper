@@ -161,5 +161,48 @@ class TestStuckDaemons(unittest.TestCase):
         self.assertEqual(len(summary["lifetimes_by_kind"]["gradle"]), 1)
 
 
+class TestStuckMemory(unittest.TestCase):
+    """Память, которую удержали зависшие демоны: стоит ли вообще этот класс."""
+
+    def test_footprint_per_daemon_divides_sum_by_count(self):
+        sweeps = [{"by_kind": {"gradle": {"count": 2, "footprint_mb": 4000}}},
+                  {"by_kind": {"gradle": {"count": 1, "footprint_mb": 1000}}}]
+        self.assertEqual(corpus.footprint_per_daemon_mb(sweeps, "gradle"),
+                         [2000.0, 1000.0])
+
+    def test_footprint_skips_sweeps_without_daemons(self):
+        sweeps = [{"by_kind": {"gradle": {"count": 0, "footprint_mb": 0}}}]
+        self.assertEqual(corpus.footprint_per_daemon_mb(sweeps, "gradle"), [])
+
+    def test_counts_only_daemons_that_outlived_threshold(self):
+        records = [
+            # пережил час после отмены
+            {"kind": "gradle", "canceled_at": 0.0, "mtime": 7200.0},
+            # умер через 10 минут — рейперу не нужен
+            {"kind": "gradle", "canceled_at": 0.0, "mtime": 600.0},
+            # не зависший вовсе
+            {"kind": "gradle", "canceled_at": None, "mtime": 9000.0},
+        ]
+        report = corpus.stuck_memory_report(records, [], 3600.0)
+        self.assertEqual(report["count"], 2)
+        self.assertEqual(report["over_threshold"], 1)
+        self.assertAlmostEqual(report["over_threshold_pct"], 50.0)
+
+    def test_held_memory_is_averaged_over_the_period(self):
+        """Память, висевшая на зависших, делится на длину периода."""
+        records = [{"kind": "gradle", "canceled_at": 0.0, "mtime": 7200.0}]
+        sweeps = [{"by_kind": {"gradle": {"count": 1, "footprint_mb": 2000}}}]
+        report = corpus.stuck_memory_report(records, sweeps, 3600.0)
+        # демон прожил 2 часа, период — те же 2 часа, footprint 2000 МБ
+        self.assertAlmostEqual(report["period_hours"], 2.0)
+        self.assertAlmostEqual(report["held_mb_average"], 2000.0)
+
+    def test_no_records_means_nothing_to_measure(self):
+        report = corpus.stuck_memory_report([], [], 3600.0)
+        self.assertEqual(report["count"], 0)
+        self.assertEqual(report["measured"], 0)
+        self.assertAlmostEqual(report["held_mb_average"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,12 +20,6 @@ import json
 import os
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-# Правила, которые защищают демона (не убивают) и правила, которые убивают.
-# Разделение нужно, чтобы отчёт различал «порог не проверен, потому что
-# правило ни разу не сработало» и «правило сработало и оставило демона
-# живым по другой причине».
-KILL_RULES = frozenset({"kill"})
-
 # Правила, которые не выполнялись НИ РАЗУ за весь журнал: значит, порог,
 # который за ними стоит, не проверен ни на одном реальном демоне.
 UNPROVEN_HINT = "ни разу не сработало — порог за этим правилом не проверен"
@@ -143,12 +137,17 @@ def tail_idle_bounds(record: Dict[str, Any]) -> Optional[tuple[float, float]]:
 # --------------------------------------------------------------------------- #
 
 
-def rule_coverage(sweeps: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+def rule_coverage(sweeps: Sequence[Dict[str, Any]],
+                  known_rules: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """Покрытие правил: какие срабатывали, какие — ни разу.
 
     По журналу видно, какие пороги вообще проверены на живых демонах.
     Правило, которое не сработало ни разу, оставляет свой порог
     непроверенным: значение стоит, но никто не знает, верное ли оно.
+
+    `known_rules` — полный список правил политики. Без него «ни разу не
+    сработало» пусто: журнал хранит только те правила, которые сработали, и
+    молчание о нём означало бы «всё проверено».
     """
     hits: Dict[str, int] = {}
     for row in sweeps:
@@ -156,6 +155,8 @@ def rule_coverage(sweeps: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             hits[rule] = hits.get(rule, 0) + int(count or 0)
     fired = {rule: count for rule, count in hits.items() if count > 0}
     never = sorted(rule for rule, count in hits.items() if count == 0)
+    if known_rules is not None:
+        never = sorted(set(known_rules) - set(fired))
     return {
         "sweeps": len(sweeps),
         "hits": dict(sorted(hits.items())),
@@ -227,6 +228,104 @@ def stuck_lifetime(record: Dict[str, Any]) -> Optional[tuple[float, str]]:
     if lifetime < 0:
         return None
     return (lifetime, source)
+
+
+def footprint_per_daemon_mb(sweeps: Sequence[Dict[str, Any]],
+                            kind: str) -> List[float]:
+    """Footprint одного живого демона вида, МБ — по журналу свипов.
+
+    В свипе хранится суммарный footprint по видам, а не по демонам, поэтому
+    «сколько занимает один демон» получается делением суммы на число демонов.
+    Это оценка, а не измерение отдельного демона: демоны одного вида различаются
+    по настройке JVM. Но для ответа «сколько памяти висело на зависших» нужна
+    именно величина порядка — и она отсюда берётся честно.
+    """
+    values: List[float] = []
+    for row in sweeps:
+        bucket = (row.get("by_kind") or {}).get(kind) or {}
+        count = int(bucket.get("count") or 0)
+        if count <= 0:
+            continue
+        values.append(float(bucket.get("footprint_mb") or 0) / count)
+    return values
+
+
+def stuck_memory_report(records: Iterable[Dict[str, Any]],
+                        sweeps: Sequence[Dict[str, Any]],
+                        threshold_seconds: float) -> Dict[str, Any]:
+    """Сколько памяти удержали зависшие демоны — и стоит ли их класс.
+
+    Отвечает на вопрос «а может, этот класс не нужен?» тремя числами:
+      * сколько демонов зависло и сколько демон-часов они удержали память;
+      * сколько из них пережило порог «завис» (остальные умерли сами, и
+        рейперу они не нужны);
+      * сколько памяти в среднем висело на зависших в любой момент.
+
+    Последнее число — решающее: если удерживаемая память мала по сравнению со
+    свободной, класс не создаёт давления, и убирать его незачем.
+    """
+    lifetimes: List[float] = []
+    over: List[float] = []
+    hours_by_kind: Dict[str, float] = {}
+    first: Optional[float] = None
+    last: Optional[float] = None
+    kinds: Dict[str, int] = {}
+    for record in records:
+        if not is_stuck(record):
+            continue
+        kind = str(record.get("kind") or "unknown")
+        kinds[kind] = kinds.get(kind, 0) + 1
+        canceled = record.get("canceled_at")
+        bounds = death_bounds(record)
+        if canceled is None or bounds is None:
+            continue
+        lower, upper, _source = bounds
+        lifetime = lower - float(canceled)
+        if lifetime < 0:
+            continue
+        lifetimes.append(lifetime)
+        hours_by_kind[kind] = hours_by_kind.get(kind, 0.0) + lifetime / 3600.0
+        if lifetime > threshold_seconds:
+            over.append(lifetime)
+        for stamp in (float(canceled), lower):
+            first = stamp if first is None else min(first, stamp)
+            last = stamp if last is None else max(last, stamp)
+
+    period_hours = ((last - first) / 3600.0) if (first is not None and last is not None
+                                                     and last > first) else 0.0
+    total_hours = sum(lifetimes) / 3600.0
+    over_hours = sum(v - threshold_seconds for v in over) / 3600.0
+
+    footprint_median: Dict[str, float] = {}
+    for kind in kinds:
+        values = footprint_per_daemon_mb(sweeps, kind)
+        if values:
+            footprint_median[kind] = percentile(values, 50)
+    # Сколько памяти висело на зависших в среднем за период: сумма
+    # «демон-часы × footprint демона» делим на длину периода.
+    held_mb_total = sum(hours_by_kind.get(kind, 0.0) * footprint_median.get(kind, 0.0)
+                         for kind in kinds)
+    held_mb = held_mb_total / period_hours if period_hours > 0 else 0.0
+    typical_footprint = (percentile(list(footprint_median.values()), 50)
+                         if footprint_median else 0.0)
+
+    return {
+        "count": sum(kinds.values()),
+        "count_by_kind": kinds,
+        "measured": len(lifetimes),
+        "threshold_seconds": threshold_seconds,
+        "over_threshold": len(over),
+        "over_threshold_pct": (round(100.0 * len(over) / len(lifetimes), 1)
+                               if lifetimes else 0.0),
+        "daemon_hours_total": total_hours,
+        "daemon_hours_over_threshold": over_hours,
+        "period_hours": period_hours,
+        "footprint_median_mb": footprint_median,
+        "held_mb_average": held_mb,
+        "held_mb_average_over_threshold": (
+            over_hours * typical_footprint / period_hours
+            if period_hours > 0 else 0.0),
+    }
 
 
 def stuck_summaries(records: Iterable[Dict[str, Any]]) -> Dict[str, Any]:

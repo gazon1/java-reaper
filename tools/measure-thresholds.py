@@ -41,17 +41,19 @@ import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from reaper.config import load_config, resolve_targets  # noqa: E402
+from reaper.config import DEFAULTS, load_config, resolve_targets  # noqa: E402
 from reaper.corpus import (  # noqa: E402
     gaps_between_builds,
     human,
     percentile,
     read_jsonl,
     rule_coverage,
+    stuck_memory_report,
     stuck_summaries,
     tail_idle,
     tail_idle_bounds,
 )
+from reaper.policy import default_policy, kill_rule_names  # noqa: E402
 from reaper.targets import (  # noqa: E402
     ACTIVITY_MARKERS,
     TargetSet,
@@ -81,7 +83,11 @@ def measure_sweeps(rows: List[dict[str, Any]], cfg: dict[str, Any],
             footprint_by_kind.setdefault(kind, []).append(value)
 
     sweeps_with_impact = sum(1 for v in under_impact if v > 0)
-    coverage = rule_coverage(rows)
+    # Полный список правил — из политики: журнал хранит только сработавшие
+    # правила, и без этого списка «не сработало ни разу» было бы пустым.
+    policy_cfg = {**DEFAULTS, **cfg}
+    rule_names = [rule.name for rule in default_policy(policy_cfg)]
+    coverage = rule_coverage(rows, rule_names)
     result: Dict[str, Any] = {
         "sweeps": len(rows),
         "period_days": (max(r["at"] for r in rows)
@@ -96,6 +102,7 @@ def measure_sweeps(rows: List[dict[str, Any]], cfg: dict[str, Any],
         "footprint_by_kind": {},
         "free_memory": {},
         "rule_coverage": coverage,
+        "kill_rules": kill_rule_names(policy_cfg),
     }
 
     for kind, values in sorted(footprint_by_kind.items()):
@@ -257,12 +264,40 @@ def measure_history(rows: List[dict[str, Any]],
     return result
 
 
+def measure_stuck_memory(sweep_rows: List[dict[str, Any]],
+                         history_rows: List[dict[str, Any]],
+                         cfg: dict[str, Any]) -> Dict[str, Any]:
+    """Сколько памяти висело на зависших демонах — и стоит ли этот класс."""
+    threshold = float(cfg.get("STUCK_AFTER_SECONDS", 3600))
+    report = stuck_memory_report(history_rows, sweep_rows, threshold)
+    if not report.get("measured"):
+        report["note"] = ("зависших демонов в корпусе нет — измерять нечего")
+        return report
+    # Честный вывод: класс нужен, если удерживаемая память заметна. Сравниваем
+    # со свободной памятью из журнала свипов.
+    free = [float(r["mem_available_mb"]) for r in sweep_rows
+            if r.get("mem_available_mb") is not None]
+    if free:
+        report["free_memory_p50_mb"] = percentile(free, 50)
+        report["share_of_free_memory_pct"] = (
+            round(100.0 * report["held_mb_average"] / percentile(free, 50), 2)
+            if percentile(free, 50) else 0.0)
+    report["verdict"] = (
+        f"зависших {report['count']}, из них пережили порог "
+        f"{threshold / 60:.0f} мин — {report['over_threshold']} "
+        f"({report['over_threshold_pct']} %); в среднем висело "
+        f"{human(report['held_mb_average'])} МБ, из них сверх порога — "
+        f"{human(report['held_mb_average_over_threshold'])} МБ")
+    return report
+
+
 # --------------------------------------------------------------------------- #
 # Вывод
 # --------------------------------------------------------------------------- #
 
 
-def print_report(sweeps: Dict[str, Any], history: Dict[str, Any]) -> None:
+def print_report(sweeps: Dict[str, Any], history: Dict[str, Any],
+                 stuck_memory: Optional[Dict[str, Any]] = None) -> None:
     print("=" * 78)
     print("Измерение порогов по накопленным журналам")
     print("=" * 78)
@@ -295,16 +330,24 @@ def print_report(sweeps: Dict[str, Any], history: Dict[str, Any]) -> None:
         print(f"  ВЫВОД: {sweeps['verdict']}")
 
         coverage = sweeps.get("rule_coverage") or {}
+        kill_rules = sweeps.get("kill_rules") or []
         if coverage.get("sweeps"):
             print()
             print("  Покрытие правил (какие пороги вообще проверены):")
             for rule, count in (coverage.get("fired") or {}).items():
                 print(f"    сработало {count:>6} раз  {rule}")
             never = coverage.get("never_fired") or []
-            if never:
-                print(f"    НИ РАЗУ не сработало: {', '.join(never)}")
+            kill_never = [rule for rule in never if rule in kill_rules]
+            protective = [rule for rule in never if rule not in kill_rules]
+            if kill_never:
+                print(f"    НИ РАЗУ не сработало (kill-правила): "
+                      f"{', '.join(kill_never)}")
                 print("      → пороги за этими правилами на живых демонах не "
-                      "проверены")
+                      "проверены, и пилоту не из чего набирать события")
+            if protective:
+                print(f"    НИ РАЗУ не сработало (защитные): "
+                      f"{', '.join(protective)}")
+                print("      → защищать было некого, а не «порог не проверен»")
 
     print()
     print("2. Простой по видам (по истории сводок демонов)")
@@ -384,6 +427,34 @@ def print_report(sweeps: Dict[str, Any], history: Dict[str, Any]) -> None:
                     print("      сколько прожили после отмены — измерить нечем: "
                           "момент смерти не замечен")
 
+    if stuck_memory is not None:
+        print()
+        print("3. Память на зависших демонах (стоит ли этот класс)")
+        print("-" * 78)
+        if not stuck_memory.get("measured"):
+            print(f"  {stuck_memory.get('note', 'измерять нечего')}")
+        else:
+            print(f"  зависших: {stuck_memory['count']}"
+                  f"   из них пережили порог "
+                  f"{stuck_memory['threshold_seconds'] / 60:.0f} мин: "
+                  f"{stuck_memory['over_threshold']} "
+                  f"({stuck_memory['over_threshold_pct']} %)")
+            print(f"  удержали память: {human(stuck_memory['daemon_hours_total'])}"
+                  f" демон-часов за {human(stuck_memory['period_hours'])} ч")
+            for kind, value in sorted((stuck_memory.get('footprint_median_mb') or {}).items()):
+                print(f"    footprint одного {kind} (медиана по свипам): "
+                      f"{human(value, 0)} МБ")
+            print(f"  в среднем висело на зависших: "
+                  f"{human(stuck_memory['held_mb_average'])} МБ; "
+                  f"сверх порога — "
+                  f"{human(stuck_memory['held_mb_average_over_threshold'])} МБ")
+            if "free_memory_p50_mb" in stuck_memory:
+                print(f"  это {stuck_memory['share_of_free_memory_pct']} % от "
+                      f"свободной памяти (медиана "
+                      f"{human(stuck_memory['free_memory_p50_mb'], 0)} МБ)")
+            print()
+            print(f"  ВЫВОД: {stuck_memory['verdict']}")
+
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
@@ -410,14 +481,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sweeps_path = args.sweeps or os.path.join(state_dir, "sweeps.jsonl")
     history_path = args.history or os.path.join(state_dir, "logs-history.jsonl")
 
-    sweeps = measure_sweeps(read_jsonl(sweeps_path), cfg, targets)
-    history = measure_history(read_jsonl(history_path), targets)
+    sweep_rows = read_jsonl(sweeps_path)
+    history_rows = read_jsonl(history_path)
+    sweeps = measure_sweeps(sweep_rows, cfg, targets)
+    history = measure_history(history_rows, targets)
+    stuck_memory = measure_stuck_memory(sweep_rows, history_rows, cfg)
 
     if args.json:
-        print(json.dumps({"sweeps": sweeps, "history": history},
+        print(json.dumps({"sweeps": sweeps, "history": history,
+                          "stuck_memory": stuck_memory},
                          ensure_ascii=False, indent=2))
         return 0
-    print_report(sweeps, history)
+    print_report(sweeps, history, stuck_memory)
     return 0
 
 
