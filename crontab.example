@@ -18,4 +18,4 @@
 #
 # Пути в примере — для машины пользователя max; поправь на свои.
 
-*/5 * * * * /usr/bin/python3 /home/max/dev/java-reaper/tools/watchdog.py >> /home/max/.local/state/java-reaper/watchdog.log 2>&1
+*/5 * * * * /usr/bin/python3 $HOME/dev/java-reaper/tools/watchdog.py >> $HOME/.local/state/java-reaper/watchdog.log 2>&1

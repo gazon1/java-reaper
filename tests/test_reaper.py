@@ -169,7 +169,7 @@ class TestLoopbackDetection(unittest.TestCase):
         self.assertTrue(reaper._is_loopback("0100007f"))
 
     def test_external_v4(self):
-        self.assertFalse(reaper._is_loopback("6B01A8C0"))  # 192.168.1.107
+        self.assertFalse(reaper._is_loopback("6B01A8C0"))  # 192.0.2.107
         self.assertFalse(reaper._is_loopback("EBE92422"))  # 34.36.233.235
 
     def test_loopback_v6(self):

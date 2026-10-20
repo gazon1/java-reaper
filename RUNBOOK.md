@@ -260,7 +260,7 @@ tail -20 ~/.local/state/java-reaper/watchdog.log
 ```bash
 crontab -l > /tmp/reaper-cron.txt
 cat >> /tmp/reaper-cron.txt <<'EOF'
-*/5 * * * * /usr/bin/python3 /home/max/dev/java-reaper/tools/watchdog.py >> /home/max/.local/state/java-reaper/watchdog.log 2>&1
+*/5 * * * * /usr/bin/python3 $HOME/dev/java-reaper/tools/watchdog.py >> $HOME/.local/state/java-reaper/watchdog.log 2>&1
 EOF
 crontab /tmp/reaper-cron.txt
 ```
