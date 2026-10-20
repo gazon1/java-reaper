@@ -23,6 +23,12 @@ Gradle и Kotlin не убирают свои логи: `~/.gradle/daemon` ра�
 По умолчанию инструмент НИЧЕГО НЕ УДАЛЯЕТ, а только показывает план
 (режим dry-run). Удаление включает флаг `--apply`.
 
+Перед удалением из лога извлекается КОМПАКТНАЯ СВОДКА и складывается в
+`logs-history.jsonl` (рядом с состоянием рейпера): кто, когда жил, когда
+шли сборки, была ли отмена. Лог — это десятки мегабайт, сводка — килобайты;
+история при этом остаётся навсегда и по ней работает симулятор
+(`tools/simulate.py`). Отключается флагом `--no-history`.
+
 Чего инструмент не трогает (никогда):
 
   * маркеры Kotlin (`kotlin-compiler-client-*-is-running`,
@@ -42,6 +48,16 @@ import re
 import sys
 import time
 from typing import Any
+
+# Пакет reaper лежит в родительском каталоге — нужен ради сводок истории.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from reaper.history import (  # noqa: E402
+    append_history,
+    default_history_path,
+    summarize_gradle,
+    summarize_kotlin,
+)
 
 # Главные классы демонов: по ним видно, что процесс — тот самый демон.
 GRADLE_MAIN = "org.gradle.launcher.daemon.bootstrap.GradleDaemon"
@@ -222,6 +238,37 @@ def collect(gradle_dir: str, kotlin_dir: str, min_age_seconds: float,
     return plan
 
 
+def summarize_for_history(item: dict[str, Any]) -> dict[str, Any] | None:
+    """Сводка по логу, который собираемся удалить.
+
+    Лог — это десятки мегабайт, сводка — килобайты. Сводка остаётся
+    навсегда и по ней работает симулятор правил.
+    """
+    path = item["path"]
+    try:
+        if item["kind"] == "gradle":
+            version = os.path.basename(os.path.dirname(path))
+            return summarize_gradle(path, pid=item.get("pid"), version=version)
+        instance = os.path.basename(path).split("-")[-1].split(".")[0]
+        return summarize_kotlin(path, instance=instance)
+    except OSError:
+        return None
+
+
+def write_history(plan: list[dict[str, Any]], history_path: str) -> int:
+    """Пишет сводки по всем кандидатам в JSONL-историю. Возвращает число."""
+    written = 0
+    for item in plan:
+        if item.get("lock"):
+            continue  # замок — не демон
+        record = summarize_for_history(item)
+        if record is None:
+            continue
+        append_history(history_path, record)
+        written += 1
+    return written
+
+
 def apply_plan(plan: list[dict[str, Any]]) -> tuple[int, int, list[str]]:
     """Удаляет файлы из плана. Возвращает (удалено, байт, ошибки)."""
     removed = 0
@@ -282,6 +329,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="каталог логов Kotlin")
     parser.add_argument("--json", action="store_true",
                         help="машиночитаемый вывод")
+    parser.add_argument("--history", default=None,
+                        help="куда писать сводки истории "
+                             "(по умолчанию logs-history.jsonl в каталоге "
+                             "состояния рейпера)")
+    parser.add_argument("--no-history", action="store_true",
+                        help="не сохранять сводки (логи просто удаляются)")
+    parser.add_argument("--archive-only", action="store_true",
+                        help="только сохранить сводки, ничего не удалять")
     args = parser.parse_args(argv)
 
     now = time.time()
@@ -289,27 +344,38 @@ def main(argv: list[str] | None = None) -> int:
     plan = collect(args.gradle_dir, args.kotlin_dir,
                    args.min_age_hours * 3600.0, now, open_paths)
 
-    if args.apply:
+    # Сводки — ДО удаления: после удаления лога данные исчезнут.
+    history_path = args.history or default_history_path()
+    archived = 0
+    if not args.no_history and plan:
+        archived = write_history(plan, history_path)
+
+    if args.apply and not args.archive_only:
         removed, freed, errors = apply_plan(plan)
     else:
         removed, freed, errors = 0, 0, []
 
     if args.json:
         print(json.dumps({
-            "dry_run": not args.apply,
+            "dry_run": not args.apply or args.archive_only,
             "min_age_hours": args.min_age_hours,
             "files": len(plan),
             "bytes": sum(i["size_bytes"] for i in plan),
             "removed": removed,
             "removed_bytes": freed,
+            "archived": archived,
+            "history_path": None if args.no_history else history_path,
             "errors": errors,
             "plan": plan,
         }, ensure_ascii=False, indent=1, sort_keys=True), flush=True)
     else:
-        print(format_plan(plan, dry_run=not args.apply), flush=True)
+        print(format_plan(plan, dry_run=not args.apply or args.archive_only),
+              flush=True)
         for err in errors:
             print(f"ОШИБКА: {err}", file=sys.stderr, flush=True)
-        if args.apply:
+        if archived:
+            print(f"Сводок в истории: {archived} → {history_path}", flush=True)
+        if args.apply and not args.archive_only:
             print(f"Удалено файлов: {removed}, освобождено "
                   f"{freed / 1024 / 1024:.1f} МБ", flush=True)
     return 0 if not errors else 1

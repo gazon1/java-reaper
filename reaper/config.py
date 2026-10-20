@@ -29,6 +29,12 @@ DEFAULTS: dict[str, Any] = {
     # сессиями компиляции у Kotlin p99.9 = 100 мин, максимум 1.7 ч, то есть
     # 2 ч — заведомо выше «живого» простоя.
     "KOTLIN_IDLE_SECONDS": 7200,   # 2 ч — порог простоя (Kotlin)
+    # Через сколько после отмены сборки считать демон «зависшим».
+    # Отдельный порог, потому что это ДРУГАЯ категория: демон, у которого
+    # клиент отвалился во время сборки, работу продолжать некому и
+    # некому — а Gradle его не убирает (его idle-таймаут не действует,
+    # пока демон «в сборке»). Таких демонов не жалко держать часами.
+    "STUCK_AFTER_SECONDS": 3600,  # 1 ч
     "MIN_FOOTPRINT_MB": 128,      # RSS+swap ниже — не жалко
     "BUSY_CPU_SECONDS": 3.0,      # 3 с CPU за свип = «занят»
     "SWEEP_SECONDS": 300,         # интервал свипа
@@ -68,21 +74,28 @@ DEFAULTS: dict[str, Any] = {
 # Версия правил. Меняется, когда меняется смысл порогов: чтобы при смене
 # правил сбросить накопленную метрику пилота (она измеряет ДРУГОЕ, если
 # правила другие, и смешивать их нельзя).
-RULES_VERSION = 2
+RULES_VERSION = 3
 
 
 def expand(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
 
 
-def load_config(path: str | None) -> dict[str, Any]:
+def load_config(path: str | None,
+                warnings: list[str] | None = None) -> dict[str, Any]:
     """Читает KEY=VALUE-конфиг. Неизвестные ключи игнорируются, битые значения
-    не ломают работу: остаётся значение по умолчанию."""
+    не ломают работу: остаётся значение по умолчанию.
+
+    `warnings` — список, в который добавляются сообщения о проблемах
+    (битое значение, неизвестный ключ). Раньше оба случая проходили молча:
+    оператор думал, что настроил порог, а действовал дефолт — и это
+    выглядело как «рейпер сломался», а не как «опечатка в конфиге».
+    """
     cfg = dict(DEFAULTS)
     cfg_path = expand(path or DEFAULTS["CONFIG_PATH"])
     if os.path.isfile(cfg_path):
         with open(cfg_path, encoding="utf-8") as fh:
-            for raw in fh:
+            for number, raw in enumerate(fh, 1):
                 line = raw.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
@@ -90,6 +103,9 @@ def load_config(path: str | None) -> dict[str, Any]:
                 key = key.strip()
                 value = value.split("#", 1)[0].strip()
                 if key not in DEFAULTS:
+                    if warnings is not None:
+                        warnings.append(f"конфиг: неизвестный ключ {key!r} "
+                                        f"(строка {number}) — проигнорирован")
                     continue
                 default = DEFAULTS[key]
                 try:
@@ -102,7 +118,10 @@ def load_config(path: str | None) -> dict[str, Any]:
                     else:
                         cfg[key] = value
                 except (TypeError, ValueError):
-                    pass
+                    if warnings is not None:
+                        warnings.append(f"конфиг: значение {key!r} = {value!r} "
+                                        f"не подходит — взят дефолт "
+                                        f"{default!r} (строка {number})")
     return cfg
 
 

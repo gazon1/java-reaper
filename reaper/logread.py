@@ -1,9 +1,12 @@
-"""Разбор логов демонов — рейпер.
+"""Чтение логов демонов — рейпер.
 
-Сам формат лога (маркеры, таймстемпы, сопоставление сборок) живёт в
-`reaper/logparse.py` — общем модуле с `tools/analyze-idle.py`. Здесь только
-инкрементальное чтение: смещение хранится в состоянии, поэтому за свип
-читаются только новые байты.
+Имя модуля отражает его роль: это ЧТЕНИЕ (инкрементальное), а не разбор
+формата. Сам формат лога (маркеры, таймстемпы, сопоставление сборок) живёт
+в `reaper/logparse.py` — общем модуле с `tools/analyze-idle.py` и с
+историей демонов (`reaper/history.py`).
+
+Здесь только выборка байтов: смещение хранится в состоянии, поэтому за
+свип читаются только новые байты.
 
 Схема чтения: первый свип — файл целиком (до LOG_SCAN_MAX_BYTES), дальше —
 только новые байты.
@@ -20,6 +23,7 @@ from .logparse import (
     MARK_BUILD_END_ALT,
     MARK_BUILD_START,
     parse_ts,
+    scan_lines,
     scan_markers,
 )
 
@@ -35,10 +39,17 @@ __all__ = [
 ]
 
 
-def scan_gradle_log(path: str, offset: int, max_bytes: int) -> dict[str, Any]:
+def scan_gradle_log(path: str, offset: int, max_bytes: int,
+                    prev_start: float | None = None,
+                    prev_canceled: float | None = None) -> dict[str, Any]:
     """Разбор лога Gradle-демона.
 
-    offset — сколько байт уже разобрано (из состояния). Возвращает:
+    offset — сколько байт уже разобрано (из состояния).
+    prev_start / prev_canceled — начало последней сборки и момент отмены
+    из прошлого чтения: маркер отмены может попасть в новый кусок, а
+    таймстемпа у него нет (см. reaper.logparse.scan_lines).
+
+    Возвращает:
       offset   — новое смещение;
       start/end — найденные маркеры (может быть None);
       canceled — момент отмены сборки (клиент отвалился), если была;
@@ -65,8 +76,17 @@ def scan_gradle_log(path: str, offset: int, max_bytes: int) -> dict[str, Any]:
     except OSError:
         return {"offset": offset, "start": None, "end": None,
                 "canceled": None, "complete": False}
-    s, e = scan_markers(blob.decode("utf-8", "replace"))
-    canceled = _scan_canceled(blob)
+    # Разбор — тем же сканером, что и полный файл (reaper.logparse):
+    # формат лога знает одно место, а не два.
+    scan = scan_lines(blob.splitlines(), prev_start=prev_start,
+                      prev_canceled=prev_canceled)
+    starts = [b.start for b in scan.builds]
+    ends = [b.end for b in scan.builds if b.end is not None]
+    if scan.last_end is not None:
+        ends.append(scan.last_end)
+    s = max(starts) if starts else None
+    e = max(ends) if ends else None
+    canceled = scan.canceled_at
     if offset <= 0 and not complete and e is None:
         # Файл больше лимита и маркеры в его начале не найдены: историю
         # пока не знаем — читаем с этого места дальше в следующих свипах.
@@ -75,19 +95,6 @@ def scan_gradle_log(path: str, offset: int, max_bytes: int) -> dict[str, Any]:
         new_offset = size
     return {"offset": new_offset, "start": s, "end": e, "canceled": canceled,
             "complete": complete or e is not None}
-
-
-def _scan_canceled(blob: bytes) -> float | None:
-    """Момент отмены сборки в блоке байтов (клиент отвалился)."""
-    if MARK_BUILD_CANCELED not in blob:
-        return None
-    canceled = None
-    for line in blob.splitlines():
-        if MARK_BUILD_CANCELED in line:
-            ts = parse_ts(line.decode("utf-8", "replace"))
-            if ts is not None:
-                canceled = ts
-    return canceled
 
 
 def parse_gradle_log(path: str, tail_bytes: int) -> tuple[float | None, float | None]:

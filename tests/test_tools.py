@@ -330,6 +330,35 @@ class TestPruneLogs(unittest.TestCase):
         self.assertFalse(os.path.exists(log))
         self.assertFalse(os.path.exists(lock))
 
+    def test_history_saved_before_deletion(self):
+        """Сводка остаётся, даже если лог удалён: лог — мусор, сводка — данные."""
+        path = self._gradle_log(111)
+        history = os.path.join(self.tmp.name, "history.jsonl")
+        code = prune.main(["--apply", "--gradle-dir", self.gradle,
+                           "--kotlin-dir", self.kotlin, "--history", history])
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(path))
+        loaded = reaper.read_history(history)
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["pid"], 111)
+
+    def test_archive_only_keeps_logs(self):
+        """--archive-only: только сводки, логи на месте."""
+        path = self._gradle_log(111)
+        history = os.path.join(self.tmp.name, "history.jsonl")
+        prune.main(["--archive-only", "--gradle-dir", self.gradle,
+                    "--kotlin-dir", self.kotlin, "--history", history])
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(len(reaper.read_history(history)), 1)
+
+    def test_no_history_skips_summaries(self):
+        path = self._gradle_log(111)
+        history = os.path.join(self.tmp.name, "history.jsonl")
+        prune.main(["--apply", "--no-history", "--gradle-dir", self.gradle,
+                    "--kotlin-dir", self.kotlin, "--history", history])
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(os.path.exists(history))
+
     def test_json_output_lists_plan(self):
         self._gradle_log(111)
         out = io.StringIO()
@@ -348,3 +377,131 @@ class TestPruneLogs(unittest.TestCase):
             prune.parse_kotlin_group("kotlin-daemon.2026-10-20.08-29-00-827.00.log"),
             "kotlin-daemon.2026-10-20.08-29-00-827")
         self.assertIsNone(prune.parse_kotlin_group("kotlin-daemon.log"))
+
+
+# --------------------------------------------------------------------------- #
+# История демонов и симулятор правил (блоки 3 и 4)
+# --------------------------------------------------------------------------- #
+
+simulate = _load_tool("reaper_simulate", "simulate.py")
+
+
+class TestLogHistory(unittest.TestCase):
+    """Сводка по логу: компактная запись вместо мегабайт лога."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "daemon-4242.out.log")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("2026-10-04T12:00:01.500+0300 [INFO] Received command: Build{id=1}\n")
+            fh.write("2026-10-04T12:09:00.000+0300 [INFO] Marking the daemon as idle\n")
+            fh.write("2026-10-04T12:10:00.000+0300 [INFO] Received command: Build{id=2}\n")
+            fh.write("thread 7: client disconnection detected, canceling the build\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_summary_has_builds_and_cancel(self):
+        rec = reaper.summarize_gradle(self.path, pid=4242, version="9.7.1")
+        self.assertEqual(rec["kind"], "gradle")
+        self.assertEqual(rec["pid"], 4242)
+        self.assertEqual(len(rec["builds"]), 2)
+        # Отмена найдена даже без таймстемпа на её строке: временем отмены
+        # считается начало той сборки, во время которой клиент отвалился.
+        self.assertIsNotNone(rec["canceled_at"])
+
+    def test_cancel_cleared_by_later_build(self):
+        """Новая сборка после отмены → демон не «завис»."""
+        rec = reaper.summarize_gradle(self.path, pid=4242)
+        later = dict(rec)
+        later["builds"] = rec["builds"] + [[rec["canceled_at"] + 10, None]]
+        self.assertIsNone(reaper.effective_canceled(later))
+
+    def test_history_roundtrip(self):
+        path = os.path.join(self.tmp.name, "history.jsonl")
+        rec = reaper.summarize_gradle(self.path, pid=4242)
+        reaper.append_history(path, rec)
+        loaded = reaper.read_history(path)
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["pid"], 4242)
+
+    def test_intervals_for_gradle(self):
+        rec = reaper.summarize_gradle(self.path, pid=4242)
+        spans = reaper.intervals(rec)
+        self.assertTrue(spans)
+        self.assertEqual(len(spans), 2)
+
+
+class TestSimulator(unittest.TestCase):
+    """Симуляция правил по истории: сколько убили бы и сколько ошиблись."""
+
+    def _record(self, kind="gradle", builds=(), first=0.0, mtime=0.0,
+                canceled=None):
+        return {"kind": kind, "pid": 1, "builds": [list(b) for b in builds],
+                "first_activity": first, "last_activity": mtime, "mtime": mtime,
+                "canceled_at": canceled}
+
+    def test_idle_daemon_killed_after_threshold(self):
+        rec = self._record(builds=[[0.0, 100.0]], first=0.0, mtime=10000.0)
+        kt = simulate.kill_time(rec, 3600.0)
+        self.assertIsNotNone(kt)
+        self.assertAlmostEqual(kt, 100.0 + 3600.0)
+
+    def test_busy_daemon_not_killed(self):
+        """Демон, который отработал и умер, не кандидат."""
+        rec = self._record(builds=[[0.0, 1000.0]], first=0.0, mtime=1000.0)
+        self.assertIsNone(simulate.kill_time(rec, 3600.0))
+
+    def test_build_longer_than_threshold_is_candidate(self):
+        """Сборка длиннее порога — кандидат: простой считается от её начала.
+
+        В рейпере такой демон защищён правилами «занят: CPU» и «дети», но
+        модель их не знает — поэтому это верхняя оценка убийств.
+        """
+        rec = self._record(builds=[[0.0, 10000.0]], first=0.0, mtime=10000.0)
+        kt = simulate.kill_time(rec, 3600.0)
+        self.assertIsNotNone(kt)
+        self.assertAlmostEqual(kt, 3600.0)
+
+    def test_gradle_self_timeout_wins(self):
+        """Демон, простоявший дольше таймаута Gradle, мёртв до нашего свипа."""
+        rec = self._record(builds=[[0.0, 100.0]], first=0.0, mtime=100.0 + 181 * 60)
+        # Наш порог 6 ч — позже, чем таймаут Gradle (3 ч): демон уже мёртв.
+        self.assertIsNone(simulate.kill_time(rec, 6 * 3600.0))
+        # Наш порог 1 ч — раньше: успеваем.
+        self.assertIsNotNone(simulate.kill_time(rec, 3600.0))
+
+    def test_stuck_daemon_survives_gradle_timeout(self):
+        """Зависший демон таймаутом Gradle не убирается — в этом его суть."""
+        rec = self._record(builds=[[0.0, None]], first=0.0, mtime=100.0 + 10 * 3600,
+                           canceled=100.0)
+        kt = simulate.kill_time(rec, 6 * 3600.0, stuck_threshold=3600.0)
+        self.assertIsNotNone(kt)
+        self.assertAlmostEqual(kt, 100.0 + 3600.0)
+
+    def test_reuse_detected(self):
+        rec = self._record(builds=[[0.0, 100.0], [5000.0, 5100.0]], first=0.0,
+                           mtime=5100.0)
+        self.assertTrue(simulate.reused_after(rec, 100.0 + 3600.0))
+
+    def test_simulate_counts(self):
+        recs = [
+            # простаивает 5 ч, порог 1 ч → убили бы
+            self._record(builds=[[0.0, 100.0]], first=0.0, mtime=100.0 + 5 * 3600),
+            # отработал и умер → не убили бы
+            self._record(builds=[[0.0, 1000.0]], first=0.0, mtime=1000.0),
+        ]
+        result = simulate.simulate(recs, {"60 мин": 3600.0})
+        data = result["gradle"]["60 мин"]
+        self.assertEqual(data["kills"], 1)
+        self.assertEqual(data["false_positives"], 0)
+        self.assertEqual(data["died_own"], 1)
+
+    def test_false_positive_counted(self):
+        recs = [self._record(builds=[[0.0, 100.0], [5000.0, 5100.0]], first=0.0,
+                              mtime=5100.0)]
+        result = simulate.simulate(recs, {"60 мин": 3600.0})
+        data = result["gradle"]["60 мин"]
+        self.assertEqual(data["kills"], 1)
+        self.assertEqual(data["false_positives"], 1)
+        self.assertAlmostEqual(data["rate"], 1.0)

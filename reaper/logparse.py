@@ -26,6 +26,7 @@ import os
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Iterable
 
 # Маркеры в логе Gradle-демона.
 #   «Received command: Build»    — INFO, начало сборки.
@@ -159,44 +160,69 @@ class FileScan:
         return None
 
 
-def scan_file(path: str) -> FileScan:
-    """Потоково (построчно) читает лог и собирает последовательность сборок.
+@dataclass
+class LineScan:
+    """Что найдено в последовательности строк лога."""
 
-    Файл целиком в память не загружается — логи бывают десятки мегабайт.
+    builds: list[Build] = field(default_factory=list)
+    # Момент отмены сборки (клиент отвалился). ВНИМАНИЕ: строка отмены в
+    # логе Gradle идёт БЕЗ таймстемпа (это часть стектрейса), поэтому
+    # временем отмены считается начало той сборки, во время которой
+    # клиент отвалился.
+    canceled_at: float | None = None
+    unclosed_builds: int = 0
+    idle_without_start: int = 0
+    bad_timestamp_lines: int = 0
+    # Последняя отметка «демон освободился» — даже если начало сборки было
+    # в предыдущем куске лога (при инкрементальном чтении это обычное дело).
+    last_end: float | None = None
 
-    Сопоставление сборок — FIFO: конец сборки закрывает самую старую
-    незакрытую сборку. Порядок важен: сборки могут идти параллельно.
+
+def scan_lines(lines: Iterable[bytes], prev_start: float | None = None,
+               prev_canceled: float | None = None) -> LineScan:
+    """Разбирает последовательность строк лога Gradle.
+
+    Единая реализация для всех потребителей: и для полного файла
+    (`scan_file`), и для инкрементального чтения (только новые байты).
+    Раньше это были две реализации одного формата — и они разъехались:
+    инкрементальный путь ловил отмену по таймстемпу строки, которого у
+    строки отмены нет вовсе, то есть никогда.
+
+    prev_start / prev_canceled — состояние из прошлого чтения: начало
+    последней сборки и момент отмены, если они были раньше в этом же логе.
     """
-    stat = os.stat(path)
-    scan = FileScan(path, stat.st_mtime)
-
+    scan = LineScan(canceled_at=prev_canceled)
     pending_starts: deque[float] = deque()
+    last_start = prev_start
 
-    with open(path, "rb") as handle:
-        for line in handle:
-            if MARK_BUILD_BYTES in line:
-                ts = parse_timestamp(line)
-                if ts is None:
-                    scan.bad_timestamp_lines += 1
-                    continue
-                pending_starts.append(ts)
-            elif MARK_IDLE_BYTES in line:
-                ts = parse_timestamp(line)
-                if ts is None:
-                    scan.bad_timestamp_lines += 1
-                    continue
-                if pending_starts:
-                    # FIFO-сопоставление: конец сборки закрывает самую старую
-                    # незакрытую сборку.
-                    scan.builds.append(Build(pending_starts.popleft(), ts))
-                else:
-                    # Демон ушёл в idle без единой полученной сборки
-                    # (например, в начале жизни демона) — не ошибка.
-                    scan.idle_without_start += 1
-            elif MARK_BUILD_CANCELED in line:
-                ts = parse_timestamp(line)
-                if ts is not None:
-                    scan.canceled_at = ts
+    for line in lines:
+        if MARK_BUILD_CANCELED in line:
+            # Клиент отвалился. Своего таймстемпа у строки нет — берём
+            # начало последней сборки: отмена случилась во время неё.
+            ts = parse_timestamp(line)
+            scan.canceled_at = ts if ts is not None else (last_start or ts)
+            continue
+        if MARK_BUILD_BYTES in line:
+            ts = parse_timestamp(line)
+            if ts is None:
+                scan.bad_timestamp_lines += 1
+                continue
+            pending_starts.append(ts)
+            last_start = ts
+        elif MARK_IDLE_BYTES in line:
+            ts = parse_timestamp(line)
+            if ts is None:
+                scan.bad_timestamp_lines += 1
+                continue
+            scan.last_end = ts
+            if pending_starts:
+                # FIFO-сопоставление: конец сборки закрывает самую старую
+                # незакрытую сборку.
+                scan.builds.append(Build(pending_starts.popleft(), ts))
+            else:
+                # Демон ушёл в idle без единой полученной сборки
+                # (например, в начале жизни демона) — не ошибка.
+                scan.idle_without_start += 1
 
     # Старты без парного end: сборка не завершилась (лог оборван, демон умер).
     # Конец такой сборки условно равен mtime файла, но в простои она НЕ входит,
@@ -206,6 +232,28 @@ def scan_file(path: str) -> FileScan:
         scan.unclosed_builds += 1
 
     return scan
+
+
+def scan_file(path: str) -> FileScan:
+    """Потоково (построчно) читает лог и собирает последовательность сборок.
+
+    Файл целиком в память не загружается — логи бывают десятки мегабайт.
+
+    Сопоставление сборок — FIFO: конец сборки закрывает самую старую
+    незакрытую сборку. Порядок важен: сборки могут идти параллельно.
+    """
+    stat = os.stat(path)
+    with open(path, "rb") as handle:
+        scan = scan_lines(handle)
+    return FileScan(
+        path=path,
+        mtime=stat.st_mtime,
+        builds=scan.builds,
+        unclosed_builds=scan.unclosed_builds,
+        idle_without_start=scan.idle_without_start,
+        bad_timestamp_lines=scan.bad_timestamp_lines,
+        canceled_at=scan.canceled_at,
+    )
 
 
 def scan_markers(text: str) -> tuple[float | None, float | None]:

@@ -30,6 +30,7 @@ from .report import (
 )
 from .state import (
     append_kill,
+    append_sweep,
     degradation_warnings,
     load_state,
     measure_coverage,
@@ -37,6 +38,7 @@ from .state import (
     note_stale_peers,
     record_freed,
     save_state,
+    sweep_record,
     sync_rules_version,
     update_metric,
 )
@@ -123,8 +125,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     mode = args.mode or ("dry-run" if args.dry_run else "kill")
 
-    cfg = load_config(args.config)
+    config_warnings: list[str] = []
+    cfg = load_config(args.config, config_warnings)
     state = load_state(cfg)
+    for w in config_warnings:
+        print(f"WARNING: {w}", flush=True)
 
     # ---- команды только на чтение ----
     if args.explain:
@@ -243,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
     write_state(cfg, state, decisions, now, trimmed_pids)
     update_metric(state, decisions, now, cfg, report)
     note_stale_peers(state, decisions)
+    append_sweep(cfg, sweep_record(decisions, now, cfg))
     freed = record_freed(state, report)
     state["last_sweep_at"] = now
     state["last_sweep_ok"] = True

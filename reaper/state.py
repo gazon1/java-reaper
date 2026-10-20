@@ -43,6 +43,17 @@ def kills_path(cfg: dict[str, Any]) -> str:
     return os.path.join(expand(str(cfg["STATE_DIR"])), "kills.jsonl")
 
 
+def sweeps_path(cfg: dict[str, Any]) -> str:
+    """Журнал свипов (JSONL): что мы видели и какие решения приняли.
+
+    В отличие от `state.json` (последнее состояние) это ИСТОРИЯ: по ней
+    видно, сколько памяти висело под ударом, какие правила срабатывали
+    и как менялась картина со временем.
+    """
+    from .config import expand
+    return os.path.join(expand(str(cfg["STATE_DIR"])), "sweeps.jsonl")
+
+
 def _migrate(data: dict[str, Any]) -> dict[str, Any]:
     """Приводит состояние к текущей версии: вычищает неизвестные поля."""
     out: dict[str, Any] = {k: v for k, v in data.items() if k in GLOBAL_FIELDS}
@@ -358,6 +369,46 @@ def note_stale_peers(state: dict[str, Any], decisions: list[Decision]) -> int:
     if touched:
         state["stale_peer_events"] = int(state.get("stale_peer_events", 0)) + touched
     return touched
+
+
+def append_sweep(cfg: dict[str, Any], record: dict[str, Any]) -> None:
+    """Дописывает сводку свипа в JSONL-журнал (история решений)."""
+    path = sweeps_path(cfg)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def sweep_record(decisions: list[Decision], now: float,
+                 cfg: dict[str, Any]) -> dict[str, Any]:
+    """Сводка одного свипа для журнала.
+
+    Ключевое поле — `would_free_mb`: сколько памяти висело под ударом
+    в этом свипе. Именно это и есть эффект рейпера, измеряемый непрерывно,
+    а не «сколько демонов убито» (их всегда мало, а памяти — много).
+    """
+    kills = [d for d in decisions if d.kill]
+    return {
+        "at": now,
+        "daemons": len(decisions),
+        "footprint_mb": sum(d.daemon.footprint_mb for d in decisions),
+        "would_kill": len(kills),
+        "would_free_mb": sum(d.daemon.footprint_mb for d in kills),
+        "by_kind": {
+            kind: {
+                "count": sum(1 for d in decisions if d.daemon.kind == kind),
+                "footprint_mb": sum(d.daemon.footprint_mb for d in decisions
+                                    if d.daemon.kind == kind),
+                "would_free_mb": sum(d.daemon.footprint_mb for d in kills
+                                     if d.daemon.kind == kind),
+            }
+            for kind in ("gradle", "kotlin")
+        },
+        "rules": {
+            name: sum(1 for d in decisions if (d.rule or "") == name)
+            for name in sorted({d.rule or "unknown" for d in decisions})
+        },
+    }
 
 
 def append_kill(cfg: dict[str, Any], record: dict[str, Any]) -> None:

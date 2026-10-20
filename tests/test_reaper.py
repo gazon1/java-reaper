@@ -563,6 +563,32 @@ class TestConfig(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_bad_value_is_reported(self):
+        """Битое значение не проходит молча: оператор должен узнать."""
+        with tempfile.NamedTemporaryFile("w", suffix=".cfg", delete=False) as fh:
+            fh.write("IDLE_SECONDS = не число\n")
+            fh.write("НЕТ_ТАКОГО_КЛЮЧА = 5\n")
+            path = fh.name
+        try:
+            warnings = []
+            cfg = reaper.load_config(path, warnings)
+            self.assertEqual(cfg["IDLE_SECONDS"], 21600)
+            self.assertTrue(any("IDLE_SECONDS" in w for w in warnings))
+            self.assertTrue(any("НЕТ_ТАКОГО_КЛЮЧА" in w for w in warnings))
+        finally:
+            os.unlink(path)
+
+    def test_good_config_has_no_warnings(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".cfg", delete=False) as fh:
+            fh.write("IDLE_SECONDS = 600\n")
+            path = fh.name
+        try:
+            warnings = []
+            reaper.load_config(path, warnings)
+            self.assertEqual(warnings, [])
+        finally:
+            os.unlink(path)
+
     def test_bad_value_keeps_default(self):
         with tempfile.NamedTemporaryFile("w", suffix=".cfg", delete=False) as fh:
             fh.write("IDLE_SECONDS = не число\n")

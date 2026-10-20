@@ -6,7 +6,7 @@ import os
 import time
 from typing import Any
 
-from .logs import scan_gradle_log
+from .logread import scan_gradle_log
 from .model import Daemon, PeerConn
 from .proc import (
     children_map,
@@ -104,7 +104,9 @@ def collect_daemons(cfg: dict[str, Any], state: dict[str, Any],
             d.log_ok = False
         elif kind == "gradle":
             res = scan_gradle_log(d.log_path, int(rec.get("log_offset", 0)),
-                                  int(cfg["LOG_SCAN_MAX_BYTES"]))
+                                  int(cfg["LOG_SCAN_MAX_BYTES"]),
+                                  prev_start=rec.get("last_build_start"),
+                                  prev_canceled=rec.get("canceled_at"))
             d.log_offset = int(res["offset"])
             d.idle_known = bool(res["complete"])
             d.last_build_start = _max_ts(rec.get("last_build_start"), res["start"])

@@ -33,6 +33,17 @@ from reaper.execute import (  # noqa: E402,F401
     still_same,
 )
 from reaper.housekeeping import trim_idle_logs  # noqa: E402,F401
+from reaper.history import (  # noqa: E402,F401
+    append_history,
+    default_history_path,
+    effective_canceled,
+    intervals,
+    kotlin_activity,
+    parse_kotlin_ts,
+    read_history,
+    summarize_gradle,
+    summarize_kotlin,
+)
 from reaper.logparse import (  # noqa: E402,F401
     Build,
     FileScan,
@@ -44,7 +55,7 @@ from reaper.logparse import (  # noqa: E402,F401
     parse_timestamp,
     scan_file,
 )
-from reaper.logs import (  # noqa: E402,F401
+from reaper.logread import (  # noqa: E402,F401
     parse_gradle_log,
     scan_gradle_log,
     scan_markers,

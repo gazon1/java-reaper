@@ -88,6 +88,7 @@ def default_policy(cfg: dict) -> list[Rule]:
     размер → простой → вывод.
     """
     idle_limit = float(cfg["IDLE_SECONDS"])
+    stuck_after = float(cfg.get("STUCK_AFTER_SECONDS", 3600))
     min_footprint = int(cfg["MIN_FOOTPRINT_MB"])
     peer_max_age = float(cfg.get("PEER_MAX_AGE_SECONDS", 21600))
 
@@ -144,8 +145,12 @@ def default_policy(cfg: dict) -> list[Rule]:
         его idle-таймаут (180 мин) не действует, пока демон считается
         «в сборке». Это единственная категория, которую убирает рейпер,
         а Gradle — нет.
+
+        Порог СВОЙ (STUCK_AFTER_SECONDS), а не общий порог простоя: ждать
+        шесть часов демон, которому работать некому, незачем. Демон с
+        живым клиентом защищён правилом `peer` — раньше него.
         """
-        return s.stuck_build and s.stuck_age > s.idle_limit
+        return s.stuck_build and s.stuck_age > stuck_after
 
     return [
         Rule("allowlist",
@@ -196,6 +201,15 @@ def default_policy(cfg: dict) -> list[Rule]:
              f"footprint (RSS+swap) < {min_footprint} МБ",
              Action.KEEP, small,
              lambda s: f"footprint {s.daemon.footprint_mb} МБ < {min_footprint} МБ"),
+        Rule("stuck",
+             "Зависший демон: клиент отвалился во время сборки. Работать "
+             "некому, и работать уже некому — Gradle такой демон не убирает "
+             "(его idle-таймаут не действует, пока демон «в сборке»).",
+             f"была отмена сборки (клиент отвалился), сборка не завершилась, "
+             f"и с отмены прошло > {stuck_after / 60:.0f} мин",
+             Action.KILL, stuck,
+             lambda s: (f"завис: клиент отвалился {s.stuck_age / 3600:.1f} ч назад, "
+                        f"работать некому; footprint {s.daemon.footprint_mb} МБ")),
         Rule("building",
              "Идёт сборка: демон начал её недавно.",
              "есть старт сборки без конца и простой < порога простоя",
@@ -212,15 +226,6 @@ def default_policy(cfg: dict) -> list[Rule]:
              Action.KEEP, gradle_building,
              lambda s: "идёт сборка Gradle — Kotlin-демоны не трогаю",
              protected=True),
-        Rule("stuck",
-             "Зависший демон: клиент отвалился во время сборки. Работать "
-             "некому, и работать уже некому — Gradle такой демон не убирает "
-             "(его idle-таймаут не действует, пока демон «в сборке»).",
-             "была отмена сборки (клиент отвалился), сборка не завершилась, "
-             f"и с отмены прошло > {idle_limit / 60:.0f} мин",
-             Action.KILL, stuck,
-             lambda s: (f"завис: клиент отвалился {s.stuck_age / 3600:.1f} ч назад, "
-                        f"работать некому; footprint {s.daemon.footprint_mb} МБ")),
         Rule("kill",
              "Все условия кандидата выполнены: простоя достаточно, памяти достаточно, "
              "демон никем не наблюдается.",
