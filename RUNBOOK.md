@@ -22,6 +22,13 @@ tail -20 ~/.local/state/java-reaper/watchdog.log # что делал сторо�
 python3 ~/dev/java-reaper/tools/monthly-report.py
 ```
 
+Уборка логов мёртвых демонов (по умолчанию — только план):
+
+```bash
+python3 ~/dev/java-reaper/tools/prune-logs.py                # план
+python3 ~/dev/java-reaper/tools/prune-logs.py --apply        # удалить
+```
+
 ## Штатные состояния
 
 | Сообщение | Что значит | Что делать |
@@ -189,6 +196,29 @@ TRIM_AFTER_SECONDS=3600
 mtime лога — сам признак простоя, его трогать нельзя). Историю сборок рейпер
 держит в своём состоянии, поэтому усечение не мешает его решениям.
 
+## Мёртвые логи (1.2 ГБ в ~/.gradle/daemon, 108 МБ в /tmp)
+
+Gradle и Kotlin свои логи не чистят — растёт бесконечно.
+
+```bash
+python3 ~/dev/java-reaper/tools/prune-logs.py           # план: что удалим
+python3 ~/dev/java-reaper/tools/prune-logs.py --apply   # удалить
+```
+
+Что удаляется: логи процессов, которых больше нет. Проверка «файл открыт
+каким-либо процессом» — главная (пока демон жив, он держит лог открытым);
+для Gradle дополнительно сверяется PID из имени файла.
+
+**Чего инструмент не делает:** не трогает маркеры Kotlin
+(`kotlin-compiler-client-*-is-running`, `kotlin-compiler-in-*.alive`,
+`kotlin-compilation-session-*-is-running`) — их создаёт и удаляет сам Kotlin;
+не трогает логи живых демонов (у Kotlin живой демон пишет в несколько
+файлов `.00/.01/.02`, открыт только последний — открытый файл защищает всю
+группу).
+
+Если план выглядит неправдоподобно (например, в списке лог живого демона) —
+не применять, разбираться вручную.
+
 ## Откат
 
 Всё обратимо: рейпер не меняет ни репозитории, ни `gradle.properties`,
@@ -211,6 +241,13 @@ import json,sys
 d=json.load(sys.stdin)
 for x in sorted(d['daemons'], key=lambda x:-x['footprint_mb']):
     print(f\"{x['pid']:>8} {x['kind']:>7} {x['footprint_mb']:>6} МБ  простой {int(x['idle_seconds']/60):>5} мин  {x['reason'][:50]}\")"
+
+# сводка по классам демонов (сколько памяти держит Gradle, сколько Kotlin)
+java-reaper --status --json | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for k,v in d['kinds'].items():
+    print(f\"{k:>7}: {v['count']} шт, {v['footprint_mb']} МБ, под удар {v['kill_footprint_mb']} МБ, порог {v['idle_limit_seconds']/3600:.0f} ч\")"
 
 # ретроспектива: какой порог простоя оптимален
 ./tools/analyze-idle.py --thresholds "30,60,120,180,360,720"
