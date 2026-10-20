@@ -27,6 +27,15 @@ python3 ~/dev/java-reaper/tools/monthly-report.py
 ```bash
 python3 ~/dev/java-reaper/tools/prune-logs.py                # план
 python3 ~/dev/java-reaper/tools/prune-logs.py --apply        # удалить
+python3 ~/dev/java-reaper/tools/prune-logs.py --archive-only # только сводки
+```
+
+Симуляция правил по накопленной истории — «что бы мы убили и сколько ошиблись»,
+за минуты вместо недель пилота:
+
+```bash
+python3 ~/dev/java-reaper/tools/simulate.py
+python3 ~/dev/java-reaper/tools/simulate.py --thresholds "30,60,120,180"
 ```
 
 ## Штатные состояния
@@ -218,6 +227,28 @@ python3 ~/dev/java-reaper/tools/prune-logs.py --apply   # удалить
 
 Если план выглядит неправдоподобно (например, в списке лог живого демона) —
 не применять, разбираться вручную.
+
+## Рейпер молчит, но выглядит здоровым
+
+Если `--status` показывает «оставить» у всех, а выглядит это нормально —
+проверьте наблюдаемость:
+
+```bash
+java-reaper --status --json | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print('правила за свип:', d['rule_hits_last'])
+print('измерено демонов:', d['measured_count'], 'из', len(d['daemons']))
+print('деградация:', d['degradation'])"
+```
+
+- `rule_hits_last` пустой или весь в `unknown-history` / `no-baseline` —
+  разбор логов сломался (сменился формат Gradle), и рейпер ничего не может
+  оценить;
+- `degradation` непуст — детекция деградировала (см. предупреждения в
+  `--health` и в журнале свипа);
+- в `metric` много `unknown` — свипов не было (машина выключена), и события
+  закрылись без наблюдения; они не входят в знаменатель.
 
 ## Откат
 
