@@ -13,7 +13,7 @@ from typing import Any
 from .classify import classify
 from .collect import collect_daemons
 from .config import (RULES_VERSION, disabled_flag,
-                    idle_limit as idle_limit_for, load_config, resolve_targets)
+                    idle_limit_for_kind, load_config, resolve_targets)
 from .execute import execute
 from .history import archive_daemon_log
 from .housekeeping import trim_idle_logs
@@ -268,14 +268,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.audit:
             text, code = audit_report(cfg, decisions, state, targets)
             if args.json:
-                limits = {k: (spec.idle_seconds
-                              if spec.idle_seconds is not None
-                              else idle_limit_for(cfg, k))
-                          for k, spec in targets.specs_by_name().items()}
+                limits = {k: idle_limit_for_kind(cfg, k, targets)
+                          for k in targets.specs_by_name()}
                 stale = [d for d in decisions
                          if d.idle_seconds is not None
                          and d.idle_seconds > limits.get(
-                             d.daemon.kind, idle_limit_for(cfg, d.daemon.kind))]
+                             d.daemon.kind,
+                             idle_limit_for_kind(cfg, d.daemon.kind, targets))]
                 print(json.dumps({
                     "schema_version": JSON_SCHEMA_VERSION,
                     "idle_limit_seconds": limits,
@@ -329,7 +328,8 @@ def main(argv: list[str] | None = None) -> int:
     write_state(cfg, state, decisions, now, trimmed_pids)
     update_metric(state, decisions, now, cfg, report)
     note_stale_peers(state, decisions)
-    append_sweep(cfg, sweep_record(decisions, now, cfg))
+    append_sweep(cfg, sweep_record(decisions, now, cfg,
+                                   mem_available_mb=state.get("mem_available_mb")))
     freed = record_freed(state, report)
     state["last_sweep_at"] = now
     state["last_sweep_ok"] = True

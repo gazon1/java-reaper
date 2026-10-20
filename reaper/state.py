@@ -475,12 +475,18 @@ def append_sweep(cfg: dict[str, Any], record: dict[str, Any]) -> None:
 
 
 def sweep_record(decisions: list[Decision], now: float,
-                 cfg: dict[str, Any]) -> dict[str, Any]:
+                 cfg: dict[str, Any],
+                 mem_available_mb: int | None = None) -> dict[str, Any]:
     """Сводка одного свипа для журнала.
 
     Ключевое поле — `would_free_mb`: сколько памяти висело под ударом
     в этом свипе. Именно это и есть эффект рейпера, измеряемый непрерывно,
     а не «сколько демонов убито» (их всегда мало, а памяти — много).
+
+    `mem_available_mb` — сколько памяти было доступно системе в момент
+    свипа. Без него по журналу нельзя понять, при каком давлении памяти
+    рейпер начал бы убирать: правило «памяти хватает — не трогай» не
+    оставляет следов, и порог давления оказывается непроверенным.
     """
     kills = [d for d in decisions if d.kill]
     return {
@@ -489,6 +495,7 @@ def sweep_record(decisions: list[Decision], now: float,
         "footprint_mb": sum(d.daemon.footprint_mb for d in decisions),
         "would_kill": len(kills),
         "would_free_mb": sum(d.daemon.footprint_mb for d in kills),
+        "mem_available_mb": mem_available_mb,
         # Виды — те, что реально встретились в этом свипе. Список не
         # зашит: новая цель попадает в журнал сама, иначе её эффект был бы
         # не виден в месячном отчёте (тихая потеря данных).
