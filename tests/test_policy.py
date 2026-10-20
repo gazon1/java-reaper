@@ -126,7 +126,11 @@ class TestPolicyInvariants(unittest.TestCase):
             self.assertEqual(d.children, [], "убит демон с живыми детьми")
             self.assertGreaterEqual(d.footprint_mb, self.cfg["MIN_FOOTPRINT_MB"],
                                     "убит демон с footprint ниже минимума")
-            self.assertGreaterEqual(age, self.cfg["IDLE_SECONDS"],
+            # Порог простоя свой у каждого класса: у Kotlin он вдвое меньше
+            # (у Kotlin нет своего idle-таймаута, его не убирает никто).
+            limit = (self.cfg["KOTLIN_IDLE_SECONDS"] if d.kind == "kotlin"
+                     else self.cfg["IDLE_SECONDS"])
+            self.assertGreaterEqual(age, limit,
                                     "убит демон с простоя меньше порога")
             self.assertFalse(dec.busy, "убит демон, признанный занятым")
             self.assertFalse(dec.protected, "убит защищённый демон")

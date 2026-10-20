@@ -28,6 +28,19 @@ def _max_ts(*values: Any) -> float | None:
     return max(known) if known else None
 
 
+def canceled_state(canceled_at: float | None, last_build_start: float | None
+                   ) -> float | None:
+    """Учитывает ли отмена сборки «зависание» демона.
+
+    Отмена обесценивается, если после неё началась новая сборка: клиент
+    вернулся, демон не завис. Иначе мы считали бы зависшим демон, к
+    которому снова подключились, и убили бы живой процесс.
+    """
+    if canceled_at is None or last_build_start is None:
+        return canceled_at
+    return None if last_build_start > canceled_at else canceled_at
+
+
 def peer_key(conn: PeerConn) -> str:
     """Идентичность соединения: inode демонной стороны + порты."""
     return f"{conn.inode}:{conn.local_port}:{conn.remote_port}"
@@ -96,6 +109,12 @@ def collect_daemons(cfg: dict[str, Any], state: dict[str, Any],
             d.idle_known = bool(res["complete"])
             d.last_build_start = _max_ts(rec.get("last_build_start"), res["start"])
             d.last_build_end = _max_ts(rec.get("last_build_end"), res["end"])
+            d.canceled_at = canceled_state(
+                _max_ts(rec.get("canceled_at"), res.get("canceled")),
+                d.last_build_start)
+            # Отмена сборки без последующей сборки = демон «завис»:
+            # клиент отвалился, работать некому, Gradle его не уберёт.
+            d.stuck_build = bool(d.canceled_at)
         else:
             try:
                 d.log_mtime = os.path.getmtime(d.log_path)

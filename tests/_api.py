@@ -12,12 +12,18 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from reaper.classify import classify, evaluate  # noqa: E402,F401
-from reaper.collect import collect_daemons, peer_key  # noqa: E402,F401
+from reaper.collect import (  # noqa: E402,F401
+    canceled_state,
+    collect_daemons,
+    peer_key,
+)
 from reaper.config import (  # noqa: E402,F401
     DEFAULTS,
+    RULES_VERSION,
     allowlist,
     disabled_flag,
     expand,
+    idle_limit,
     load_config,
 )
 from reaper.execute import (  # noqa: E402,F401
@@ -27,10 +33,18 @@ from reaper.execute import (  # noqa: E402,F401
     still_same,
 )
 from reaper.housekeeping import trim_idle_logs  # noqa: E402,F401
-from reaper.logs import (  # noqa: E402,F401
+from reaper.logparse import (  # noqa: E402,F401
+    Build,
+    FileScan,
+    MARK_BUILD_BYTES,
     MARK_BUILD_END,
     MARK_BUILD_END_ALT,
     MARK_BUILD_START,
+    MARK_IDLE_BYTES,
+    parse_timestamp,
+    scan_file,
+)
+from reaper.logs import (  # noqa: E402,F401
     parse_gradle_log,
     scan_gradle_log,
     scan_markers,
@@ -72,6 +86,7 @@ from reaper.report import (  # noqa: E402,F401
     format_json,
     format_status,
     health,
+    kind_summary,
     pilot_report,
 )
 from reaper.state import (  # noqa: E402,F401
@@ -86,6 +101,7 @@ from reaper.state import (  # noqa: E402,F401
     record_freed,
     save_state,
     state_path,
+    sync_rules_version,
     update_metric,
 )
 

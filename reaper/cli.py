@@ -12,7 +12,7 @@ from typing import Any
 
 from .classify import classify
 from .collect import collect_daemons
-from .config import disabled_flag, load_config
+from .config import RULES_VERSION, disabled_flag, idle_limit as idle_limit_for, load_config
 from .execute import execute
 from .housekeeping import trim_idle_logs
 from .model import Decision
@@ -34,6 +34,7 @@ from .state import (
     note_stale_peers,
     record_freed,
     save_state,
+    sync_rules_version,
     update_metric,
 )
 
@@ -79,6 +80,10 @@ def write_state(cfg: dict[str, Any], state: dict[str, Any],
         if d.kind == "gradle":
             rec["last_build_start"] = d.last_build_start
             rec["last_build_end"] = d.last_build_end
+            # Момент отмены сборки держим в состоянии: лог разбирается
+            # инкрементально, и без записи маркер отмены был бы виден
+            # ровно один свип — а «зависший» демон нужно видеть спустя часы.
+            rec["canceled_at"] = d.canceled_at
         if d.peer_first_seen:
             rec["peer_first_seen"] = d.peer_first_seen
         if trimmed_pids and d.pid in trimmed_pids:
@@ -138,8 +143,11 @@ def main(argv: list[str] | None = None) -> int:
                 "would_free_mb": state.get("would_free_mb", 0),
                 "stale_peer_events": state.get("stale_peer_events", 0),
                 "stale_peer_daemons": state.get("stale_peer_daemons", {}),
-                "criterion": {"max_reuse_rate": PILOT_MAX_REUSE_RATE,
-                              "min_events": PILOT_MIN_EVENTS},
+                "criterion": {
+                    "max_reuse_rate": float(cfg.get("PILOT_MAX_REUSE_RATE",
+                                                    PILOT_MAX_REUSE_RATE)),
+                    "min_events": int(cfg.get("PILOT_MIN_EVENTS",
+                                              PILOT_MIN_EVENTS))},
                 "verdict_code": code,
             }, ensure_ascii=False, indent=1, sort_keys=True), flush=True)
         else:
@@ -170,6 +178,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     now = time.time()
+    if sync_rules_version(state):
+        # Правила изменились: метрика пилота, набранная по старым порогам,
+        # измеряет другое — сбрасываем её ДО свипа, чтобы события этого
+        # свипа уже записывались по новым правилам.
+        print(f"java-reaper: правила изменились (версия {RULES_VERSION}) — "
+              f"метрика пилота сброшена", flush=True)
     daemons, decisions = _sweep(cfg, state, now)
 
     if args.status or args.audit:
@@ -177,12 +191,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.audit:
             text, code = audit_report(cfg, decisions, state)
             if args.json:
-                idle_limit = float(cfg["IDLE_SECONDS"])
                 stale = [d for d in decisions
-                         if d.idle_seconds is not None and d.idle_seconds > idle_limit]
+                         if d.idle_seconds is not None
+                         and d.idle_seconds > idle_limit_for(cfg, d.daemon.kind)]
                 print(json.dumps({
                     "schema_version": JSON_SCHEMA_VERSION,
-                    "idle_limit_seconds": idle_limit,
+                    "idle_limit_seconds": {k: idle_limit_for(cfg, k)
+                                           for k in ("gradle", "kotlin")},
                     "stale_daemons": [
                         {"pid": d.daemon.pid, "kind": d.daemon.kind,
                          "footprint_mb": d.daemon.footprint_mb,
@@ -195,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(text, flush=True)
         else:
             print(format_json(decisions, state, cfg, now=now) if args.json
-                  else format_status(decisions, state), flush=True)
+                  else format_status(decisions, state, cfg), flush=True)
         warn = canary(daemons, decisions)
         if warn:
             print("WARNING: " + warn, flush=True)
@@ -208,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
     trimmed_pids = {int(i["pid"]) for i in trim_report if i.get("action") == "trim"}
 
     print(format_json(decisions, state, cfg, report, now) if args.json
-          else format_status(decisions, state), flush=True)
+          else format_status(decisions, state, cfg), flush=True)
     warn = canary(daemons, decisions)
     if warn:
         print("WARNING: " + warn, flush=True)

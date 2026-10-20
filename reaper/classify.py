@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from .config import allowlist
+from .config import allowlist, idle_limit as idle_limit_for
 from .model import Action, Daemon, Decision, Protector, observed_activity
 from .policy import Rule, Signals, default_policy
 
@@ -21,7 +21,10 @@ from .policy import Rule, Signals, default_policy
 def _measure(d: Daemon, rec: dict[str, Any], now: float,
              cfg: dict[str, Any]) -> Signals:
     """Все измерения по одному демону."""
-    idle_limit = float(cfg["IDLE_SECONDS"])
+    # Порог простоя разный для Gradle и Kotlin: у Kotlin нет своего
+    # idle-таймаута (его не убирает никто), у Gradle есть — и тот равен
+    # 180 мин, поэтому наш порог должен быть выше.
+    idle_limit = idle_limit_for(cfg, d.kind)
     sweep = float(cfg["SWEEP_SECONDS"])
     hz = os.sysconf("SC_CLK_TCK")
 
@@ -55,6 +58,17 @@ def _measure(d: Daemon, rec: dict[str, Any], now: float,
     anchors = [x for x in (observed, last_state_activity) if x is not None]
     base = max(anchors) if anchors else first_seen
 
+    # «Зависший» демон: клиент отвалился во время сборки. Работать некому,
+    # и работать уже некому. Gradle такой демон не убирает — его idle-таймаут
+    # не действует, пока демон считается «в сборке».
+    #
+    # Признак «завис» держится, только если сборка действительно не
+    # завершилась: если после отмены была новая сборка, демон просто
+    # простаивает, и его уберёт обычное правило простоя, а не это.
+    stuck_build = bool(d.stuck_build and d.build_in_progress
+                       and d.canceled_at is not None)
+    stuck_age = (now - d.canceled_at) if stuck_build else 0.0
+
     allowed_pids = allowlist(cfg)
     return Signals(
         daemon=d,
@@ -71,6 +85,8 @@ def _measure(d: Daemon, rec: dict[str, Any], now: float,
         log_ok=d.log_ok,
         idle_known=d.idle_known,
         allowed=(not allowed_pids) or d.pid in allowed_pids,
+        stuck_build=stuck_build,
+        stuck_age=stuck_age,
     )
 
 

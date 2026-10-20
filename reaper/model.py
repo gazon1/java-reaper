@@ -70,6 +70,13 @@ class Daemon:
     peer_unknown: int = 0
     peer_conns: list[PeerConn] = field(default_factory=list)
     peer_first_seen: dict[str, float] = field(default_factory=dict)
+    # Демон «завис»: клиент отвалился во время сборки, сборка отменена, но
+    # демон остался в состоянии «идёт сборка». Gradle не может его убрать —
+    # его idle-таймаут не действует, пока демон «в сборке».
+    # Признак виден по логу: «client disconnection detected, canceling the build».
+    stuck_build: bool = False
+    # Момент последней отмены сборки (по логу).
+    canceled_at: float | None = None
 
     @property
     def footprint_mb(self) -> int:

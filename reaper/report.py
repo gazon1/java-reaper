@@ -7,17 +7,45 @@ import os
 import time
 from typing import Any
 
+from .config import idle_limit as idle_limit_for
 from .model import Decision
 from .policy import default_policy
 from .state import read_kills
 
 # Версия схемы машинного вывода: потребитель (агент, скрипт) обязан понимать,
 # что формат изменился, а не молча получить «поле пропало».
-JSON_SCHEMA_VERSION = 1
+JSON_SCHEMA_VERSION = 2
 
 # Критерий перехода из dry-run в kill-режим.
+# Значения по умолчанию; переопределяются конфигом (PILOT_MIN_EVENTS,
+# PILOT_MAX_REUSE_RATE) — чтобы менять планку без правки кода.
 PILOT_MAX_REUSE_RATE = 0.60
-PILOT_MIN_EVENTS = 15
+PILOT_MIN_EVENTS = 8
+
+# Классы демонов и их подписи в отчётах.
+KINDS = ("gradle", "kotlin")
+KIND_LABELS = {"gradle": "Gradle", "kotlin": "Kotlin"}
+
+
+def kind_summary(decisions: list[Decision], cfg: dict[str, Any]) -> dict[str, Any]:
+    """Сводка по классам демонов: сколько, сколько памяти, кого под удар.
+
+    Классы живут по разным правилам (у Gradle есть свой idle-таймаут,
+    у Kotlin — нет), поэтому в отчёте они видны отдельными строками.
+    """
+    out: dict[str, Any] = {}
+    for kind in KINDS:
+        items = [d for d in decisions if d.daemon.kind == kind]
+        kill = [d for d in items if d.kill]
+        out[kind] = {
+            "label": KIND_LABELS[kind],
+            "count": len(items),
+            "footprint_mb": sum(d.daemon.footprint_mb for d in items),
+            "kill_count": len(kill),
+            "kill_footprint_mb": sum(d.daemon.footprint_mb for d in kill),
+            "idle_limit_seconds": idle_limit_for(cfg, kind),
+        }
+    return out
 
 
 def _stale_note(dec: Decision) -> str:
@@ -27,7 +55,9 @@ def _stale_note(dec: Decision) -> str:
     return f" [зависший клиент: {detail}]"
 
 
-def format_status(decisions: list[Decision], state: dict[str, Any]) -> str:
+def format_status(decisions: list[Decision], state: dict[str, Any],
+                  cfg: dict[str, Any] | None = None) -> str:
+    cfg = cfg if cfg is not None else {}
     lines = [f"{'PID':>8} {'класс':>7} {'footprint':>10} {'простой':>9}  решение / причина"]
     lines.append("-" * 96)
     for dec in sorted(decisions, key=lambda d: -d.daemon.footprint_mb):
@@ -41,6 +71,18 @@ def format_status(decisions: list[Decision], state: dict[str, Any]) -> str:
     lines.append("-" * 96)
     lines.append(f"всего демонов: {len(decisions)}, footprint: {total} МБ, "
                  f"под убийство: {idle_total} МБ")
+    # Сводка по классам: у них разные пороги простоя и разная судьба.
+    for kind in KINDS:
+        items = [d for d in decisions if d.daemon.kind == kind]
+        if not items:
+            continue
+        kill = [d for d in items if d.kill]
+        limit = idle_limit_for(cfg, kind) if cfg else 0.0
+        limit_txt = f", порог простоя {limit / 3600:.0f} ч" if limit else ""
+        lines.append(f"  {KIND_LABELS[kind]}: {len(items)} шт, "
+                     f"{sum(d.daemon.footprint_mb for d in items)} МБ, "
+                     f"под убийство {sum(d.daemon.footprint_mb for d in kill)} МБ"
+                     f" ({len(kill)} шт){limit_txt}")
     metric = state.get("metric", {})
     if metric:
         lines.append(f"метрика dry-run: событий {metric.get('events', 0)}, "
@@ -86,6 +128,8 @@ def decision_to_dict(dec: Decision) -> dict[str, Any]:
             for c in d.peer_conns
         ],
         "log_path": d.log_path,
+        "stuck_build": bool(d.stuck_build),
+        "canceled_at": d.canceled_at,
     }
 
 
@@ -99,6 +143,7 @@ def format_json(decisions: list[Decision], state: dict[str, Any],
         "now": now,
         "config": {
             "IDLE_SECONDS": cfg["IDLE_SECONDS"],
+            "KOTLIN_IDLE_SECONDS": cfg.get("KOTLIN_IDLE_SECONDS"),
             "MIN_FOOTPRINT_MB": cfg["MIN_FOOTPRINT_MB"],
             "BUSY_CPU_SECONDS": cfg["BUSY_CPU_SECONDS"],
             "SWEEP_SECONDS": cfg["SWEEP_SECONDS"],
@@ -106,6 +151,7 @@ def format_json(decisions: list[Decision], state: dict[str, Any],
             "PEER_MAX_AGE_SECONDS": cfg.get("PEER_MAX_AGE_SECONDS"),
             "PID_ALLOWLIST": cfg.get("PID_ALLOWLIST", ""),
         },
+        "kinds": kind_summary(decisions, cfg),
         "daemons": [decision_to_dict(d) for d in decisions],
         "metric": state.get("metric", {}),
         "freed_mb": state.get("freed_mb", 0),
@@ -134,8 +180,13 @@ def format_explain(cfg: dict[str, Any]) -> str:
         if rule.protected:
             lines.append("    следствие: демон считается защищённым")
     lines.append("")
-    lines.append(f"Порог простоя: {int(cfg['IDLE_SECONDS']) / 60:.0f} мин; "
-                 f"минимум памяти: {cfg['MIN_FOOTPRINT_MB']} МБ; "
+    gradle_limit = idle_limit_for(cfg, "gradle")
+    kotlin_limit = idle_limit_for(cfg, "kotlin")
+    lines.append(f"Порог простоя: Gradle {gradle_limit / 60:.0f} мин "
+                 f"(выше его собственного idle-таймаута в 180 мин), "
+                 f"Kotlin {kotlin_limit / 60:.0f} мин (своего таймаута нет — "
+                 f"его не убирает никто);")
+    lines.append(f"минимум памяти: {cfg['MIN_FOOTPRINT_MB']} МБ; "
                  f"лимит убийств за свип: {cfg.get('MAX_KILLS_PER_SWEEP')}; "
                  f"возраст «зависшего клиента»: "
                  f"{int(cfg.get('PEER_MAX_AGE_SECONDS', 0)) / 3600:.0f} ч")
@@ -158,18 +209,20 @@ def pilot_report(cfg: dict[str, Any], state: dict[str, Any],
     rate = float(metric.get("rate", 0.0))
     started = float(state.get("pilot_started_at", 0.0))
     days = (now - started) / 86400.0 if started else 0.0
+    min_events = int(cfg.get("PILOT_MIN_EVENTS", PILOT_MIN_EVENTS))
+    max_rate = float(cfg.get("PILOT_MAX_REUSE_RATE", PILOT_MAX_REUSE_RATE))
 
-    if events < PILOT_MIN_EVENTS:
-        verdict = (f"ДАННЫХ МАЛО: событий {events} из нужных {PILOT_MIN_EVENTS} — "
+    if events < min_events:
+        verdict = (f"ДАННЫХ МАЛО: событий {events} из нужных {min_events} — "
                    f"вердикт не выносим")
         code = 2
-    elif rate > PILOT_MAX_REUSE_RATE:
+    elif rate > max_rate:
         verdict = (f"НЕ ВКЛЮЧАТЬ: доля ложных срабатываний "
-                   f"{100 * rate:.0f} % > {100 * PILOT_MAX_REUSE_RATE:.0f} %")
+                   f"{100 * rate:.0f} % > {100 * max_rate:.0f} %")
         code = 1
     else:
         verdict = (f"МОЖНО ВКЛЮЧАТЬ: доля ложных срабатываний {100 * rate:.0f} % "
-                   f"≤ {100 * PILOT_MAX_REUSE_RATE:.0f} %, событий {events}")
+                   f"≤ {100 * max_rate:.0f} %, событий {events}")
         code = 0
 
     kills = read_kills(cfg, limit=0)
@@ -182,7 +235,7 @@ def pilot_report(cfg: dict[str, Any], state: dict[str, Any],
         f"событий «would kill»: {events} (в ожидании ещё {pending})",
         f"из них понадобились снова: {reused} ({100 * rate:.0f} %)"
         f" — базис по ретроспективе 47 %",
-        f"критерий: доля ≤ {100 * PILOT_MAX_REUSE_RATE:.0f} % при ≥ {PILOT_MIN_EVENTS} событиях",
+        f"критерий: доля ≤ {100 * max_rate:.0f} % при ≥ {min_events} событиях",
         "",
         "Эффект:",
         f"  освобождено памяти (kill-режим): {int(state.get('freed_mb', 0))} МБ",
@@ -200,14 +253,20 @@ def pilot_report(cfg: dict[str, Any], state: dict[str, Any],
 
 def audit_report(cfg: dict[str, Any], decisions: list[Decision],
                  state: dict[str, Any]) -> tuple[str, int]:
-    """Критерий приёмки из плана: демонов с простоями длиннее IDLE_SECONDS
-    не должно остаться. Ноль — цель, неноль — недоработанный рейпер."""
-    idle_limit = float(cfg["IDLE_SECONDS"])
+    """Критерий приёмки из плана: демонов с простоями длиннее порога
+    не должно остаться. Ноль — цель, неноль — недоработанный рейпер.
+
+    Порог свой у каждого класса (Gradle / Kotlin), поэтому сравнение идёт
+    с порогом того демона, а не с одним общим числом.
+    """
     stale = [dec for dec in decisions
-             if dec.idle_seconds is not None and dec.idle_seconds > idle_limit]
+             if dec.idle_seconds is not None
+             and dec.idle_seconds > idle_limit_for(cfg, dec.daemon.kind)]
     stale.sort(key=lambda d: -d.daemon.footprint_mb)
     total = sum(dec.daemon.footprint_mb for dec in stale)
-    lines = [f"Аудит: демоны с простоем дольше {idle_limit / 60:.0f} мин", "=" * 60]
+    limits = ", ".join(f"{KIND_LABELS[k]} {idle_limit_for(cfg, k) / 3600:.0f} ч"
+                       for k in KINDS)
+    lines = [f"Аудит: демоны с простоями длиннее порога ({limits})", "=" * 60]
     if not stale:
         lines.append("  таких демонов нет — критерий приёмки выполнен (footprint = 0)")
         return "\n".join(lines), 0

@@ -11,6 +11,7 @@ import os
 import time
 from typing import Any
 
+from .config import RULES_VERSION
 from .model import Decision, observed_activity
 
 STATE_VERSION = 2
@@ -19,13 +20,13 @@ STATE_VERSION = 2
 DAEMON_FIELDS = frozenset({
     "first_seen", "kind", "cpu_ticks", "starttime", "last_cpu_at",
     "log_offset", "last_build_start", "last_build_end", "peer_first_seen",
-    "last_activity", "sigterm_attempts",
+    "last_activity", "sigterm_attempts", "canceled_at",
 })
 
 GLOBAL_FIELDS = frozenset({
     "version", "daemons", "would_kill", "metric", "freed_mb", "would_free_mb",
     "last_sweep_at", "last_sweep_ok", "pilot_started_at", "stale_peer_events",
-    "stale_peer_daemons",
+    "stale_peer_daemons", "rules_version",
 })
 
 
@@ -75,7 +76,29 @@ def load_state(cfg: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("pilot_started_at", 0.0)
     data.setdefault("stale_peer_events", 0)    # сколько раз сработало «зависший клиент»
     data.setdefault("stale_peer_daemons", {})  # pid → число срабатываний
+    data.setdefault("rules_version", 0)        # версия правил, по которым набрана метрика
     return data
+
+
+def sync_rules_version(state: dict[str, Any]) -> bool:
+    """Сбрасывает метрику пилота, если правила изменились.
+
+    Метрика пилота измеряет долю ложных срабатываний для КОНКРЕТНЫХ правил
+    и порогов. После смены правил события, набранные по старым, измеряют
+    другое — смешивать их нельзя, иначе вердикт по пилоту бессмыслен.
+
+    Возвращает True, если метрика была сброшена.
+    """
+    current = int(state.get("rules_version", 0) or 0)
+    if current == RULES_VERSION:
+        return False
+    state["rules_version"] = RULES_VERSION
+    state["would_kill"] = []
+    state["metric"] = {"events": 0, "reused": 0, "rate": 0.0, "pending": 0}
+    state["pilot_started_at"] = 0.0
+    state["stale_peer_events"] = 0
+    state["stale_peer_daemons"] = {}
+    return True
 
 
 def save_state(cfg: dict[str, Any], state: dict[str, Any]) -> None:

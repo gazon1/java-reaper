@@ -1,12 +1,12 @@
-"""Разбор логов демонов.
+"""Разбор логов демонов — рейпер.
 
-Логи Gradle засоряются DEBUG-спамом («Waiting to acquire shared lock on
-daemon addresses registry»): простаивающий демон пишет в лог постоянно
-(~124 Б/с). Поэтому mtime лога не признак активности, а маркеры сборки
-уезжают далеко назад и обычное чтение хвоста их теряет.
+Сам формат лога (маркеры, таймстемпы, сопоставление сборок) живёт в
+`reaper/logparse.py` — общем модуле с `tools/analyze-idle.py`. Здесь только
+инкрементальное чтение: смещение хранится в состоянии, поэтому за свип
+читаются только новые байты.
 
 Схема чтения: первый свип — файл целиком (до LOG_SCAN_MAX_BYTES), дальше —
-только новые байты, смещение хранится в состоянии.
+только новые байты.
 """
 
 from __future__ import annotations
@@ -14,31 +14,25 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from .proc import parse_ts
+from .logparse import (
+    MARK_BUILD_CANCELED,
+    MARK_BUILD_END,
+    MARK_BUILD_END_ALT,
+    MARK_BUILD_START,
+    parse_ts,
+    scan_markers,
+)
 
-# Маркеры в логе Gradle-демона.
-#   «Received command: Build»    — INFO, начало сборки.
-#   «Marking the daemon as idle» — INFO, демон освободился (1:1 со сборкой).
-# Второй маркер надёжнее «after build finished»: тот — DEBUG-уровень и
-# исчезает, когда DEBUG-логирование выключено.
-MARK_BUILD_START = "Received command: Build"
-MARK_BUILD_END = "Marking the daemon as idle"
-MARK_BUILD_END_ALT = "after build finished"
-
-
-def scan_markers(text: str) -> tuple[float | None, float | None]:
-    """Последние таймстемпы старта и конца сборки в блоке текста."""
-    last_start = last_end = None
-    for line in text.splitlines():
-        if MARK_BUILD_START in line:
-            ts = parse_ts(line)
-            if ts is not None:
-                last_start = ts
-        elif MARK_BUILD_END in line or MARK_BUILD_END_ALT in line:
-            ts = parse_ts(line)
-            if ts is not None:
-                last_end = ts
-    return last_start, last_end
+__all__ = [
+    "MARK_BUILD_CANCELED",
+    "MARK_BUILD_END",
+    "MARK_BUILD_END_ALT",
+    "MARK_BUILD_START",
+    "parse_ts",
+    "scan_markers",
+    "scan_gradle_log",
+    "parse_gradle_log",
+]
 
 
 def scan_gradle_log(path: str, offset: int, max_bytes: int) -> dict[str, Any]:
@@ -47,12 +41,14 @@ def scan_gradle_log(path: str, offset: int, max_bytes: int) -> dict[str, Any]:
     offset — сколько байт уже разобрано (из состояния). Возвращает:
       offset   — новое смещение;
       start/end — найденные маркеры (может быть None);
+      canceled — момент отмены сборки (клиент отвалился), если была;
       complete — True, если история лога известна целиком.
     """
     try:
         size = os.path.getsize(path)
     except OSError:
-        return {"offset": offset, "start": None, "end": None, "complete": False}
+        return {"offset": offset, "start": None, "end": None,
+                "canceled": None, "complete": False}
     if offset > size:
         offset = 0  # лог усечён или перезаписан
     if offset <= 0:
@@ -67,16 +63,31 @@ def scan_gradle_log(path: str, offset: int, max_bytes: int) -> dict[str, Any]:
             fh.seek(start)
             blob = fh.read()
     except OSError:
-        return {"offset": offset, "start": None, "end": None, "complete": False}
+        return {"offset": offset, "start": None, "end": None,
+                "canceled": None, "complete": False}
     s, e = scan_markers(blob.decode("utf-8", "replace"))
+    canceled = _scan_canceled(blob)
     if offset <= 0 and not complete and e is None:
         # Файл больше лимита и маркеры в его начале не найдены: историю
         # пока не знаем — читаем с этого места дальше в следующих свипах.
         new_offset = start
     else:
         new_offset = size
-    return {"offset": new_offset, "start": s, "end": e,
+    return {"offset": new_offset, "start": s, "end": e, "canceled": canceled,
             "complete": complete or e is not None}
+
+
+def _scan_canceled(blob: bytes) -> float | None:
+    """Момент отмены сборки в блоке байтов (клиент отвалился)."""
+    if MARK_BUILD_CANCELED not in blob:
+        return None
+    canceled = None
+    for line in blob.splitlines():
+        if MARK_BUILD_CANCELED in line:
+            ts = parse_ts(line.decode("utf-8", "replace"))
+            if ts is not None:
+                canceled = ts
+    return canceled
 
 
 def parse_gradle_log(path: str, tail_bytes: int) -> tuple[float | None, float | None]:

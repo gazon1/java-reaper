@@ -271,8 +271,8 @@ class TestClassify(unittest.TestCase):
         self.assertIn("простой", dec.reason)
 
     def test_idle_above_limit_killed(self):
-        d = make_daemon(last_build_end=NOW - 5 * HOUR)
-        st = state_for(d, NOW - 5 * HOUR, cpu_ticks=1000)
+        d = make_daemon(last_build_end=NOW - 10 * HOUR)
+        st = state_for(d, NOW - 10 * HOUR, cpu_ticks=1000)
         dec = self.decide(d, st)
         self.assertTrue(dec.kill)
         self.assertIn("простой", dec.reason)
@@ -301,8 +301,8 @@ class TestClassify(unittest.TestCase):
         self.assertIn("дети", dec.reason)
 
     def test_ignored_child_does_not_protect(self):
-        d = make_daemon(last_build_end=NOW - 5 * HOUR, children=[], ignored_children=[4242])
-        st = state_for(d, NOW - 5 * HOUR, cpu_ticks=1000)
+        d = make_daemon(last_build_end=NOW - 10 * HOUR, children=[], ignored_children=[4242])
+        st = state_for(d, NOW - 10 * HOUR, cpu_ticks=1000)
         dec = self.decide(d, st)
         self.assertTrue(dec.kill)
 
@@ -343,8 +343,8 @@ class TestClassify(unittest.TestCase):
 
     def test_stuck_build_without_cpu_children_is_candidate(self):
         """Эскалация: старт без конца давно, CPU 0, детей нет ⇒ кандидат."""
-        d = make_daemon(last_build_start=NOW - 5 * HOUR, last_build_end=None)
-        st = state_for(d, NOW - 5 * HOUR, cpu_ticks=1000)
+        d = make_daemon(last_build_start=NOW - 10 * HOUR, last_build_end=None)
+        st = state_for(d, NOW - 10 * HOUR, cpu_ticks=1000)
         dec = self.decide(d, st)
         self.assertTrue(dec.kill)
         self.assertIn("зависшая сборка", dec.reason)
@@ -395,13 +395,13 @@ class TestClassifyPeerGraph(unittest.TestCase):
 
     def test_idle_peer_does_not_protect(self):
         """Peer-кандидат (тоже простаивает) не защищает — иначе ничего не убить."""
-        peer = make_daemon(pid=2000, last_build_end=NOW - 5 * HOUR, cpu_ticks=1000)
-        daemon = make_daemon(pid=1000, last_build_end=NOW - 5 * HOUR,
+        peer = make_daemon(pid=2000, last_build_end=NOW - 10 * HOUR, cpu_ticks=1000)
+        daemon = make_daemon(pid=1000, last_build_end=NOW - 10 * HOUR,
                            peer_conns=[make_peer(2000, "client")])
         state = {
             "daemons": {
-                "1000": {"first_seen": NOW - 5 * HOUR, "cpu_ticks": 1000},
-                "2000": {"first_seen": NOW - 5 * HOUR, "cpu_ticks": 1000},
+                "1000": {"first_seen": NOW - 10 * HOUR, "cpu_ticks": 1000},
+                "2000": {"first_seen": NOW - 10 * HOUR, "cpu_ticks": 1000},
             }
         }
         decisions = {d.daemon.pid: d for d in reaper.classify([daemon, peer], state, NOW, self.cfg)}
@@ -470,7 +470,7 @@ class TestMetric(unittest.TestCase):
 class TestConfig(unittest.TestCase):
     def test_defaults(self):
         cfg = reaper.load_config("/nonexistent/config")
-        self.assertEqual(cfg["IDLE_SECONDS"], 10800)
+        self.assertEqual(cfg["IDLE_SECONDS"], 21600)
         self.assertEqual(cfg["MIN_FOOTPRINT_MB"], 128)
 
     def test_override_and_comments(self):
@@ -491,7 +491,7 @@ class TestConfig(unittest.TestCase):
             path = fh.name
         try:
             cfg = reaper.load_config(path)
-            self.assertEqual(cfg["IDLE_SECONDS"], 10800)
+            self.assertEqual(cfg["IDLE_SECONDS"], 21600)
         finally:
             os.unlink(path)
 
@@ -682,3 +682,154 @@ class TestCli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# --------------------------------------------------------------------------- #
+# Калибровка порогов (п.1) и Kotlin как отдельная цель (п.2)
+# --------------------------------------------------------------------------- #
+
+class TestThresholds(unittest.TestCase):
+    """Пороги простоя: Gradle и Kotlin живут по разным правилам."""
+
+    cfg = dict(reaper.DEFAULTS)
+
+    def decide(self, d, st=None):
+        if st is None:
+            st = state_for(d, NOW - 10 * HOUR, cpu_ticks=1000)
+        return reaper.classify([d], st, NOW, self.cfg)[0]
+
+    def test_gradle_threshold_is_six_hours(self):
+        """5 ч простоя Gradle — ещё мало: у Gradle свой таймаут 180 мин,
+        наш порог обязан быть выше, иначе мы конкурируем с ним."""
+        d = make_daemon(last_build_end=NOW - 5 * HOUR)
+        self.assertFalse(self.decide(d).kill)
+
+    def test_gradle_above_six_hours_killed(self):
+        d = make_daemon(last_build_end=NOW - 7 * HOUR)
+        self.assertTrue(self.decide(d).kill)
+
+    def test_kotlin_threshold_is_two_hours(self):
+        """Kotlin-демон умирает только по «No more clients left» — его
+        не убирает никто, поэтому порог вдвое меньше."""
+        d = make_daemon(kind="kotlin", log_mtime=NOW - 2.5 * HOUR)
+        self.assertTrue(self.decide(d).kill)
+
+    def test_kotlin_below_threshold_kept(self):
+        d = make_daemon(kind="kotlin", log_mtime=NOW - 1.5 * HOUR)
+        self.assertFalse(self.decide(d).kill)
+
+    def test_idle_limit_helper(self):
+        self.assertEqual(reaper.idle_limit(self.cfg, "gradle"), 21600)
+        self.assertEqual(reaper.idle_limit(self.cfg, "kotlin"), 7200)
+
+
+class TestStuckDaemon(unittest.TestCase):
+    """Зависший демон: клиент отвалился во время сборки."""
+
+    cfg = dict(reaper.DEFAULTS)
+
+    def decide(self, d, st=None):
+        if st is None:
+            st = state_for(d, NOW - 10 * HOUR, cpu_ticks=1000)
+        return reaper.classify([d], st, NOW, self.cfg)[0]
+
+    def test_canceled_build_killed_by_stuck_rule(self):
+        d = make_daemon(last_build_start=NOW - 10 * HOUR, last_build_end=None,
+                        canceled_at=NOW - 9 * HOUR, stuck_build=True)
+        dec = self.decide(d)
+        self.assertTrue(dec.kill)
+        self.assertIn("завис", dec.reason)
+
+    def test_fresh_cancel_not_reported_as_stuck(self):
+        """Свежая отмена — это не «зависший демон».
+
+        Демон с очень долгой сборкой без CPU кандидат на общих условиях
+        (простой считается от старта сборки), но причиной называть
+        «клиент отвалился» нельзя: отмена была час назад, клиент может
+        вернуться.
+        """
+        d = make_daemon(last_build_start=NOW - 10 * HOUR, last_build_end=None,
+                        canceled_at=NOW - 1 * HOUR, stuck_build=True)
+        dec = self.decide(d)
+        self.assertNotIn("клиент отвалился", dec.reason)
+
+    def test_new_build_cancels_stuck_state(self):
+        """Сборка после отмены → демон не «завис»."""
+        d = make_daemon(last_build_start=NOW - 2 * HOUR, last_build_end=NOW - HOUR,
+                        canceled_at=NOW - 9 * HOUR, stuck_build=True)
+        self.assertFalse(self.decide(d).kill)
+
+    def test_canceled_state_helper(self):
+        self.assertEqual(reaper.canceled_state(100.0, 200.0), None)
+        self.assertEqual(reaper.canceled_state(100.0, 50.0), 100.0)
+        self.assertIsNone(reaper.canceled_state(None, 50.0))
+        self.assertEqual(reaper.canceled_state(100.0, None), 100.0)
+
+
+class TestRulesVersion(unittest.TestCase):
+    """Смена правил обнуляет метрику пилота: она измеряет другое."""
+
+    def test_mismatch_resets_metric(self):
+        state = {
+            "rules_version": reaper.RULES_VERSION - 1,
+            "would_kill": [{"pid": 1, "at": 100.0, "reused": True, "final": True}],
+            "metric": {"events": 5, "reused": 3, "rate": 0.6, "pending": 0},
+            "pilot_started_at": 123.0,
+            "stale_peer_events": 7,
+            "stale_peer_daemons": {"1": 7},
+        }
+        self.assertTrue(reaper.sync_rules_version(state))
+        self.assertEqual(state["rules_version"], reaper.RULES_VERSION)
+        self.assertEqual(state["would_kill"], [])
+        self.assertEqual(state["metric"]["events"], 0)
+        self.assertEqual(state["pilot_started_at"], 0.0)
+        self.assertEqual(state["stale_peer_events"], 0)
+
+    def test_same_version_keeps_metric(self):
+        state = {
+            "rules_version": reaper.RULES_VERSION,
+            "would_kill": [{"pid": 1, "at": 100.0, "reused": True, "final": True}],
+            "metric": {"events": 5, "reused": 3, "rate": 0.6, "pending": 0},
+        }
+        self.assertFalse(reaper.sync_rules_version(state))
+        self.assertEqual(state["metric"]["events"], 5)
+        self.assertEqual(len(state["would_kill"]), 1)
+
+
+class TestKindSummary(unittest.TestCase):
+    """Сводка по классам демонов в отчёте (п.2)."""
+
+    cfg = dict(reaper.DEFAULTS)
+
+    def test_summary_separates_kinds(self):
+        g = make_daemon(pid=1, kind="gradle", rss_mb=400)
+        k = make_daemon(pid=2, kind="kotlin", rss_mb=300)
+        decisions = [reaper.Decision(g, True, "простой"),
+                     reaper.Decision(k, False, "работает")]
+        summary = reaper.kind_summary(decisions, self.cfg)
+        self.assertEqual(summary["gradle"]["count"], 1)
+        self.assertEqual(summary["gradle"]["kill_count"], 1)
+        self.assertEqual(summary["gradle"]["footprint_mb"], 400)
+        self.assertEqual(summary["kotlin"]["kill_count"], 0)
+        self.assertEqual(summary["kotlin"]["idle_limit_seconds"], 7200)
+        self.assertEqual(summary["gradle"]["idle_limit_seconds"], 21600)
+
+    def test_status_mentions_both_kinds(self):
+        g = make_daemon(pid=1, kind="gradle", rss_mb=400)
+        k = make_daemon(pid=2, kind="kotlin", rss_mb=300)
+        decisions = [reaper.Decision(g, True, "простой"),
+                     reaper.Decision(k, False, "работает")]
+        text = reaper.format_status(decisions, {"metric": {}}, self.cfg)
+        self.assertIn("Gradle", text)
+        self.assertIn("Kotlin", text)
+
+    def test_json_has_kinds(self):
+        import json as _json
+        g = make_daemon(pid=1, kind="gradle", rss_mb=400)
+        decisions = [reaper.Decision(g, True, "простой")]
+        payload = _json.loads(reaper.format_json(decisions, {"metric": {}},
+                                                 self.cfg, now=NOW))
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertIn("kinds", payload)
+        self.assertEqual(payload["kinds"]["gradle"]["count"], 1)
+        self.assertEqual(payload["config"]["KOTLIN_IDLE_SECONDS"], 7200)

@@ -44,6 +44,11 @@ class Signals:
     allowed: bool = True
     peer_protection: list[Protector] = field(default_factory=list)
     peer_stale: list[Protector] = field(default_factory=list)
+    # Демон «завис»: клиент отвалился во время сборки. Gradle не может его
+    # убрать — idle-таймаут не действует, пока демон «в сборке».
+    stuck_build: bool = False
+    # Сколько секунд прошло с момента отмены сборки.
+    stuck_age: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -110,13 +115,23 @@ def default_policy(cfg: dict) -> list[Rule]:
         return s.daemon.footprint_mb < min_footprint
 
     def building(s: Signals) -> bool:
-        return s.build_in_progress and s.age < idle_limit
+        return s.build_in_progress and s.age < s.idle_limit
 
     def not_idle(s: Signals) -> bool:
-        return s.age < idle_limit
+        return s.age < s.idle_limit
 
     def always(s: Signals) -> bool:
         return True
+
+    def stuck(s: Signals) -> bool:
+        """Демон завис: клиент отвалился во время сборки.
+
+        Работать некому, и работать уже некому. Gradle его не убирает:
+        его idle-таймаут (180 мин) не действует, пока демон считается
+        «в сборке». Это единственная категория, которую убирает рейпер,
+        а Gradle — нет.
+        """
+        return s.stuck_build and s.stuck_age > s.idle_limit
 
     return [
         Rule("allowlist",
@@ -169,20 +184,30 @@ def default_policy(cfg: dict) -> list[Rule]:
              lambda s: f"footprint {s.daemon.footprint_mb} МБ < {min_footprint} МБ"),
         Rule("building",
              "Идёт сборка: демон начал её недавно.",
-             "есть старт сборки без конца и простой < IDLE_SECONDS",
+             "есть старт сборки без конца и простой < порога простоя",
              Action.KEEP, building,
              lambda s: "сборка идёт (старт без конца)", busy=True),
         Rule("not-idle",
              "Демон простаивает недостаточно долго.",
-             f"простой < IDLE_SECONDS ({idle_limit / 60:.0f} мин)",
+             "простой < порога простоя для этого класса демона",
              Action.KEEP, not_idle,
-             lambda s: f"простой {s.age / 60:.0f} мин < {idle_limit / 60:.0f} мин"),
+             lambda s: f"простой {s.age / 60:.0f} мин < {s.idle_limit / 60:.0f} мин"),
+        Rule("stuck",
+             "Зависший демон: клиент отвалился во время сборки. Работать "
+             "некому, и работать уже некому — Gradle такой демон не убирает "
+             "(его idle-таймаут не действует, пока демон «в сборке»).",
+             "была отмена сборки (клиент отвалился), сборка не завершилась, "
+             f"и с отмены прошло > {idle_limit / 60:.0f} мин",
+             Action.KILL, stuck,
+             lambda s: (f"завис: клиент отвалился {s.stuck_age / 3600:.1f} ч назад, "
+                        f"работать некому; footprint {s.daemon.footprint_mb} МБ")),
         Rule("kill",
              "Все условия кандидата выполнены: простоя достаточно, памяти достаточно, "
              "демон никем не наблюдается.",
              "иначе (сюда попадают только прошедшие все проверки)",
              Action.KILL, always,
-             lambda s: (f"простой {s.age / 3600:.1f} ч, "
+             lambda s: (f"простой {s.age / 3600:.1f} ч "
+                        f"(порог {s.idle_limit / 3600:.0f} ч), "
                         f"footprint {s.daemon.footprint_mb} МБ"
                         + (", зависшая сборка (старт без конца)"
                            if s.build_in_progress else ""))),

@@ -14,6 +14,10 @@
   <ts> [INFO] [...] Received command: Build{id=..., currentDir=...}  — начало сборки
   <ts> [INFO] [...] Marking the daemon as idle, address: [...]        — демон освободился
 
+Формат лога разбирает общий модуль `reaper/logparse.py` — тот же, что
+использует сам рейпер. Одна реализация формата вместо двух: при смене
+формата Gradle правится в одном месте.
+
 Модель данных:
   Сборка i одного демона = интервал [start_i, end_i].
   Простой (idle gap) между сборками = end_i -> start_{i+1}.
@@ -42,18 +46,15 @@ import os
 import re
 import time
 import sys
-from collections import deque
-from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
+
+# Общий разбор формата лога (тот же, что у рейпера).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from reaper.logparse import FileScan, scan_file  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Константы
 # ---------------------------------------------------------------------------
-
-# Маркеры событий в байтовом виде (файлы читаются в бинарном режиме — быстрее
-# и без проблем с кодировкой мусорных строк).
-MARKER_BUILD = b"Received command: Build"
-MARKER_IDLE = b"Marking the daemon as idle"
 
 # Шаблоны поиска логов по умолчанию.
 DEFAULT_GLOBS: Tuple[str, ...] = (
@@ -68,88 +69,10 @@ LONG_REUSE_WINDOW_S = 86400
 # при выборе рекомендуемого порога (эвристика, не жёсткое правило).
 REUSE_TOLERANCE_PCT = 5.0
 
-# Число дней между 1970-01-01 и 0001-01-01 (proleptic Gregorian ordinal).
-_EPOCH_ORDINAL = 719163
-
-
-# ---------------------------------------------------------------------------
-# Разбор таймстемпов
-# ---------------------------------------------------------------------------
-
-
-def parse_timestamp(line: bytes) -> Optional[float]:
-    """
-    Разбирает таймстемп в начале строки вида YYYY-MM-DDTHH:MM:SS.mmm+ZZZZ
-    и возвращает epoch в секундах (float) с учётом смещения.
-
-    Возвращает None, если строка не начинается с корректного таймстемпа.
-    Разбор сделан вручную (без strptime) — это заметно быстрее на десятках
-    тысяч маркеров и не зависит от настроек локали.
-    """
-    # Минимальная длина таймстемпа: 28 символов ("2026-10-19T19:36:17.864+0300").
-    if len(line) < 28:
-        return None
-    try:
-        year = int(line[0:4])
-        month = int(line[5:7])
-        day = int(line[8:10])
-        hour = int(line[11:13])
-        minute = int(line[14:16])
-        second = int(line[17:19])
-        millis = int(line[20:23])
-    except ValueError:
-        return None
-
-    sign_char = line[23:24]
-    if sign_char == b"+":
-        offset_sign = 1
-    elif sign_char == b"-":
-        offset_sign = -1
-    else:
-        return None
-    try:
-        offset_hours = int(line[24:26])
-        offset_minutes = int(line[26:28])
-    except ValueError:
-        return None
-
-    days = datetime(year, month, day).toordinal() - _EPOCH_ORDINAL
-    epoch = (
-        days * 86400.0
-        + hour * 3600.0
-        + minute * 60.0
-        + second
-        + millis / 1000.0
-        - offset_sign * (offset_hours * 3600 + offset_minutes * 60)
-    )
-    return epoch
-
 
 # ---------------------------------------------------------------------------
 # Модель данных
 # ---------------------------------------------------------------------------
-
-
-class FileScan:
-    """Результат разбора одного лога демона."""
-
-    __slots__ = (
-        "path",
-        "mtime",
-        "builds",
-        "unclosed_builds",
-        "idle_without_start",
-        "bad_timestamp_lines",
-    )
-
-    def __init__(self, path: str, mtime: float) -> None:
-        self.path = path
-        self.mtime = mtime
-        # Сборки в виде (start_epoch, end_epoch|None), по порядку в логе.
-        self.builds: List[Tuple[float, Optional[float]]] = []
-        self.unclosed_builds = 0
-        self.idle_without_start = 0
-        self.bad_timestamp_lines = 0
 
 
 class Gap:
@@ -184,49 +107,9 @@ class Gap:
 # ---------------------------------------------------------------------------
 # Разбор логов
 # ---------------------------------------------------------------------------
-
-
-def scan_file(path: str) -> FileScan:
-    """
-    Потоково (построчно) читает лог и собирает последовательность событий.
-    Файл целиком в память не загружается — логи бывают десятки мегабайт.
-    """
-    stat = os.stat(path)
-    scan = FileScan(path, stat.st_mtime)
-
-    pending_starts: deque = deque()
-
-    with open(path, "rb") as handle:
-        for line in handle:
-            if MARKER_BUILD in line:
-                ts = parse_timestamp(line)
-                if ts is None:
-                    scan.bad_timestamp_lines += 1
-                    continue
-                pending_starts.append(ts)
-            elif MARKER_IDLE in line:
-                ts = parse_timestamp(line)
-                if ts is None:
-                    scan.bad_timestamp_lines += 1
-                    continue
-                if pending_starts:
-                    # FIFO-сопоставление: конец сборки закрывает самую старую
-                    # незакрытую сборку.
-                    start = pending_starts.popleft()
-                    scan.builds.append((start, ts))
-                else:
-                    # Демон ушёл в idle без единой полученной сборки
-                    # (например, в начале жизни демона) — не ошибка.
-                    scan.idle_without_start += 1
-
-    # Старты без парного end: сборка не завершилась (лог оборван, демон умер).
-    # Конец такой сборки условно равен mtime файла, но в простои она НЕ входит,
-    # иначе получился бы фиктивный гигантский простой.
-    while pending_starts:
-        scan.builds.append((pending_starts.popleft(), None))
-        scan.unclosed_builds += 1
-
-    return scan
+#
+# Сам разбор — в reaper/logparse.py (общий с рейпером): scan_file, маркеры
+# и парсер таймстемпа. Здесь только модель простоя.
 
 
 def build_gaps(scan: FileScan) -> List[Gap]:
@@ -241,11 +124,11 @@ def build_gaps(scan: FileScan) -> List[Gap]:
     builds = scan.builds
 
     for i in range(len(builds) - 1):
-        end_i = builds[i][1]
+        end_i = builds[i].end
         if end_i is None:
             # Незакрытая сборка: простой после неё определить нельзя.
             continue
-        start_next = builds[i + 1][0]
+        start_next = builds[i + 1].start
         duration = start_next - end_i
         if duration < 0:
             # Аномалия: часы идут назад (переход через смену часового пояса
@@ -253,12 +136,12 @@ def build_gaps(scan: FileScan) -> List[Gap]:
             continue
 
         # Reuse-дельта: интервал от конца сборки i+1 до начала сборки i+2.
-        end_next = builds[i + 1][1]
+        end_next = builds[i + 1].end
         if i + 2 < len(builds):
             if end_next is None:
                 reuse_delta: Optional[float] = None
             else:
-                reuse_delta = builds[i + 2][0] - end_next
+                reuse_delta = builds[i + 2].start - end_next
         else:
             # Следующей сборки не было вовсе — демон больше не понадобился.
             reuse_delta = None if end_next is None else float("inf")
@@ -292,9 +175,9 @@ def build_tail_gap(scan: FileScan, now: float) -> Optional[Gap]:
     просто висели дальше. Для живого демона конец наблюдения — текущий
     момент, для мёртвого — время изменения лога.
     """
-    if not scan.builds or scan.builds[-1][1] is None:
+    if not scan.builds or scan.builds[-1].end is None:
         return None  # последняя сборка не закрыта — хвост включал бы её время
-    end_of_idle = float(scan.builds[-1][1])
+    end_of_idle = float(scan.builds[-1].end)
     alive = daemon_alive(scan.path)
     observation_end = now if alive else scan.mtime
     duration = observation_end - end_of_idle
@@ -812,11 +695,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # ВАЖНО: если последняя сборка не закрыта (лог оборван), хвост включает
         # время её выполнения, поэтому это верхняя оценка «чистого» простоя.
         last_event: Optional[float] = None
-        for start, end in scan.builds:
-            if last_event is None or start > last_event:
-                last_event = start
-            if end is not None and (last_event is None or end > last_event):
-                last_event = end
+        for build in scan.builds:
+            if last_event is None or build.start > last_event:
+                last_event = build.start
+            if build.end is not None and (last_event is None or build.end > last_event):
+                last_event = build.end
         if last_event is not None:
             tail = scan.mtime - last_event
             if tail > 0:
@@ -829,8 +712,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         # Чистый простой: только для логов, чья последняя сборка закрыта
         # маркером idle — тогда хвост гарантированно простой.
-        if scan.builds and scan.builds[-1][1] is not None:
-            tail = scan.mtime - float(scan.builds[-1][1])
+        if scan.builds and scan.builds[-1].end is not None:
+            tail = scan.mtime - float(scan.builds[-1].end)
             if tail > 0:
                 scan_stats["tail_idle_hours"] = float(scan_stats["tail_idle_hours"]) + tail / 3600.0
                 scan_stats["tail_idle_files"] = int(scan_stats["tail_idle_files"]) + 1
