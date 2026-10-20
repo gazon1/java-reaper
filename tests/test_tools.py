@@ -8,7 +8,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -204,3 +206,145 @@ class TestMonthlyReport(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------- #
+# Уборка логов мёртвых демонов (п.3)
+# --------------------------------------------------------------------------- #
+
+prune = _load_tool("reaper_prune", "prune-logs.py")
+
+
+class TestPruneLogs(unittest.TestCase):
+    """Уборка трогает только логи мёртвых демонов и только по --apply."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.gradle = os.path.join(self.tmp.name, "gradle")
+        self.kotlin = os.path.join(self.tmp.name, "kotlin")
+        os.makedirs(os.path.join(self.gradle, "9.7.1"))
+        os.makedirs(self.kotlin)
+        self._live = prune.is_live_daemon
+        self._open_fn = prune.open_paths_under
+        prune.is_live_daemon = lambda pid, kind="gradle": pid == 4242
+        self._open: set[str] = set()
+        prune.open_paths_under = lambda dirs: set(self._open)
+
+    def tearDown(self):
+        prune.is_live_daemon = self._live
+        prune.open_paths_under = self._open_fn
+        self.tmp.cleanup()
+
+    def _write(self, path, size=1024, age_hours=100.0):
+        with open(path, "wb") as fh:
+            fh.write(b"x" * size)
+        t = time.time() - age_hours * 3600
+        os.utime(path, (t, t))
+        return path
+
+    def _gradle_log(self, pid, **kw):
+        return self._write(
+            os.path.join(self.gradle, "9.7.1", f"daemon-{pid}.out.log"), **kw)
+
+    def _kotlin_log(self, instance=333, idx=0, **kw):
+        name = f"kotlin-daemon.2026-10-20.08-29-00-{instance}.{idx:02d}.log"
+        return self._write(os.path.join(self.kotlin, name), **kw)
+
+    def _plan(self, min_age_hours=72.0):
+        return prune.collect(self.gradle, self.kotlin, min_age_hours * 3600,
+                             time.time())
+
+    def test_dead_daemon_log_is_planned(self):
+        path = self._gradle_log(111)
+        plan = self._plan()
+        self.assertEqual([p["path"] for p in plan], [path])
+
+    def test_live_daemon_log_is_not_planned(self):
+        """PID в имени лога Gradle настоящий: живой демон — не трогаем."""
+        self._gradle_log(4242)
+        self.assertEqual(self._plan(), [])
+
+    def test_open_file_is_never_removed(self):
+        """Файл, который держит открытым процесс, — не мёртвый лог."""
+        path = self._gradle_log(111)
+        self._open.add(path)
+        self.assertEqual(self._plan(), [])
+
+    def test_fresh_log_is_not_planned(self):
+        self._gradle_log(111, age_hours=1.0)
+        self.assertEqual(self._plan(), [])
+
+    def test_kotlin_log_is_planned(self):
+        path = self._kotlin_log(333)
+        plan = self._plan()
+        self.assertIn(path, [p["path"] for p in plan])
+
+    def test_kotlin_group_protected_by_open_file(self):
+        """Живой Kotlin-демон держит открытым только последний файл группы.
+
+        Остальные файлы того же демона удалять нельзя — поэтому открытый
+        файл защищает всю группу.
+        """
+        newest = self._kotlin_log(333, idx=0)
+        older = self._kotlin_log(333, idx=1)
+        self._open.add(newest)
+        plan = self._plan()
+        self.assertNotIn(older, [p["path"] for p in plan])
+
+    def test_kotlin_markers_are_never_touched(self):
+        """Маркеры Kotlin живут своей жизнью — их не трогаем никогда."""
+        markers = []
+        for name in ("kotlin-compiler-client-123-is-running",
+                     "kotlin-compiler-in-singularitytodo-456.alive",
+                     "kotlin-compilation-session-789-is-running"):
+            path = self._write(os.path.join(self.kotlin, name))
+            markers.append(path)
+        self.assertEqual(self._plan(), [])
+        for path in markers:
+            self.assertTrue(os.path.exists(path))
+
+    def test_unrelated_files_are_ignored(self):
+        self._write(os.path.join(self.gradle, "9.7.1", "notes.txt"))
+        self._write(os.path.join(self.kotlin, "readme.md"))
+        self.assertEqual(self._plan(), [])
+
+    def test_dry_run_deletes_nothing(self):
+        path = self._gradle_log(111)
+        code = prune.main(["--gradle-dir", self.gradle,
+                           "--kotlin-dir", self.kotlin])
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(path))
+
+    def test_apply_deletes_and_reports_bytes(self):
+        path = self._gradle_log(111, size=4096)
+        code = prune.main(["--apply", "--gradle-dir", self.gradle,
+                           "--kotlin-dir", self.kotlin])
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(path))
+
+    def test_apply_removes_whole_kotlin_group(self):
+        log = self._kotlin_log(333, idx=0)
+        lock = self._write(log + ".lck", size=16)
+        prune.main(["--apply", "--gradle-dir", self.gradle,
+                    "--kotlin-dir", self.kotlin])
+        self.assertFalse(os.path.exists(log))
+        self.assertFalse(os.path.exists(lock))
+
+    def test_json_output_lists_plan(self):
+        self._gradle_log(111)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            prune.main(["--json", "--gradle-dir", self.gradle,
+                        "--kotlin-dir", self.kotlin])
+        payload = json.loads(out.getvalue())
+        self.assertTrue(payload["dry_run"])
+        self.assertEqual(payload["files"], 1)
+        self.assertEqual(payload["removed"], 0)
+
+    def test_name_parsers(self):
+        self.assertEqual(prune.parse_gradle_name("daemon-123.out.log"), 123)
+        self.assertIsNone(prune.parse_gradle_name("daemon-abc.out.log"))
+        self.assertEqual(
+            prune.parse_kotlin_group("kotlin-daemon.2026-10-20.08-29-00-827.00.log"),
+            "kotlin-daemon.2026-10-20.08-29-00-827")
+        self.assertIsNone(prune.parse_kotlin_group("kotlin-daemon.log"))
