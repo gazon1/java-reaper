@@ -201,6 +201,22 @@ def read_history(path: str) -> list[dict[str, Any]]:
     return out
 
 
+def history_keys(path: str) -> set[tuple[str, float]]:
+    """Ключи уже сохранённых сводок: (путь, mtime файла).
+
+    Нужны, чтобы повторный прогон архивирования не засорил историю
+    дубликатами: симулятор считает каждую запись, и копии одного демона
+    исказили бы и число убийств, и долю ложных срабатываний.
+    """
+    keys: set[tuple[str, float]] = set()
+    for record in read_history(path):
+        path_key = record.get("path")
+        if path_key is None:
+            continue
+        keys.add((str(path_key), float(record.get("mtime") or 0.0)))
+    return keys
+
+
 def default_history_path(state_dir: str | None = None) -> str:
     """Путь к истории по умолчанию: рядом с состоянием рейпера."""
     base = state_dir or os.path.expanduser("~/.local/state/java-reaper")

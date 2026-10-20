@@ -55,6 +55,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from reaper.history import (  # noqa: E402
     append_history,
     default_history_path,
+    history_keys,
     summarize_gradle,
     summarize_kotlin,
 )
@@ -256,7 +257,13 @@ def summarize_for_history(item: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def write_history(plan: list[dict[str, Any]], history_path: str) -> int:
-    """Пишет сводки по всем кандидатам в JSONL-историю. Возвращает число."""
+    """Пишет сводки по всем кандидатам в JSONL-историю. Возвращает число.
+
+    Повторный прогон по тем же файлам не добавляет дубликатов: ключ
+    (путь, mtime) уже сохранённой сводки пропускается. Иначе история
+    разрасталась бы копиями, а симулятор считал бы каждую запись.
+    """
+    known = history_keys(history_path)
     written = 0
     for item in plan:
         if item.get("lock"):
@@ -264,7 +271,11 @@ def write_history(plan: list[dict[str, Any]], history_path: str) -> int:
         record = summarize_for_history(item)
         if record is None:
             continue
+        key = (str(record.get("path")), float(record.get("mtime") or 0.0))
+        if key in known:
+            continue
         append_history(history_path, record)
+        known.add(key)
         written += 1
     return written
 

@@ -505,3 +505,17 @@ class TestSimulator(unittest.TestCase):
         self.assertEqual(data["kills"], 1)
         self.assertEqual(data["false_positives"], 1)
         self.assertAlmostEqual(data["rate"], 1.0)
+
+    def test_history_not_duplicated_on_repeat(self):
+        """Повторный прогон архивирования не добавляет копий.
+
+        Симулятор считает каждую запись: копии одного демона исказили бы
+        и число убийств, и долю ложных срабатываний.
+        """
+        self._gradle_log(111)
+        history = os.path.join(self.tmp.name, "history.jsonl")
+        for _ in range(3):
+            prune.main(["--archive-only", "--gradle-dir", self.gradle,
+                        "--kotlin-dir", self.kotlin, "--history", history])
+        loaded = reaper.read_history(history)
+        self.assertEqual(len(loaded), 1)
