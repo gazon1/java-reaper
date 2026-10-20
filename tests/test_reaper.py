@@ -1178,3 +1178,63 @@ class TestObservability(unittest.TestCase):
         text = reaper.format_status([reaper.Decision(d, True, "простой")],
                                      state, self.cfg)
         self.assertIn("вне знаменателя", text)
+
+
+class TestStateModuleLayout(unittest.TestCase):
+    """Структура модулей состояния: `reaper.state` — точка входа.
+
+    Смысл проверки: `reaper.state` разбит на `reaper.metrics` (метрики
+    пилота и покрытие) и `reaper.journal` (журналы), но это переименование
+    внутреннего устройства — публичные имена обязаны остаться на месте,
+    иначе сломаются `cli.py`, `report.py` и инструменты из `tools/`.
+    """
+
+    # Полный публичный контракт модуля: так он выглядел до разбиения.
+    PUBLIC_NAMES = (
+        "DAEMON_FIELDS", "GLOBAL_FIELDS", "STATE_VERSION", "UNMEASURED_RULES",
+        "append_kill", "append_sweep", "degradation_warnings", "kills_path",
+        "load_state", "measure_coverage", "note_rule_hits", "note_stale_peers",
+        "read_kills", "record_freed", "save_state", "state_path",
+        "sweep_record", "sweeps_path", "sync_kind_signatures",
+        "sync_rules_version", "update_metric",
+    )
+
+    def test_public_names_still_importable_from_state(self):
+        import reaper.state as state_mod
+        for name in self.PUBLIC_NAMES:
+            self.assertTrue(hasattr(state_mod, name), f"пропал reaper.state.{name}")
+
+    def test_state_is_a_facade_not_a_copy(self):
+        """Имена в `state` — те же объекты, а не копии.
+
+        Копия означала бы, что модуль разошёлся с теми, где живёт
+        настоящая реализация: правка в одном месте не дойдёт до другого.
+        """
+        import reaper.journal as journal_mod
+        import reaper.metrics as metrics_mod
+        import reaper.state as state_mod
+        for name in ("update_metric", "measure_coverage", "note_rule_hits",
+                     "note_stale_peers", "degradation_warnings", "record_freed",
+                     "sync_kind_signatures", "sync_rules_version",
+                     "UNMEASURED_RULES"):
+            self.assertIs(getattr(state_mod, name), getattr(metrics_mod, name))
+        for name in ("append_kill", "append_sweep", "read_kills", "sweep_record",
+                     "kills_path", "sweeps_path"):
+            self.assertIs(getattr(state_mod, name), getattr(journal_mod, name))
+
+    def test_state_file_format_unchanged(self):
+        """Файл состояния: те же ключи, тот же порядок, та же разметка."""
+        import reaper.state as state_mod
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = {"STATE_DIR": tmp}
+            state = state_mod.load_state(cfg)
+            state_mod.save_state(cfg, state)
+            with open(os.path.join(tmp, "state.json"), encoding="utf-8") as fh:
+                raw = fh.read()
+        # Ключи отсортированы и на месте — от этого зависит diff состояний.
+        self.assertTrue(raw.startswith("{\n"))
+        keys = list(json.loads(raw, object_pairs_hook=lambda pairs: dict(pairs)))
+        self.assertEqual(keys, sorted(keys))
+        self.assertIn("version", keys)
+        self.assertIn("would_kill", keys)
+        self.assertEqual(set(keys), set(state_mod.GLOBAL_FIELDS))
