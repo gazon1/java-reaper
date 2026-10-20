@@ -386,8 +386,19 @@ def main(argv: list[str] | None = None) -> int:
     history_path = args.history or default_history_path()
     records = read_history(history_path)
     if not records:
-        print(f"история пуста или не найдена: {history_path}", flush=True)
-        return 1
+        # Нет истории — это не поломка прибора, а отсутствие данных. Прибор
+        # обязан сказать об этом и выйти с кодом 0: иначе он не запустится
+        # на машине, где рейпер ещё не накопил ни одной сводки.
+        if args.json:
+            print(json.dumps({"history": history_path, "records": 0,
+                              "thresholds": {}, "stuck_threshold_seconds": None,
+                              "stuck_thresholds": {}, "result": None,
+                              "stuck_scan": None},
+                             ensure_ascii=False, indent=1, sort_keys=True), flush=True)
+        else:
+            print(f"история пуста или не найдена: {history_path}", flush=True)
+            print(format_report({}, [], {}), flush=True)
+        return 0
 
     thresholds: dict[str, float] = {}
     stuck_threshold = 3600.0
