@@ -52,6 +52,10 @@ class Signals:
     # Контекст всего набора демонов: свободная память, свежая сборка
     # (по видам демонов). Правила читают его, а не каждый демон сам по себе.
     context: Context = field(default_factory=Context)
+    # Пересоздаваем ли этого демона (targets.yaml → rebuildable). False —
+    # это сервис или база данных: убивать его нельзя никогда.
+    # По умолчанию False: «не знаем ⇒ не трогаем».
+    rebuildable: bool = False
     # Какие виды демонов защищают этого, пока сами работают (из targets.yaml).
     protector_kinds: list[str] = field(default_factory=list)
     # То же самое человеческими именами («Gradle», а не «gradle») — для отчёта.
@@ -103,6 +107,9 @@ def default_policy(cfg: dict) -> list[Rule]:
 
     def not_allowed(s: Signals) -> bool:
         return not s.allowed
+
+    def not_rebuildable(s: Signals) -> bool:
+        return not s.rebuildable
 
     def no_log(s: Signals) -> bool:
         return not s.log_ok
@@ -196,6 +203,14 @@ def default_policy(cfg: dict) -> list[Rule]:
              "PID_ALLOWLIST задан и PID в него не входит",
              Action.KEEP, not_allowed,
              lambda s: "PID вне списка разрешённых — оставляю"),
+        Rule("not-rebuildable",
+             "Демон не пересоздаваемый: это сервис или данные, а не кэш. "
+             "Убивать его нельзя никогда — цена ошибки здесь не «холодный "
+             "старт», а потерянная работа.",
+             "цель не помечена rebuildable в targets.yaml",
+             Action.KEEP, not_rebuildable,
+             lambda s: "цель не пересоздаваемая — не убиваю никогда",
+             protected=True),
         Rule("no-log",
              "Демон не держит свой лог — нечем измерить простой.",
              "лог не найден через /proc/PID/fd",

@@ -395,6 +395,9 @@ def sweep_record(decisions: list[Decision], now: float,
         "footprint_mb": sum(d.daemon.footprint_mb for d in decisions),
         "would_kill": len(kills),
         "would_free_mb": sum(d.daemon.footprint_mb for d in kills),
+        # Виды — те, что реально встретились в этом свипе. Список не
+        # зашит: новая цель попадает в журнал сама, иначе её эффект был бы
+        # не виден в месячном отчёте (тихая потеря данных).
         "by_kind": {
             kind: {
                 "count": sum(1 for d in decisions if d.daemon.kind == kind),
@@ -403,7 +406,7 @@ def sweep_record(decisions: list[Decision], now: float,
                 "would_free_mb": sum(d.daemon.footprint_mb for d in kills
                                      if d.daemon.kind == kind),
             }
-            for kind in ("gradle", "kotlin")
+            for kind in sorted({d.daemon.kind for d in decisions})
         },
         "rules": {
             name: sum(1 for d in decisions if (d.rule or "") == name)

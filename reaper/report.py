@@ -380,19 +380,40 @@ def audit_report(cfg: dict[str, Any], decisions: list[Decision],
     return "\n".join(lines), 1
 
 
-def canary(daemons: list[Any], decisions: list[Decision]) -> str | None:
-    """Предупреждение: детектор молча перестал видеть демонов."""
+def canary(daemons: list[Any], decisions: list[Decision],
+           targets: TargetSet | None = None) -> str | None:
+    """Предупреждение: детектор молча перестал видеть демонов.
+
+    Проверяем по целям: если на машине есть живой процесс, который подходит
+    под какую-то цель, а в списке демонов его нет — детектор этой цели
+    ослеп. Раньше проверка искала в cmdline слова «gradle»/«kotlin» — то
+    есть о новых целях она молчала, и «кандидатов 0» выглядело бы как
+    «нечего было убивать».
+    """
     if daemons:
         return None
-    from .proc import proc_cmdline
+    from .proc import proc_comm, proc_cmdline, read_proc_stat
+
+    target_set = _targets(targets)
+    labels = target_set.labels()
+    known = {getattr(d, "pid", None) for d in daemons}
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
-        cmdline = proc_cmdline(int(entry))
-        if "gradle" in cmdline.lower() or "kotlin" in cmdline.lower():
-            if "daemon" in cmdline.lower() or "KotlinCompileDaemon" in cmdline:
-                return ("ВНИМАНИЕ: кандидатов 0, но есть java-процессы со словом "
-                        "gradle/kotlin — вероятно, изменился main-класс или формат логов")
+        pid = int(entry)
+        if pid in known:
+            continue
+        cmdline = proc_cmdline(pid)
+        if not cmdline:
+            continue
+        spec = target_set.match(cmdline, proc_comm(pid))
+        if spec is None:
+            continue
+        if read_proc_stat(pid) is None:
+            continue  # процесс успел умереть — не сбой детектора
+        return (f"ВНИМАНИЕ: кандидатов 0, но есть живой процесс цели "
+                f"«{labels.get(spec.name, spec.name)}» (pid {pid}) — "
+                f"детектор её не увидел: проверьте match_cmdline и формат лога")
     return None
 
 

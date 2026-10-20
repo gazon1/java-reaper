@@ -271,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
             print(format_json(decisions, state, cfg, now=now, targets=targets)
                   if args.json
                   else format_status(decisions, state, cfg, targets), flush=True)
-        warn = canary(daemons, decisions)
+        warn = canary(daemons, decisions, targets)
         if warn:
             print("WARNING: " + warn, flush=True)
         return 0
@@ -282,7 +282,7 @@ def main(argv: list[str] | None = None) -> int:
     archived = archive_vanished(cfg, state, daemons, now, targets)
 
     report = execute(decisions, state, now, cfg, dry_run=(mode == "dry-run"))
-    trim_report = trim_idle_logs(decisions, cfg, now)
+    trim_report = trim_idle_logs(decisions, cfg, now, targets)
     report = report + trim_report
     trimmed_pids = {int(i["pid"]) for i in trim_report if i.get("action") == "trim"}
 
@@ -298,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
     print(format_json(decisions, state, cfg, report, now, targets=targets)
           if args.json
           else format_status(decisions, state, cfg, targets), flush=True)
-    warn = canary(daemons, decisions)
+    warn = canary(daemons, decisions, targets)
     if warn:
         print("WARNING: " + warn, flush=True)
     for w in warnings:

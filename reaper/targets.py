@@ -67,7 +67,10 @@ class TargetSpec:
     recreate_cost_seconds — цена холодного старта (None → плоский конфиг);
     self_timeout_seconds  — через сколько демон умирает сам (Gradle: 180 мин);
     protects       — какие виды демонов этот вид защищает, пока работает;
-    rebuildable    — «это пересоздаваемый кэш, его можно убить».
+    rebuildable    — «это пересоздаваемый кэш, его можно убить»;
+    log_trim       — «лог этого демона можно усекать» (усечение сдвигает
+                     mtime, а у целей, где mtime — признак простоя, это
+                     врёт: демон выглядел бы «только что активным»).
     """
 
     name: str
@@ -86,6 +89,7 @@ class TargetSpec:
     self_timeout_seconds: float | None = None
     protects: tuple[str, ...] = ()
     rebuildable: bool = False
+    log_trim: bool = False
 
     def matches(self, cmdline: str, comm: str = "") -> bool:
         """Похоже ли этот процесс на нашу цель."""
@@ -122,6 +126,9 @@ BUILTIN_TARGETS: tuple[TargetSpec, ...] = (
         # Пока идёт сборка Gradle, компилятор нужен прямо сейчас.
         protects=("kotlin",),
         rebuildable=True,
+        # Лог Gradle можно усекать: простой измеряется по маркерам сборок,
+        # а не по mtime.
+        log_trim=True,
     ),
     TargetSpec(
         name="kotlin",
@@ -218,6 +225,7 @@ def _spec_from_dict(raw: dict[str, Any], warnings: list[str],
         self_timeout_seconds=_optional_float(raw.get("self_timeout_seconds")),
         protects=tuple(str(p) for p in protects),
         rebuildable=bool(raw.get("rebuildable", False)),
+        log_trim=bool(raw.get("log_trim", False)),
     )
     if not spec.match_cmdline and not spec.match_comm:
         warnings.append(f"цели: у «{name}» нет ни match_cmdline, ни match_comm "

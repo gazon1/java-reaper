@@ -254,6 +254,10 @@ def classify(daemons: list[Daemon], state: dict[str, Any], now: float,
         sig = _measure(d, rec, now, cfg, targets)
         sig.context = ctx
         sig.recreate_cost_seconds = recreate_cost(cfg, d.kind, targets)
+        # Пересоздаваем ли демон (targets.yaml → rebuildable). Не знаем —
+        # не убиваем: «неизвестное ⇒ оставить».
+        spec = targets.get(d.kind)
+        sig.rebuildable = bool(spec.rebuildable) if spec is not None else False
         # Кто защищает этот вид демонов, пока сам работает (targets.yaml).
         sig.protector_kinds = targets.protectors_of(d.kind)
         labels = targets.labels()

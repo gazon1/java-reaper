@@ -363,5 +363,89 @@ class TestLogLookup(unittest.TestCase):
         self.assertIsNone(reaper.find_log_path(os.getpid(), None))
 
 
+class TestSafetyPromises(unittest.TestCase):
+    """Обещания, которые код обязан выполнять, а не только объявлять.
+
+    Каждое из них — место, где легко оставить поле «для красоты»: тогда
+    оператор напишет в конфиге «не убивать» и ничего не изменится.
+    """
+
+    def setUp(self):
+        self.cfg = dict(reaper.DEFAULTS)
+        self.cfg["MEMORY_PRESSURE_MB"] = 0
+        self.now = 1_800_000_000.0
+        self.hour = 3600.0
+
+    def _targets(self, **kwargs):
+        kwargs.setdefault("rebuildable", True)
+        return tg.TargetSet({"gradle": tg.TargetSpec(name="gradle", **kwargs)})
+
+    def _daemon(self, kind="gradle"):
+        return reaper.Daemon(pid=1, kind=kind, rss_mb=1000, swap_mb=0,
+                             cpu_ticks=100, starttime=1,
+                             last_build_end=self.now - 10 * self.hour)
+
+    def _decide(self, targets):
+        state = {"daemons": {"1": {"first_seen": self.now - 20 * self.hour,
+                                   "cpu_ticks": 100}}}
+        return reaper.classify([self._daemon()], state, self.now, self.cfg,
+                               targets=targets)[0]
+
+    def test_not_rebuildable_is_never_killed(self):
+        """Цель без rebuildable — не кэш: убивать её нельзя никогда."""
+        targets = self._targets(rebuildable=False)
+        dec = self._decide(targets)
+        self.assertFalse(dec.kill)
+        self.assertEqual(dec.rule, "not-rebuildable")
+
+    def test_rebuildable_can_be_killed(self):
+        dec = self._decide(self._targets())
+        self.assertTrue(dec.kill)
+
+    def test_unknown_kind_is_not_killed(self):
+        """Вида нет в наборе целей — «не знаем ⇒ не трогаем»."""
+        dec = self._decide(tg.builtin_targets())
+        self.assertTrue(dec.kill, "встроенные цели пересоздаваемы")
+
+    def test_rule_is_visible_in_explain(self):
+        text = reaper.format_explain(self.cfg, self._targets())
+        self.assertIn("not-rebuildable", text)
+
+    def test_sweep_record_lists_all_kinds(self):
+        """Виды в журнале свипов — те, что встретились, а не два имени."""
+        d1 = self._daemon("gradle")
+        d2 = reaper.Daemon(pid=2, kind="esbuild", rss_mb=500, swap_mb=0,
+                           cpu_ticks=100, starttime=1)
+        record = reaper.sweep_record(
+            [reaper.Decision(d1, True, "простой"),
+             reaper.Decision(d2, True, "простой")],
+            self.now, self.cfg)
+        self.assertIn("esbuild", record["by_kind"])
+        self.assertIn("gradle", record["by_kind"])
+        self.assertEqual(record["by_kind"]["esbuild"]["count"], 1)
+
+    def test_log_trim_is_a_property_of_target(self):
+        """Усекать лог можно только там, где это не врёт про простой."""
+        targets = tg.TargetSet({
+            "gradle": tg.TargetSpec(name="gradle", log_trim=True),
+            "kotlin": tg.TargetSpec(name="kotlin", log_trim=False),
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            for kind, expected in (("gradle", True), ("kotlin", False)):
+                path = os.path.join(tmp, f"{kind}.log")
+                with open(path, "wb") as fh:
+                    fh.write(b"x" * (2 * 1024 * 1024))
+                d = reaper.Daemon(pid=1, kind=kind, rss_mb=1000, swap_mb=0,
+                                  cpu_ticks=100, starttime=1, log_path=path)
+                dec = reaper.Decision(d, True, "простой")
+                dec.idle_seconds = 10 * self.hour
+                report = reaper.trim_idle_logs(
+                    [dec], dict(self.cfg, TRIM_IDLE_LOGS=1), self.now, targets)
+                self.assertEqual(bool(report), expected,
+                                 f"вид {kind}: усечение "
+                                 f"{'должно' if expected else 'не должно'} "
+                                 f"происходить")
+
+
 if __name__ == "__main__":
     unittest.main()

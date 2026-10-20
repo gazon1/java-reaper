@@ -35,8 +35,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from reaper.config import load_config  # noqa: E402
+from reaper.config import load_config, resolve_targets  # noqa: E402
 from reaper.state import load_state, read_kills, sweeps_path  # noqa: E402
+from reaper.targets import load_targets  # noqa: E402
 
 
 def read_sweeps(cfg: dict, since: float) -> list[dict]:
@@ -63,7 +64,7 @@ def period_days(days: int) -> float:
     return days * 86400.0
 
 
-def collect(cfg: dict, days: int) -> dict:
+def collect(cfg: dict, days: int, targets=None) -> dict:
     """Собирает цифры отчёта."""
     state = load_state(cfg)
     now = time.time()
@@ -126,6 +127,7 @@ def collect(cfg: dict, days: int) -> dict:
         "avg_under_threat_mb": int(avg_under_threat),
         "rule_hits": rule_hits,
         "current_footprint_mb": kinds_footprint,
+        "kind_labels": (targets.labels() if targets is not None else {}),
         "stale_peer_events": int(state.get("stale_peer_events", 0)),
         "stale_peer_daemons": state.get("stale_peer_daemons", {}) or {},
         "pilot_started_at": float(state.get("pilot_started_at", 0.0)),
@@ -167,10 +169,12 @@ def format_report(data: dict) -> str:
         f"в среднем {data['avg_under_threat_mb']} МБ",
     ]
     if data["current_footprint_mb"]:
-        gradle = data["current_footprint_mb"].get("gradle", 0)
-        kotlin = data["current_footprint_mb"].get("kotlin", 0)
-        lines.append(f"  сейчас держат демоны: Gradle {gradle} МБ, "
-                     f"Kotlin {kotlin} МБ")
+        # Виды не зашиты: сколько их — столько и строк. Подпись — из
+        # targets.yaml («Gradle», а не «gradle»).
+        labels = data.get("kind_labels") or {}
+        parts = ", ".join(f"{labels.get(name, name)} {mb} МБ" for name, mb
+                          in sorted(data["current_footprint_mb"].items()))
+        lines.append(f"  сейчас держат демоны: {parts}")
     if data["rule_hits"]:
         lines.append("  правила за период:")
         for name, count in sorted(data["rule_hits"].items(), key=lambda kv: -kv[1]):
@@ -217,7 +221,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
-    data = collect(cfg, args.days)
+    targets = resolve_targets(load_targets(None, []), cfg, set(), [])
+    data = collect(cfg, args.days, targets)
     if args.json:
         print(json.dumps(data, ensure_ascii=False, indent=1, sort_keys=True))
     else:

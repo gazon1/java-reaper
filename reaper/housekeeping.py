@@ -19,22 +19,31 @@ import os
 from typing import Any
 
 from .model import Decision
+from .targets import TargetSet, builtin_targets
 
 
 def trim_idle_logs(decisions: list[Decision], cfg: dict[str, Any],
-                   now: float) -> list[dict[str, Any]]:
+                   now: float,
+                   targets: TargetSet | None = None) -> list[dict[str, Any]]:
     """Усекает логи демонов, которые простаивают дольше TRIM_AFTER_SECONDS.
 
     По умолчанию выключено (TRIM_IDLE_LOGS=0) — это запись в чужие файлы,
     включать её нужно осознанно.
+
+    Усекать можно не любой лог: если у цели mtime лога — признак простоя
+    (Kotlin), усечение сдвинуло бы mtime, и демон выглядел бы «только что
+    активным». Поэтому «умеет усекать» — свойство цели (`log_trim` в
+    targets.yaml), а не имя вида.
     """
     report: list[dict[str, Any]] = []
     if not int(cfg.get("TRIM_IDLE_LOGS", 0)):
         return report
+    target_set = targets or builtin_targets()
     after = float(cfg.get("TRIM_AFTER_SECONDS", 3600))
     for dec in decisions:
         d = dec.daemon
-        if d.kind != "gradle" or not d.log_path:
+        spec = target_set.get(d.kind)
+        if spec is None or not spec.log_trim or not d.log_path:
             continue
         if dec.idle_seconds is None or dec.idle_seconds < after:
             continue
