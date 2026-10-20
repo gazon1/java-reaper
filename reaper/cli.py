@@ -42,6 +42,7 @@ from .state import (
     record_freed,
     save_state,
     sweep_record,
+    sync_kind_signatures,
     sync_rules_version,
     update_metric,
 )
@@ -251,6 +252,15 @@ def main(argv: list[str] | None = None) -> int:
         # свипа уже записывались по новым правилам.
         _say(args, f"java-reaper: правила изменились (версия {RULES_VERSION}) — "
                    f"метрика пилота сброшена")
+    else:
+        # Версия кода та же, но правила конкретной цели могли измениться
+        # (порог в targets.yaml). Тогда сбрасывается метрика ТОЛЬКО по этому
+        # виду: по остальным она остаётся честной.
+        changed = sync_kind_signatures(state, targets, cfg)
+        if changed:
+            _say(args, "java-reaper: правила изменились для вида "
+                       + ", ".join(changed)
+                       + " — метрика по нему перезапущена, по остальным сохранена")
     daemons, decisions = _sweep(cfg, state, now, targets)
 
     if args.status or args.audit:

@@ -144,6 +144,7 @@ from reaper.state import (  # noqa: E402,F401
     state_path,
     sweep_record,
     sweeps_path,
+    sync_kind_signatures,
     sync_rules_version,
     update_metric,
 )

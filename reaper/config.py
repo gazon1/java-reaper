@@ -290,6 +290,73 @@ def idle_limit(cfg: dict[str, Any], kind: str) -> float:
     return float(cfg["IDLE_SECONDS"])
 
 
+# Ключи конфига, влияющие на решения по ЛЮБОМУ виду демонов. Меняются —
+# меняются решения всех видов, и метрика по всем видам становится непригодной.
+GLOBAL_SIGNATURE_KEYS = (
+    "IDLE_SECONDS",
+    "MIN_FOOTPRINT_MB",
+    "BUSY_CPU_SECONDS",
+    "SWEEP_SECONDS",
+    "MEMORY_PRESSURE_MB",
+    "KILL_LARGE_DAEMON_MB",
+    "GRADLE_BUILD_ACTIVE_SECONDS",
+    "BUILD_ACTIVE_SECONDS",
+    "STUCK_AFTER_SECONDS",
+    "PEER_MAX_AGE_SECONDS",
+    "RECREATE_COST_SECONDS",
+    "PID_ALLOWLIST",
+)
+
+
+def _spec_fingerprint(spec: TargetSpec) -> dict[str, Any]:
+    """Поля описания цели, влияющие на решения по демонам этого вида."""
+    return {
+        "idle_seconds": spec.idle_seconds,
+        "recreate_cost_seconds": spec.recreate_cost_seconds,
+        "build_active_seconds": spec.build_active_seconds,
+        "stuck_after_seconds": spec.stuck_after_seconds,
+        "min_footprint_mb": spec.min_footprint_mb,
+        "large_daemon_mb": spec.large_daemon_mb,
+        "self_timeout_seconds": spec.self_timeout_seconds,
+        "rebuildable": spec.rebuildable,
+        "activity": spec.activity,
+    }
+
+
+def kind_signature(spec: TargetSpec, cfg: dict[str, Any],
+                   targets: "TargetSet | None" = None) -> str:
+    """Подпись правил, действующих для одного вида демонов.
+
+    Что меняет решения по демонам вида:
+      * поля описания цели (пороги, пересоздаваемость, способ измерения
+        активности);
+      * общие ключи конфига (давление по памяти, порог простоя, белый
+        список PID и прочие) — они действуют на все виды сразу;
+      * описания видов, которые этот вид защищает (protects): изменилось
+        их правило — изменилось и решение по защищаемому.
+
+    Подпись нужна для того, чтобы сбросить метрику ТОЛЬКО по тому виду,
+    чьи правила изменились. Общий сброс по всем видам — слишком грубо:
+    добавление новой цели обнуляло бы весь накопленный пилот.
+    """
+    import hashlib
+    import json as _json
+
+    payload: dict[str, Any] = {
+        "rules_version": RULES_VERSION,
+        "spec": _spec_fingerprint(spec),
+        "global": {key: cfg.get(key) for key in GLOBAL_SIGNATURE_KEYS},
+        "protectors": {},
+    }
+    if targets is not None:
+        for name in spec.protects:
+            other = targets.get(name)
+            if other is not None:
+                payload["protectors"][name] = _spec_fingerprint(other)
+    blob = _json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
 def allowlist(cfg: dict[str, Any]) -> set[int]:
     """PID'ы, которым разрешено убивать. Пусто — разрешены все."""
     raw = str(cfg.get("PID_ALLOWLIST") or "")

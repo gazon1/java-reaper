@@ -487,5 +487,69 @@ class TestSafetyPromises(unittest.TestCase):
                                  f"происходить")
 
 
+class TestKindSignatures(unittest.TestCase):
+    """Смена правил одной цели не должна обнулять метрику по остальным.
+
+    Метрика пилота измеряет долю ложных срабатываний для конкретных правил.
+    Правила изменились у одной цели — события по ней измеряли другое, и их
+    надо выбросить; по остальным видам события остаются честными.
+    """
+
+    def _targets(self, mock_idle: float = 3600.0):
+        return tg.TargetSet({
+            "gradle": tg.TargetSpec(name="gradle", idle_seconds=21600.0,
+                                    rebuildable=True),
+            "mock": tg.TargetSpec(name="mock", idle_seconds=mock_idle,
+                                  rebuildable=True),
+        })
+
+    def _state(self):
+        return {
+            "would_kill": [
+                {"pid": 1, "kind": "gradle", "at": 100.0, "final": True,
+                 "outcome": "reused"},
+                {"pid": 2, "kind": "mock", "at": 100.0, "final": True,
+                 "outcome": "reused"},
+            ],
+            "kind_signatures": {},
+        }
+
+    def test_first_run_records_signatures_without_dropping_events(self):
+        state = self._state()
+        changed = reaper.sync_kind_signatures(state, self._targets(), dict(reaper.DEFAULTS))
+        self.assertEqual(changed, [])
+        self.assertEqual(len(state["would_kill"]), 2)
+        self.assertIn("gradle", state["kind_signatures"])
+        self.assertIn("mock", state["kind_signatures"])
+
+    def test_change_of_one_target_drops_only_its_events(self):
+        state = self._state()
+        cfg = dict(reaper.DEFAULTS)
+        reaper.sync_kind_signatures(state, self._targets(), cfg)
+        # Порог простоя у «mock» подняли — его события измеряли другое.
+        changed = reaper.sync_kind_signatures(state, self._targets(mock_idle=7200.0), cfg)
+        self.assertEqual(changed, ["mock"])
+        kinds = [e["kind"] for e in state["would_kill"]]
+        self.assertEqual(kinds, ["gradle"],
+                         "события по остальным видам должны сохраниться")
+
+    def test_global_change_drops_events_of_all_kinds(self):
+        """Общий ключ конфига действует на все виды — сбрасываются все."""
+        state = self._state()
+        reaper.sync_kind_signatures(state, self._targets(), dict(reaper.DEFAULTS))
+        cfg = dict(reaper.DEFAULTS, MEMORY_PRESSURE_MB=1024)
+        changed = reaper.sync_kind_signatures(state, self._targets(), cfg)
+        self.assertEqual(sorted(changed), ["gradle", "mock"])
+        self.assertEqual(state["would_kill"], [])
+
+    def test_unchanged_rules_keep_events(self):
+        state = self._state()
+        cfg = dict(reaper.DEFAULTS)
+        reaper.sync_kind_signatures(state, self._targets(), cfg)
+        changed = reaper.sync_kind_signatures(state, self._targets(), cfg)
+        self.assertEqual(changed, [])
+        self.assertEqual(len(state["would_kill"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

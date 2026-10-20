@@ -28,7 +28,7 @@ GLOBAL_FIELDS = frozenset({
     "last_sweep_at", "last_sweep_ok", "pilot_started_at", "stale_peer_events",
     "stale_peer_daemons", "rules_version", "would_free_pending_mb",
     "rule_hits", "rule_hits_last", "measured_count", "measured_prev",
-    "degradation", "mem_available_mb",
+    "degradation", "mem_available_mb", "kind_signatures",
 })
 
 
@@ -97,6 +97,7 @@ def load_state(cfg: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("measured_prev", 0)       # то же на прошлом свипе
     data.setdefault("degradation", [])        # предупреждения о деградации
     data.setdefault("mem_available_mb", None) # сколько памяти доступно системе
+    data.setdefault("kind_signatures", {})   # подпись правил по видам демонов
     return data
 
 
@@ -118,7 +119,40 @@ def sync_rules_version(state: dict[str, Any]) -> bool:
     state["pilot_started_at"] = 0.0
     state["stale_peer_events"] = 0
     state["stale_peer_daemons"] = {}
+    state["kind_signatures"] = {}
     return True
+
+
+def sync_kind_signatures(state: dict[str, Any], targets: Any,
+                         cfg: dict[str, Any]) -> list[str]:
+    """Точечный сброс метрики: по видам, у которых изменились правила.
+
+    Зачем: смена правил одной цели (например, подняли порог простоя
+    только для неё) обнуляла бы весь накопленный пилот по всем видам —
+    а метрика по остальным видам от этого изменения не менялась и
+    остаётся честной.
+
+    Возвращает список видов, чьи события выброшены.
+    """
+    from .config import kind_signature
+
+    signatures = state.setdefault("kind_signatures", {})
+    events = state.setdefault("would_kill", [])
+    changed: list[str] = []
+    for name, spec in targets.specs_by_name().items():
+        signature = kind_signature(spec, cfg, targets)
+        previous = signatures.get(name)
+        signatures[name] = signature
+        if previous is None or previous == signature:
+            continue
+        # Правила вида изменились: его события измеряли другое.
+        stale = [e for e in events if str(e.get("kind") or "unknown") == name]
+        if not stale:
+            continue
+        events[:] = [e for e in events
+                     if str(e.get("kind") or "unknown") != name]
+        changed.append(name)
+    return changed
 
 
 def save_state(cfg: dict[str, Any], state: dict[str, Any]) -> None:
