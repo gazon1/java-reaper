@@ -24,6 +24,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import _api as reaper  # noqa: E402
+from reaper import report  # noqa: E402
 
 FIXTURE = os.path.join(HERE, "fixtures", "gradle-daemon.log")
 NOW = 1_800_000_000.0
@@ -516,6 +517,52 @@ class TestExplain(unittest.TestCase):
         text = reaper.format_explain(self.cfg)
         self.assertIn("Порог простоя", text)
         self.assertIn("180", text)  # 3 ч в минутах
+
+
+# --------------------------------------------------------------------------- #
+# Общие помощники отчётов: демоны по видам, порог простоя, сводка
+# --------------------------------------------------------------------------- #
+
+class TestReportHelpers(unittest.TestCase):
+    """Помощники, на которые переписаны отчёты.
+
+    Если они разойдутся между собой, разойдутся и отчёты: таблица, JSON
+    и аудит обязаны показывать одни и те же числа.
+    """
+
+    def setUp(self):
+        self.cfg = dict(reaper.DEFAULTS)
+        self.targets = reaper.builtin_targets()
+
+    def test_daemons_grouped_by_kind(self):
+        g = reaper.Decision(make_daemon(pid=1, kind="gradle"), True, "простой")
+        k = reaper.Decision(make_daemon(pid=2, kind="kotlin"), False, "ждёт")
+        grouped = report.daemons_by_kind([g, k], self.targets)
+        self.assertEqual([d.daemon.pid for d in grouped["gradle"]], [1])
+        self.assertEqual([d.daemon.pid for d in grouped["kotlin"]], [2])
+
+    def test_unknown_kind_is_not_in_summary(self):
+        other = reaper.Decision(make_daemon(pid=3, kind="неизвестный"), False, "x")
+        grouped = report.daemons_by_kind([other], self.targets)
+        self.assertNotIn("неизвестный", grouped)
+        self.assertEqual(sum(len(v) for v in grouped.values()), 0)
+
+    def test_idle_limits_match_kind_thresholds(self):
+        limits = report.idle_limits(self.cfg, self.targets)
+        for kind in self.targets.names():
+            self.assertEqual(limits[kind],
+                             report.idle_limit_for_kind(self.cfg, kind, self.targets))
+
+    def test_kind_aggregates_equal_kind_summary(self):
+        g = reaper.Decision(make_daemon(pid=1, kind="gradle"), True, "простой")
+        k = reaper.Decision(make_daemon(pid=2, kind="kotlin"), False, "ждёт")
+        decisions = [g, k]
+        self.assertEqual(report.kind_aggregates(decisions, self.cfg, self.targets),
+                         reaper.kind_summary(decisions, self.cfg, self.targets))
+
+    def test_kind_label_falls_back_to_name(self):
+        self.assertEqual(report.kind_label({}, "gradle"), "gradle")
+        self.assertEqual(report.kind_label({"gradle": "Gradle"}, "gradle"), "Gradle")
 
 
 # --------------------------------------------------------------------------- #

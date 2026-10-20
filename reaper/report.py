@@ -36,6 +36,71 @@ def _targets(targets: TargetSet | None) -> TargetSet:
     return targets if targets is not None else builtin_targets()
 
 
+def kind_label(labels: dict[str, str], kind: str) -> str:
+    """Подпись вида в отчёте: своя подпись цели, иначе её имя.
+
+    Подпись живёт у цели, а вид приходит откуда угодно, поэтому запасной
+    вариант (имя) должен быть в одном месте, а не в каждом отчёте.
+    """
+    return labels.get(kind, kind)
+
+
+def daemons_by_kind(decisions: list[Decision],
+                    target_set: TargetSet) -> dict[str, list[Decision]]:
+    """Демоны, разложенные по видам.
+
+    Виды берём из набора целей, а не из самих демонов: у демона неизвестного
+    вида нет ни подписи, ни порога простоя, и в сводке по видам ему не
+    место. Порядок демонов внутри вида сохраняется.
+    """
+    grouped: dict[str, list[Decision]] = {kind: [] for kind in target_set.names()}
+    for dec in decisions:
+        items = grouped.get(dec.daemon.kind)
+        if items is not None:
+            items.append(dec)
+    return grouped
+
+
+def idle_limits(cfg: dict[str, Any], target_set: TargetSet,
+                kinds: list[str] | None = None) -> dict[str, float]:
+    """Порог простоя для каждого вида демона.
+
+    У каждого вида своя планка (у Gradle есть свой idle-таймаут, у Kotlin его
+    нет), и считать её надо в одном месте: отчёты брали её по-разному,
+    и числа в них расходились.
+
+    `kinds` ограничивает круг: отчёт, где вид не показывается, не должен
+    платить за его порог.
+    """
+    names = target_set.names() if kinds is None else list(kinds)
+    return {kind: idle_limit_for_kind(cfg, kind, target_set) for kind in names}
+
+
+def kind_aggregates(decisions: list[Decision], cfg: dict[str, Any],
+                    target_set: TargetSet,
+                    limits: dict[str, float] | None = None) -> dict[str, Any]:
+    """Сводка по видам: сколько демонов, сколько памяти, кого под удар.
+
+    Один сборщик на все отчёты: таблица и JSON показывают одни и те же
+    числа, а не две независимые выжимки одного и того же.
+    """
+    if limits is None:
+        limits = idle_limits(cfg, target_set)
+    labels = target_set.labels()
+    out: dict[str, Any] = {}
+    for kind, items in daemons_by_kind(decisions, target_set).items():
+        kill = [d for d in items if d.kill]
+        out[kind] = {
+            "label": kind_label(labels, kind),
+            "count": len(items),
+            "footprint_mb": sum(d.daemon.footprint_mb for d in items),
+            "kill_count": len(kill),
+            "kill_footprint_mb": sum(d.daemon.footprint_mb for d in kill),
+            "idle_limit_seconds": limits.get(kind, 0.0),
+        }
+    return out
+
+
 def kind_summary(decisions: list[Decision], cfg: dict[str, Any],
                  targets: TargetSet | None = None) -> dict[str, Any]:
     """Сводка по классам демонов: сколько, сколько памяти, кого под удар.
@@ -43,23 +108,7 @@ def kind_summary(decisions: list[Decision], cfg: dict[str, Any],
     Классы живут по разным правилам (у Gradle есть свой idle-таймаут,
     у Kotlin — нет), поэтому в отчёте они видны отдельными строками.
     """
-    target_set = _targets(targets)
-    labels = target_set.labels()
-    out: dict[str, Any] = {}
-    for kind in target_set.names():
-        items = [d for d in decisions if d.daemon.kind == kind]
-        kill = [d for d in items if d.kill]
-        spec = target_set.get(kind)
-        limit = idle_limit_for_kind(cfg, kind, target_set)
-        out[kind] = {
-            "label": labels.get(kind, kind),
-            "count": len(items),
-            "footprint_mb": sum(d.daemon.footprint_mb for d in items),
-            "kill_count": len(kill),
-            "kill_footprint_mb": sum(d.daemon.footprint_mb for d in kill),
-            "idle_limit_seconds": limit,
-        }
-    return out
+    return kind_aggregates(decisions, cfg, _targets(targets))
 
 
 def _stale_note(dec: Decision) -> str:
@@ -74,7 +123,6 @@ def format_status(decisions: list[Decision], state: dict[str, Any],
                   targets: TargetSet | None = None) -> str:
     cfg = cfg if cfg is not None else {}
     target_set = _targets(targets)
-    labels = target_set.labels()
     lines = [f"{'PID':>8} {'класс':>7} {'footprint':>10} {'простой':>9}  решение / причина"]
     lines.append("-" * 96)
     for dec in sorted(decisions, key=lambda d: -d.daemon.footprint_mb):
@@ -93,18 +141,19 @@ def format_status(decisions: list[Decision], state: dict[str, Any],
         lines.append(f"свободной памяти: {available} МБ "
                      f"(порог давления {cfg.get('MEMORY_PRESSURE_MB')} МБ)")
     # Сводка по классам: у них разные пороги простоя и разная судьба.
-    for kind in target_set.names():
-        items = [d for d in decisions if d.daemon.kind == kind]
-        if not items:
+    # Пустой конфиг — это «порогов нет»: строка про порог не печатается.
+    by_kind = daemons_by_kind(decisions, target_set)
+    limits = idle_limits(cfg, target_set,
+                         [kind for kind, items in by_kind.items() if items]) if cfg else {}
+    for kind, agg in kind_aggregates(decisions, cfg, target_set, limits).items():
+        if not agg["count"]:
             continue
-        kill = [d for d in items if d.kill]
-        spec = target_set.get(kind)
-        limit = idle_limit_for_kind(cfg, kind, target_set) if cfg else 0.0
+        limit = agg["idle_limit_seconds"]
         limit_txt = f", порог простоя {limit / 3600:.0f} ч" if limit else ""
-        lines.append(f"  {labels.get(kind, kind)}: {len(items)} шт, "
-                     f"{sum(d.daemon.footprint_mb for d in items)} МБ, "
-                     f"под убийство {sum(d.daemon.footprint_mb for d in kill)} МБ"
-                     f" ({len(kill)} шт){limit_txt}")
+        lines.append(f"  {agg['label']}: {agg['count']} шт, "
+                     f"{agg['footprint_mb']} МБ, "
+                     f"под убийство {agg['kill_footprint_mb']} МБ"
+                     f" ({agg['kill_count']} шт){limit_txt}")
     metric = state.get("metric", {})
     if metric:
         counted = int(metric.get("counted", metric.get("events", 0)))
@@ -208,7 +257,7 @@ def format_json(decisions: list[Decision], state: dict[str, Any],
         },
         "targets": {
             name: {
-                "label": target_set.labels().get(name, name),
+                "label": kind_label(target_set.labels(), name),
                 "idle_limit_seconds": spec.idle_seconds,
                 "recreate_cost_seconds": spec.recreate_cost_seconds,
                 "activity": spec.activity,
@@ -259,17 +308,18 @@ def format_explain(cfg: dict[str, Any],
         if rule.protected:
             lines.append("    следствие: демон считается защищённым")
     lines.append("")
+    idle_by_kind = idle_limits(cfg, target_set)
     limits = []
     for name, spec in target_set.specs_by_name().items():
-        limit = idle_limit_for_kind(cfg, name, target_set)
+        limit = idle_by_kind[name]
         notes = []
         if spec.self_timeout_seconds:
             notes.append(f"свой idle-таймаут {spec.self_timeout_seconds / 60:.0f} мин")
         if spec.protects:
             notes.append("защищает: "
-                         + ", ".join(labels.get(k, k) for k in spec.protects))
+                         + ", ".join(kind_label(labels, k) for k in spec.protects))
         suffix = f" ({'; '.join(notes)})" if notes else ""
-        limits.append(f"{labels.get(name, name)} {limit / 60:.0f} мин{suffix}")
+        limits.append(f"{kind_label(labels, name)} {limit / 60:.0f} мин{suffix}")
     lines.append("Порог простоя: " + "; ".join(limits) + ";")
     lines.append(f"минимум памяти: {cfg['MIN_FOOTPRINT_MB']} МБ; "
                  f"лимит убийств за свип: {cfg.get('MAX_KILLS_PER_SWEEP')}; "
@@ -281,7 +331,7 @@ def format_explain(cfg: dict[str, Any],
     lines.append(f"давление по памяти: убираем, когда {pressure_txt}; "
                  f"крупные демоны (≥ {cfg.get('KILL_LARGE_DAEMON_MB')} МБ) — "
                  f"всегда")
-    costs = ", ".join(f"{labels.get(name, name)} "
+    costs = ", ".join(f"{kind_label(labels, name)} "
                       f"{spec.recreate_cost_seconds:.0f} с"
                       for name, spec in target_set.specs_by_name().items()
                       if spec.recreate_cost_seconds)
@@ -292,7 +342,7 @@ def format_explain(cfg: dict[str, Any],
     lines.append("")
     lines.append("Цели:")
     for name, spec in target_set.specs_by_name().items():
-        lines.append(f"  {labels.get(name, name)} ({name}):")
+        lines.append(f"  {kind_label(labels, name)} ({name}):")
         match = []
         if spec.match_cmdline:
             match.append(f"cmdline «{spec.match_cmdline}»")
@@ -321,9 +371,38 @@ def format_explain(cfg: dict[str, Any],
                       else "НЕ пересоздаваемый (убивать нельзя)")
         if spec.protects:
             safety.append("защищает: "
-                          + ", ".join(labels.get(k, k) for k in spec.protects))
+                          + ", ".join(kind_label(labels, k) for k in spec.protects))
         lines.append("    безопасность: " + ", ".join(safety))
     return "\n".join(lines)
+
+
+def _kind_verdicts(by_kind: dict[str, Any], min_events: int,
+                   max_rate: float) -> list[dict[str, Any]]:
+    """Вердикт по каждому виду: у вида своя цена ошибки.
+
+    Общая цифра смешала бы «ложное срабатывание на 40-секундном Gradle» с
+    «ложным срабатыванием на 2-секундном демоне», поэтому вердикт выносится
+    по видам. Вид, у которого событий мало, своего вердикта не получает
+    (данных недостаточно).
+    """
+    verdicts: list[dict[str, Any]] = []
+    for kind, data in sorted(by_kind.items()):
+        kind_counted = int(data.get("counted", 0))
+        kind_rate = float(data.get("rate", 0.0))
+        if kind_counted < min_events:
+            kind_code = 2
+        elif kind_rate > max_rate:
+            kind_code = 1
+        else:
+            kind_code = 0
+        verdicts.append({"kind": kind, "counted": kind_counted,
+                         "reused": int(data.get("reused", 0)),
+                         "rate": kind_rate,
+                         "rate_weighted": float(data.get("rate_weighted", 0.0)),
+                         "cost_reused_seconds": float(
+                             data.get("cost_reused_seconds", 0.0)),
+                         "verdict_code": kind_code})
+    return verdicts
 
 
 def pilot_report(cfg: dict[str, Any], state: dict[str, Any],
@@ -356,23 +435,7 @@ def pilot_report(cfg: dict[str, Any], state: dict[str, Any],
     # срабатыванием на 2-секундном демоне». Вид, у которого событий мало,
     # своего вердикта не получает (данных недостаточно).
     by_kind = metric.get("by_kind") or {}
-    kind_verdicts: list[dict[str, Any]] = []
-    for kind, data in sorted(by_kind.items()):
-        kind_counted = int(data.get("counted", 0))
-        kind_rate = float(data.get("rate", 0.0))
-        if kind_counted < min_events:
-            kind_code = 2
-        elif kind_rate > max_rate:
-            kind_code = 1
-        else:
-            kind_code = 0
-        kind_verdicts.append({"kind": kind, "counted": kind_counted,
-                              "reused": int(data.get("reused", 0)),
-                              "rate": kind_rate,
-                              "rate_weighted": float(data.get("rate_weighted", 0.0)),
-                              "cost_reused_seconds": float(
-                                  data.get("cost_reused_seconds", 0.0)),
-                              "verdict_code": kind_code})
+    kind_verdicts = _kind_verdicts(by_kind, min_events, max_rate)
     judged = [v for v in kind_verdicts if v["verdict_code"] != 2]
     if not kind_verdicts and counted:
         # Метрика старого формата (без разбивки по видам) — вердикт как раньше,
@@ -455,8 +518,12 @@ def audit_report(cfg: dict[str, Any], decisions: list[Decision],
     """
     target_set = _targets(targets)
     labels = target_set.labels()
+    limits = idle_limits(cfg, target_set)
 
     def limit_of(kind: str) -> float:
+        """Порог простоя вида: у известных — из набора целей, у прочих — из конфига."""
+        if kind in limits:
+            return limits[kind]
         return idle_limit_for_kind(cfg, kind, target_set)
 
     stale = [dec for dec in decisions
@@ -464,9 +531,9 @@ def audit_report(cfg: dict[str, Any], decisions: list[Decision],
              and dec.idle_seconds > limit_of(dec.daemon.kind)]
     stale.sort(key=lambda d: -d.daemon.footprint_mb)
     total = sum(d.daemon.footprint_mb for d in stale)
-    limits = ", ".join(f"{labels.get(k, k)} {limit_of(k) / 3600:.0f} ч"
-                       for k in target_set.names())
-    lines = [f"Аудит: демоны с простоями длиннее порога ({limits})", "=" * 60]
+    limits_txt = ", ".join(f"{kind_label(labels, k)} {limit_of(k) / 3600:.0f} ч"
+                           for k in target_set.names())
+    lines = [f"Аудит: демоны с простоями длиннее порога ({limits_txt})", "=" * 60]
     if not stale:
         lines.append("  таких демонов нет — критерий приёмки выполнен (footprint = 0)")
         return "\n".join(lines), 0
@@ -510,7 +577,7 @@ def canary(daemons: list[Any], decisions: list[Decision],
         if read_proc_stat(pid) is None:
             continue  # процесс успел умереть — не сбой детектора
         return (f"ВНИМАНИЕ: кандидатов 0, но есть живой процесс цели "
-                f"«{labels.get(spec.name, spec.name)}» (pid {pid}) — "
+                f"«{kind_label(labels, spec.name)}» (pid {pid}) — "
                 f"детектор её не увидел: проверьте match_cmdline и формат лога")
     return None
 

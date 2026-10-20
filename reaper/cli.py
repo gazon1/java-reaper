@@ -28,6 +28,7 @@ from .report import (
     format_json,
     format_status,
     health,
+    idle_limits,
     pilot_report,
 )
 from .targets import TargetSet, load_targets
@@ -134,12 +135,21 @@ def archive_vanished(cfg: dict[str, Any], state: dict[str, Any],
     Момент, когда мы заметили пропажу демона, — это и есть его смерть
     (с точностью до интервала свипа): лог-то молчит с последней записи,
     и без этой отметки простой демона не виден вовсе.
+
+    Вместе с верхней границей (`death_observed_at`) запоминаем и нижнюю —
+    `last_seen_at`, момент последнего свипа, на котором демон ещё был жив.
+    Между ними демон умер, но когда именно — неизвестно; знать нижнюю
+    границу важно, чтобы оценивать простой честно: считать, что демон жил
+    до момента обнаружения, — это завышать его простой.
     """
     history_path = os.path.join(os.path.expanduser(str(cfg["STATE_DIR"])),
                                 "logs-history.jsonl")
     live = {d.pid for d in daemons}
     prev = state.get("daemons", {})
     seen_at = time.time() if now is None else now
+    # Момент предыдущего свипа: на нём демон ещё был виден (он был в
+    # состоянии, из которого мы его и вычитываем).
+    last_seen_at = state.get("last_sweep_at")
     archived = 0
     for pid, rec in list(prev.items()):
         if int(pid) in live:
@@ -149,7 +159,8 @@ def archive_vanished(cfg: dict[str, Any], state: dict[str, Any],
             continue
         try:
             if archive_daemon_log(str(path), rec.get("kind"), history_path,
-                                  death_observed_at=seen_at, targets=targets):
+                                  death_observed_at=seen_at, targets=targets,
+                                  last_seen_at=last_seen_at):
                 archived += 1
         except OSError:
             continue
@@ -175,10 +186,13 @@ def _say(args: argparse.Namespace, text: str) -> None:
     print(text, file=stream, flush=True)
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    mode = args.mode or ("dry-run" if args.dry_run else "kill")
+def _load_context(args: argparse.Namespace
+                  ) -> tuple[dict[str, Any], TargetSet, dict[str, Any], list[str]]:
+    """Конфиг, цели, состояние и предупреждения — всё, что нужно до решения.
 
+    Порядок важен: цели резолвятся по конфигу, а состояние читается уже
+    по готовому конфигу — иначе демоны собрались бы не по тем правилам.
+    """
     config_warnings: list[str] = []
     explicit_keys: set[str] = set()
     cfg = load_config(args.config, config_warnings, explicit_keys)
@@ -187,10 +201,45 @@ def main(argv: list[str] | None = None) -> int:
     targets = resolve_targets(load_targets(args.targets, config_warnings), cfg,
                               explicit_keys, config_warnings)
     state = load_state(cfg)
-    for w in config_warnings:
-        _say(args, f"WARNING: {w}")
+    return cfg, targets, state, config_warnings
 
-    # ---- команды только на чтение ----
+
+def _pilot_json(cfg: dict[str, Any], state: dict[str, Any], code: int) -> str:
+    """Машиночитаемый вердикт пилота — те же числа, что и в тексте.
+
+    Отдельный JSON, а не разбор текста: потребитель (агент, скрипт) должен
+    видеть ровно те величины, на которых вынесен вердикт.
+    """
+    metric = state.get("metric", {}) or {}
+    return json.dumps({
+        "schema_version": JSON_SCHEMA_VERSION,
+        "metric": metric,
+        "events": int(metric.get("events", 0)),
+        "reused": int(metric.get("reused", 0)),
+        "reuse_rate": float(metric.get("rate", 0.0)),
+        "by_kind": metric.get("by_kind", {}),
+        "pilot_started_at": state.get("pilot_started_at", 0.0),
+        "freed_mb": state.get("freed_mb", 0),
+        "would_free_mb": state.get("would_free_mb", 0),
+        "stale_peer_events": state.get("stale_peer_events", 0),
+        "stale_peer_daemons": state.get("stale_peer_daemons", {}),
+        "criterion": {
+            "max_reuse_rate": float(cfg.get("PILOT_MAX_REUSE_RATE",
+                                            PILOT_MAX_REUSE_RATE)),
+            "min_events": int(cfg.get("PILOT_MIN_EVENTS",
+                                      PILOT_MIN_EVENTS))},
+        "verdict_code": code,
+    }, ensure_ascii=False, indent=1, sort_keys=True)
+
+
+def _run_readonly(args: argparse.Namespace, cfg: dict[str, Any],
+                  targets: TargetSet, state: dict[str, Any]) -> int | None:
+    """Команды, которые только читают состояние.
+
+    Их выполняем до блокировки и свипа: посмотреть, что рейпер наделал,
+    должно быть можно и тогда, когда свип уже идёт, а молчащий таймер не
+    должен мешать диагностике. None — такой команды не было.
+    """
     if args.explain:
         print(format_explain(cfg, targets), flush=True)
         return 0
@@ -198,26 +247,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.pilot:
         text, code = pilot_report(cfg, state)
         if args.json:
-            metric = state.get("metric", {}) or {}
-            print(json.dumps({
-                "schema_version": JSON_SCHEMA_VERSION,
-                "metric": metric,
-                "events": int(metric.get("events", 0)),
-                "reused": int(metric.get("reused", 0)),
-                "reuse_rate": float(metric.get("rate", 0.0)),
-                "by_kind": metric.get("by_kind", {}),
-                "pilot_started_at": state.get("pilot_started_at", 0.0),
-                "freed_mb": state.get("freed_mb", 0),
-                "would_free_mb": state.get("would_free_mb", 0),
-                "stale_peer_events": state.get("stale_peer_events", 0),
-                "stale_peer_daemons": state.get("stale_peer_daemons", {}),
-                "criterion": {
-                    "max_reuse_rate": float(cfg.get("PILOT_MAX_REUSE_RATE",
-                                                    PILOT_MAX_REUSE_RATE)),
-                    "min_events": int(cfg.get("PILOT_MIN_EVENTS",
-                                              PILOT_MIN_EVENTS))},
-                "verdict_code": code,
-            }, ensure_ascii=False, indent=1, sort_keys=True), flush=True)
+            print(_pilot_json(cfg, state, code), flush=True)
         else:
             print(text, flush=True)
         return code
@@ -226,81 +256,179 @@ def main(argv: list[str] | None = None) -> int:
         text, code = health(cfg, state)
         print(text, flush=True)
         return code
+    return None
 
-    # ---- аварийный тормоз ----
+
+def _emergency_brake(args: argparse.Namespace, cfg: dict[str, Any]) -> bool:
+    """Аварийный тормоз: файл-флаг отключения рейпера.
+
+    Проверяем раньше всего остального: выключенный рейпер не должен ни
+    блокировку брать, ни состояние трогать.
+    """
     flag = disabled_flag(cfg)
-    if os.path.exists(flag):
-        _say(args, f"java-reaper: отключён флагом {flag} — ничего не делаю")
-        return 0
+    if not os.path.exists(flag):
+        return False
+    _say(args, f"java-reaper: отключён флагом {flag} — ничего не делаю")
+    return True
 
+
+def _acquire_lock(cfg: dict[str, Any]):
+    """Единственный владелец состояния: flock исключает наложение прогонов.
+
+    Возвращает открытый дескриптор — его надо держать живым до конца
+    прогона, иначе блокировка снимется сама. None — прогон уже идёт.
+    """
     os.makedirs(os.path.expanduser(str(cfg["STATE_DIR"])), exist_ok=True)
-
-    # Единственный владелец состояния: flock исключает наложение прогонов.
     lock_path = os.path.abspath(os.path.expanduser(str(cfg["LOCK_PATH"])))
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     lock_fh = open(lock_path, "w")
     try:
         fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        _say(args, "java-reaper: другой прогон уже идёт — выхожу")
-        return 0
+        lock_fh.close()
+        return None
+    return lock_fh
 
-    now = time.time()
+
+def _reset_metric_if_rules_changed(args: argparse.Namespace,
+                                   cfg: dict[str, Any], state: dict[str, Any],
+                                   targets: TargetSet) -> None:
+    """Сброс метрики пилота, если правила изменились.
+
+    Метрика, набранная по старым порогам, измеряет другое — её надо
+    обнулить. Но по возможности по одному виду: по остальным она
+    остаётся честной.
+    """
     if sync_rules_version(state):
         # Правила изменились: метрика пилота, набранная по старым порогам,
         # измеряет другое — сбрасываем её ДО свипа, чтобы события этого
         # свипа уже записывались по новым правилам.
         _say(args, f"java-reaper: правила изменились (версия {RULES_VERSION}) — "
                    f"метрика пилота сброшена")
+        return
+    # Версия кода та же, но правила конкретной цели могли измениться
+    # (порог в targets.yaml). Тогда сбрасывается метрика ТОЛЬКО по этому
+    # виду: по остальным она остаётся честной.
+    changed = sync_kind_signatures(state, targets, cfg)
+    if changed:
+        _say(args, "java-reaper: правила изменились для вида "
+                   + ", ".join(changed)
+                   + " — метрика по нему перезапущена, по остальным сохранена")
+
+
+def _print_status(args: argparse.Namespace, decisions: list[Decision],
+                  state: dict[str, Any], cfg: dict[str, Any], now: float,
+                  targets: TargetSet) -> None:
+    """Таблица демонов с решениями (или тот же список в JSON)."""
+    print(format_json(decisions, state, cfg, now=now, targets=targets)
+          if args.json
+          else format_status(decisions, state, cfg, targets), flush=True)
+
+
+def _audit_json(cfg: dict[str, Any], decisions: list[Decision],
+                targets: TargetSet, code: int) -> str:
+    """Машиночитаемый аудит — те же демоны, что и в текстовом отчёте."""
+    limits = idle_limits(cfg, targets)
+    stale = [d for d in decisions
+             if d.idle_seconds is not None
+             and d.idle_seconds > limits.get(
+                 d.daemon.kind,
+                 idle_limit_for_kind(cfg, d.daemon.kind, targets))]
+    return json.dumps({
+        "schema_version": JSON_SCHEMA_VERSION,
+        "idle_limit_seconds": limits,
+        "stale_daemons": [
+            {"pid": d.daemon.pid, "kind": d.daemon.kind,
+             "footprint_mb": d.daemon.footprint_mb,
+             "idle_seconds": d.idle_seconds, "reason": d.reason}
+            for d in stale],
+        "total_footprint_mb": sum(d.daemon.footprint_mb for d in stale),
+        "verdict_code": code,
+    }, ensure_ascii=False, indent=1, sort_keys=True)
+
+
+def _print_audit(args: argparse.Namespace, decisions: list[Decision],
+                 state: dict[str, Any], cfg: dict[str, Any],
+                 targets: TargetSet) -> None:
+    """Аудит приёмки: демоны с простоями длиннее порога."""
+    text, code = audit_report(cfg, decisions, state, targets)
+    if args.json:
+        print(_audit_json(cfg, decisions, targets, code), flush=True)
     else:
-        # Версия кода та же, но правила конкретной цели могли измениться
-        # (порог в targets.yaml). Тогда сбрасывается метрика ТОЛЬКО по этому
-        # виду: по остальным она остаётся честной.
-        changed = sync_kind_signatures(state, targets, cfg)
-        if changed:
-            _say(args, "java-reaper: правила изменились для вида "
-                       + ", ".join(changed)
-                       + " — метрика по нему перезапущена, по остальным сохранена")
-    daemons, decisions = _sweep(cfg, state, now, targets)
+        print(text, flush=True)
 
-    if args.status or args.audit:
-        # --status/--audit — только чтение: состояние не трогаем.
-        if args.audit:
-            text, code = audit_report(cfg, decisions, state, targets)
-            if args.json:
-                limits = {k: idle_limit_for_kind(cfg, k, targets)
-                          for k in targets.specs_by_name()}
-                stale = [d for d in decisions
-                         if d.idle_seconds is not None
-                         and d.idle_seconds > limits.get(
-                             d.daemon.kind,
-                             idle_limit_for_kind(cfg, d.daemon.kind, targets))]
-                print(json.dumps({
-                    "schema_version": JSON_SCHEMA_VERSION,
-                    "idle_limit_seconds": limits,
-                    "stale_daemons": [
-                        {"pid": d.daemon.pid, "kind": d.daemon.kind,
-                         "footprint_mb": d.daemon.footprint_mb,
-                         "idle_seconds": d.idle_seconds, "reason": d.reason}
-                        for d in stale],
-                    "total_footprint_mb": sum(d.daemon.footprint_mb for d in stale),
-                    "verdict_code": code,
-                }, ensure_ascii=False, indent=1, sort_keys=True), flush=True)
-            else:
-                print(text, flush=True)
-        else:
-            print(format_json(decisions, state, cfg, now=now, targets=targets)
-                  if args.json
-                  else format_status(decisions, state, cfg, targets), flush=True)
-        warn = canary(daemons, decisions, targets)
-        if warn:
-            _say(args, "WARNING: " + warn)
-        return 0
 
-    # ---- рабочий свип ----
+def _print_sweep_result(args: argparse.Namespace, decisions: list[Decision],
+                        state: dict[str, Any], cfg: dict[str, Any],
+                        report: list[dict[str, Any]], now: float,
+                        targets: TargetSet, daemons: list[Any]) -> None:
+    """Вывод результата свипа и предупреждение о слепом детекторе."""
+    print(format_json(decisions, state, cfg, report, now, targets=targets)
+          if args.json
+          else format_status(decisions, state, cfg, targets), flush=True)
+    warn = canary(daemons, decisions, targets)
+    if warn:
+        _say(args, "WARNING: " + warn)
+
+
+def _save_sweep_state(cfg: dict[str, Any], state: dict[str, Any],
+                      decisions: list[Decision], now: float,
+                      report: list[dict[str, Any]],
+                      trimmed_pids: set[int]) -> int:
+    """Запись состояния по итогам свипа.
+
+    Сначала наблюдения, потом метрика и журнал: метрика считается по
+    тому, что действительно сделали, а не по предположению.
+    """
+    write_state(cfg, state, decisions, now, trimmed_pids)
+    update_metric(state, decisions, now, cfg, report)
+    note_stale_peers(state, decisions)
+    append_sweep(cfg, sweep_record(decisions, now, cfg,
+                                   mem_available_mb=state.get("mem_available_mb")))
+    freed = record_freed(state, report)
+    state["last_sweep_at"] = now
+    state["last_sweep_ok"] = True
+    if not state.get("pilot_started_at"):
+        state["pilot_started_at"] = now
+    save_state(cfg, state)
+    return freed
+
+
+def _log_actions(args: argparse.Namespace, cfg: dict[str, Any],
+                 report: list[dict[str, Any]],
+                 decisions: list[Decision]) -> None:
+    """Журнал действий: что сделали с каждым демоном.
+
+    Отдельные строки, а не часть отчёта: с --json stdout должен остаться
+    чистым JSON, поэтому действия уходят в stderr.
+    """
+    for item in report:
+        _say(args, f"java-reaper: pid={item['pid']} {item['action']} — "
+                   f"{item['reason']}")
+        if item.get("action") in ("SIGTERM", "SIGKILL"):
+            append_kill(cfg, {
+                "pid": item["pid"],
+                "action": item["action"],
+                "reason": item["reason"],
+                "footprint_mb": item.get("footprint_mb", 0),
+                "kind": next((d.daemon.kind for d in decisions
+                              if d.daemon.pid == item["pid"]), "?"),
+            })
+
+
+def _run_sweep(args: argparse.Namespace, cfg: dict[str, Any],
+               state: dict[str, Any], daemons: list[Any],
+               decisions: list[Decision], now: float, mode: str,
+               targets: TargetSet) -> int:
+    """Рабочий свип: убрать застаревшие демоны и записать результат.
+
+    Порядок важен: сначала решение, потом вывод, потом состояние — по
+    прерванному прогону должно быть видно, что уже решено, а не только
+    что записано.
+    """
     # Демоны, которых больше нет, архивируем в историю: их логи в /tmp
     # исчезают при перезагрузке, и без сводки они исчезнут навсегда.
-    archived = archive_vanished(cfg, state, daemons, now, targets)
+    archive_vanished(cfg, state, daemons, now, targets)
 
     report = execute(decisions, state, now, cfg, dry_run=(mode == "dry-run"))
     trim_report = trim_idle_logs(decisions, cfg, now, targets)
@@ -316,45 +444,64 @@ def main(argv: list[str] | None = None) -> int:
     warnings = degradation_warnings(state, cfg, measured, total)
     state["degradation"] = warnings
 
-    print(format_json(decisions, state, cfg, report, now, targets=targets)
-          if args.json
-          else format_status(decisions, state, cfg, targets), flush=True)
-    warn = canary(daemons, decisions, targets)
-    if warn:
-        _say(args, "WARNING: " + warn)
+    _print_sweep_result(args, decisions, state, cfg, report, now, targets,
+                         daemons)
     for w in warnings:
         _say(args, f"WARNING: {w}")
 
-    write_state(cfg, state, decisions, now, trimmed_pids)
-    update_metric(state, decisions, now, cfg, report)
-    note_stale_peers(state, decisions)
-    append_sweep(cfg, sweep_record(decisions, now, cfg,
-                                   mem_available_mb=state.get("mem_available_mb")))
-    freed = record_freed(state, report)
-    state["last_sweep_at"] = now
-    state["last_sweep_ok"] = True
-    if not state.get("pilot_started_at"):
-        state["pilot_started_at"] = now
-    save_state(cfg, state)
-
-    for item in report:
-        _say(args, f"java-reaper: pid={item['pid']} {item['action']} — "
-                   f"{item['reason']}")
-        if item.get("action") in ("SIGTERM", "SIGKILL"):
-            append_kill(cfg, {
-                "pid": item["pid"],
-                "action": item["action"],
-                "reason": item["reason"],
-                "footprint_mb": item.get("footprint_mb", 0),
-                "kind": next((d.daemon.kind for d in decisions
-                              if d.daemon.pid == item["pid"]), "?"),
-            })
+    freed = _save_sweep_state(cfg, state, decisions, now, report, trimmed_pids)
+    _log_actions(args, cfg, report, decisions)
     killed = [i for i in report if i["action"] in ("SIGTERM", "SIGKILL")]
     _say(args, f"java-reaper: режим {mode}, демонов {len(decisions)}, "
                f"сигналов отправлено {len(killed)}, "
                f"кандидатов на убийство {sum(1 for d in decisions if d.kill)}"
                + (f", освобождено {freed} МБ" if freed else ""))
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Точка входа: разбор аргументов и выбор режима.
+
+    В main остаётся только маршрутизация — что именно делает команда,
+    живёт в отдельных функциях. Иначе правка любого отчёта задевала бы
+    разбор аргументов, и diff переставал бы что-то объяснять.
+    """
+    args = build_parser().parse_args(argv)
+    mode = args.mode or ("dry-run" if args.dry_run else "kill")
+    cfg, targets, state, config_warnings = _load_context(args)
+    for w in config_warnings:
+        _say(args, f"WARNING: {w}")
+
+    code = _run_readonly(args, cfg, targets, state)
+    if code is not None:
+        return code
+
+    if _emergency_brake(args, cfg):
+        return 0
+
+    # Дескриптор держим открытым до конца прогона: пока он жив, жив
+    # и flock, а второй прогон не начнётся.
+    lock_fh = _acquire_lock(cfg)
+    if lock_fh is None:
+        _say(args, "java-reaper: другой прогон уже идёт — выхожу")
+        return 0
+
+    now = time.time()
+    _reset_metric_if_rules_changed(args, cfg, state, targets)
+    daemons, decisions = _sweep(cfg, state, now, targets)
+
+    if args.status or args.audit:
+        # --status/--audit — только чтение: состояние не трогаем.
+        if args.audit:
+            _print_audit(args, decisions, state, cfg, targets)
+        else:
+            _print_status(args, decisions, state, cfg, now, targets)
+        warn = canary(daemons, decisions, targets)
+        if warn:
+            _say(args, "WARNING: " + warn)
+        return 0
+
+    return _run_sweep(args, cfg, state, daemons, decisions, now, mode, targets)
 
 
 if __name__ == "__main__":
