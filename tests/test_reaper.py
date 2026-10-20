@@ -462,6 +462,84 @@ class TestMetric(unittest.TestCase):
         self.assertEqual(metric["reused"], 1)
         self.assertAlmostEqual(metric["rate"], 0.5)
 
+    # ---- целостность метрики (исходы событий) ----
+
+    def test_observation_gap_makes_event_unknown(self):
+        """Разрыв наблюдения (машина выключена) → событие «unknown».
+
+        Иначе демон, которого мы не видели, засчитывался бы как «не
+        понадобился снова» — и доля ложных срабатываний была бы занижена,
+        а вердикт по пилоту — ложнооптимистичен.
+        """
+        state = {
+            "last_sweep_at": NOW - 20 * HOUR,   # нас не было 20 ч
+            "would_kill": [{"pid": 1, "at": NOW - 7 * HOUR, "reused": False,
+                            "final": False, "starttime": 1, "mb": 100}],
+        }
+        metric = reaper.update_metric(state, [], NOW, self.cfg)
+        self.assertEqual(metric["unknown"], 1)
+        self.assertEqual(metric["counted"], 0)
+        self.assertEqual(metric["rate"], 0.0)
+        self.assertEqual(state["would_kill"][0]["outcome"], "unknown")
+
+    def test_continuous_observation_keeps_event_countable(self):
+        state = {
+            "last_sweep_at": NOW - 5 * 60,       # свипы шли как обычно
+            "would_kill": [{"pid": 1, "at": NOW - 7 * HOUR, "reused": False,
+                            "final": False, "starttime": 1, "mb": 100}],
+        }
+        metric = reaper.update_metric(state, [], NOW, self.cfg)
+        self.assertEqual(metric["not_reused"], 1)
+        self.assertEqual(metric["counted"], 1)
+        self.assertEqual(metric["unknown"], 0)
+
+    def test_killed_daemon_is_not_counted_as_not_reused(self):
+        """В kill-режиме демон убит — «понадобился снова» мы не увидим.
+
+        Событие рождается в том же свипе, где демон убит, и закрывается
+        как «killed» — вне знаменателя.
+        """
+        d = make_daemon(last_build_end=NOW - 10 * HOUR)
+        decisions = [reaper.Decision(d, True, "простой")]
+        state = {}
+        report = [{"pid": d.pid, "action": "SIGTERM", "reason": "простой"}]
+        metric = reaper.update_metric(state, decisions, NOW, self.cfg, report)
+        self.assertTrue(state["would_kill"][0]["killed"])
+        # Через окно событие закрывается, но в знаменатель не идёт.
+        later = NOW + 7 * HOUR
+        metric = reaper.update_metric(state, [], later, self.cfg)
+        self.assertEqual(metric["killed"], 1)
+        self.assertEqual(metric["counted"], 0)
+        self.assertEqual(metric["not_reused"], 0)
+        self.assertEqual(state["would_kill"][0]["outcome"], "killed")
+
+    def test_events_come_from_execution_report(self):
+        """Считаются те, кого исполнитель действительно тронет."""
+        d = make_daemon(last_build_end=NOW - 10 * HOUR)
+        decisions = [reaper.Decision(d, True, "простой")]
+        state = {}
+        report = [{"pid": d.pid, "action": "skipped",
+                   "reason": "превышен лимит убийств за свип"}]
+        metric = reaper.update_metric(state, decisions, NOW, self.cfg, report)
+        self.assertEqual(metric["events"], 0)
+        self.assertEqual(metric["pending"], 0)
+        self.assertEqual(state["would_kill"], [])
+
+    def test_dry_run_action_creates_event(self):
+        d = make_daemon(last_build_end=NOW - 10 * HOUR)
+        decisions = [reaper.Decision(d, True, "простой")]
+        state = {}
+        report = [{"pid": d.pid, "action": "dry-run", "reason": "простой"}]
+        metric = reaper.update_metric(state, decisions, NOW, self.cfg, report)
+        self.assertEqual(metric["pending"], 1)
+
+    def test_pending_footprint_reported_separately(self):
+        d = make_daemon(last_build_end=NOW - 10 * HOUR, rss_mb=512)
+        decisions = [reaper.Decision(d, True, "простой")]
+        state = {}
+        metric = reaper.update_metric(state, decisions, NOW, self.cfg)
+        self.assertEqual(state["would_free_pending_mb"], 512)
+
 
 # --------------------------------------------------------------------------- #
 # Конфиг и состояние
@@ -587,20 +665,33 @@ class TestExecuteDryRun(unittest.TestCase):
         report = reaper.execute([reaper.Decision(d, True, "test")], {}, NOW, self.cfg, dry_run=True)
         self.assertEqual([r["action"] for r in report], ["dry-run"])
 
-    def test_kotlin_skipped_while_gradle_builds(self):
-        gradle_pid = os.getpid()
-        kotlin_pid = os.getppid()
-        st_g = reaper.read_proc_stat(gradle_pid)
-        st_k = reaper.read_proc_stat(kotlin_pid)
-        g = make_daemon(pid=gradle_pid, kind="gradle", starttime=st_g["starttime"],
+    def test_kotlin_protected_while_gradle_builds(self):
+        """Пока идёт сборка Gradle, Kotlin-демоны не трогаем.
+
+        Защита живёт в таблице правил (правило «gradle-building»), а не в
+        исполнителе: раньше исполнитель резал кандидатов в последний
+        момент, а отчёт и метрика считали их убитыми.
+        """
+        g = make_daemon(pid=1001, kind="gradle",
                         last_build_start=NOW - 60, last_build_end=None)
-        k = make_daemon(pid=kotlin_pid, kind="kotlin", starttime=st_k["starttime"],
-                        log_mtime=NOW - 5 * HOUR)
-        decisions = [reaper.Decision(g, False, "busy"), reaper.Decision(k, True, "idle")]
-        report = reaper.execute(decisions, {}, NOW, self.cfg, dry_run=True)
-        skipped = [r for r in report if r["action"] == "skipped"]
-        self.assertEqual(len(skipped), 1)
-        self.assertEqual(skipped[0]["pid"], kotlin_pid)
+        k = make_daemon(pid=1002, kind="kotlin", log_mtime=NOW - 5 * HOUR)
+        state = {"daemons": {
+            "1001": {"first_seen": NOW - 10 * HOUR, "cpu_ticks": 1000},
+            "1002": {"first_seen": NOW - 10 * HOUR, "cpu_ticks": 1000},
+        }}
+        decisions = {d.daemon.pid: d
+                     for d in reaper.classify([g, k], state, NOW, self.cfg)}
+        self.assertFalse(decisions[1002].kill)
+        self.assertEqual(decisions[1002].rule, "gradle-building")
+        self.assertIn("сборка Gradle", decisions[1002].reason)
+
+    def test_kotlin_killed_when_no_gradle_build(self):
+        """Без сборки Gradle Kotlin-демон простоя выводится под удар."""
+        k = make_daemon(pid=1002, kind="kotlin", log_mtime=NOW - 5 * HOUR)
+        state = {"daemons": {"1002": {"first_seen": NOW - 10 * HOUR,
+                                      "cpu_ticks": 1000}}}
+        decisions = reaper.classify([k], state, NOW, self.cfg)
+        self.assertTrue(decisions[0].kill)
 
     def test_no_candidates_no_report(self):
         report = reaper.execute([], {}, NOW, self.cfg, dry_run=True)
@@ -833,3 +924,89 @@ class TestKindSummary(unittest.TestCase):
         self.assertIn("kinds", payload)
         self.assertEqual(payload["kinds"]["gradle"]["count"], 1)
         self.assertEqual(payload["config"]["KOTLIN_IDLE_SECONDS"], 7200)
+
+
+# --------------------------------------------------------------------------- #
+# Наблюдаемость правил и детекция деградации (блок 2)
+# --------------------------------------------------------------------------- #
+
+class TestObservability(unittest.TestCase):
+    """Видно, какие правила работают и не слеп ли рейпер."""
+
+    cfg = dict(reaper.DEFAULTS)
+
+    def test_rule_hits_counted(self):
+        d1 = make_daemon(pid=1, last_build_end=NOW - 10 * HOUR)
+        d2 = make_daemon(pid=2, last_build_end=NOW - 10 * HOUR)
+        state = {"daemons": {
+            "1": {"first_seen": NOW - 10 * HOUR, "cpu_ticks": 1000},
+            "2": {"first_seen": NOW - 10 * HOUR, "cpu_ticks": 1000},
+        }}
+        decisions = reaper.classify([d1, d2], state, NOW, self.cfg)
+        hits = reaper.note_rule_hits(state, decisions)
+        self.assertEqual(hits.get("kill"), 2)
+        self.assertEqual(state["rule_hits_last"], hits)
+        self.assertEqual(state["rule_hits"]["kill"], 2)
+
+    def test_rule_hits_accumulate(self):
+        d = make_daemon(pid=1, last_build_end=NOW - 10 * HOUR)
+        state = {"daemons": {"1": {"first_seen": NOW - 10 * HOUR,
+                                   "cpu_ticks": 1000}}}
+        decisions = reaper.classify([d], state, NOW, self.cfg)
+        reaper.note_rule_hits(state, decisions)
+        reaper.note_rule_hits(state, decisions)
+        self.assertEqual(state["rule_hits"]["kill"], 2)
+
+    def test_degradation_when_most_daemons_unmeasured(self):
+        """Если почти все демоны под «не знаем» — детекция деградировала."""
+        d = make_daemon(pid=1, log_ok=False)      # лог не найден → не измерен
+        state = {"daemons": {"1": {"first_seen": NOW - 10 * HOUR,
+                                   "cpu_ticks": 1000}}}
+        decisions = reaper.classify([d], state, NOW, self.cfg)
+        measured, total = reaper.measure_coverage(state, decisions, self.cfg)
+        self.assertEqual(total, 1)
+        self.assertEqual(measured, 0)
+        warnings = reaper.degradation_warnings(state, self.cfg, measured, total)
+        self.assertTrue(warnings)
+        self.assertIn("деградировала", warnings[0])
+
+    def test_no_degradation_when_all_measured(self):
+        d = make_daemon(pid=1, last_build_end=NOW - 10 * HOUR)
+        state = {"daemons": {"1": {"first_seen": NOW - 10 * HOUR,
+                                   "cpu_ticks": 1000}}}
+        decisions = reaper.classify([d], state, NOW, self.cfg)
+        measured, total = reaper.measure_coverage(state, decisions, self.cfg)
+        self.assertEqual(measured, 1)
+        self.assertEqual(reaper.degradation_warnings(state, self.cfg,
+                                                    measured, total), [])
+
+    def test_degradation_on_sudden_drop(self):
+        """Число измеренных демонов упало больше чем вдвое."""
+        state = {"measured_count": 8, "measured_prev": 8}
+        warnings = reaper.degradation_warnings(state, self.cfg, measured=3,
+                                                total=3)
+        self.assertTrue(any("упало" in w for w in warnings))
+
+    def test_health_reports_degradation(self):
+        state = {"last_sweep_at": NOW, "metric": {},
+                 "degradation": ["измерить удалось лишь 0 из 5 демонов"]}
+        text, code = reaper.health(self.cfg, state)
+        self.assertEqual(code, 1)
+        self.assertIn("деградация", text)
+
+    def test_status_shows_rule_hits(self):
+        d = make_daemon(pid=1, last_build_end=NOW - 10 * HOUR)
+        state = {"metric": {}, "rule_hits_last": {"kill": 1}}
+        text = reaper.format_status([reaper.Decision(d, True, "простой")],
+                                     state, self.cfg)
+        self.assertIn("правила за последний свип", text)
+        self.assertIn("kill", text)
+
+    def test_status_shows_unknown_and_killed(self):
+        d = make_daemon(pid=1, last_build_end=NOW - 10 * HOUR)
+        state = {"metric": {"events": 3, "counted": 1, "reused": 0,
+                            "unknown": 1, "killed": 1, "pending": 2,
+                            "rate": 0.0}}
+        text = reaper.format_status([reaper.Decision(d, True, "простой")],
+                                     state, self.cfg)
+        self.assertIn("вне знаменателя", text)

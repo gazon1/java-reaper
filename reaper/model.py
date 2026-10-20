@@ -118,6 +118,10 @@ class Decision:
     protected: bool = False
     protectors: list[Protector] = field(default_factory=list)
     stale_peers: list[Protector] = field(default_factory=list)
+    # Имя правила, которое сработало («not-idle», «stuck», «kill»…).
+    # Нужно для наблюдаемости: видно, какие правила вообще работают,
+    # и деградацию детекции («все демоны ушли в unknown-history»).
+    rule: str | None = None
 
     def __post_init__(self) -> None:
         # Совместимость: Decision(d, True, "…") — как в старом монолите.

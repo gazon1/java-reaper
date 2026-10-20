@@ -30,7 +30,10 @@ from .report import (
 )
 from .state import (
     append_kill,
+    degradation_warnings,
     load_state,
+    measure_coverage,
+    note_rule_hits,
     note_stale_peers,
     record_freed,
     save_state,
@@ -222,14 +225,23 @@ def main(argv: list[str] | None = None) -> int:
     report = report + trim_report
     trimmed_pids = {int(i["pid"]) for i in trim_report if i.get("action") == "trim"}
 
+    # Наблюдаемость: какие правила сработали и не деградировала ли детекция.
+    # Считаем ДО вывода — отчёт должен показывать свежие числа.
+    note_rule_hits(state, decisions)
+    measured, total = measure_coverage(state, decisions, cfg)
+    warnings = degradation_warnings(state, cfg, measured, total)
+    state["degradation"] = warnings
+
     print(format_json(decisions, state, cfg, report, now) if args.json
           else format_status(decisions, state, cfg), flush=True)
     warn = canary(daemons, decisions)
     if warn:
         print("WARNING: " + warn, flush=True)
+    for w in warnings:
+        print(f"WARNING: {w}", flush=True)
 
     write_state(cfg, state, decisions, now, trimmed_pids)
-    update_metric(state, decisions, now, cfg)
+    update_metric(state, decisions, now, cfg, report)
     note_stale_peers(state, decisions)
     freed = record_freed(state, report)
     state["last_sweep_at"] = now

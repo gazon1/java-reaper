@@ -49,6 +49,10 @@ class Signals:
     stuck_build: bool = False
     # Сколько секунд прошло с момента отмены сборки.
     stuck_age: float = 0.0
+    # Идёт ли где-то сборка Gradle. Это КОНТЕКСТ всего набора демонов, а не
+    # признак самого демона: пока идёт сборка, компилятор нужен, и убивать
+    # Kotlin-демоны нельзя (иначе сборка упадёт посреди компиляции).
+    gradle_building: bool = False
 
 
 @dataclass(frozen=True)
@@ -119,6 +123,16 @@ def default_policy(cfg: dict) -> list[Rule]:
 
     def not_idle(s: Signals) -> bool:
         return s.age < s.idle_limit
+
+    def gradle_building(s: Signals) -> bool:
+        """Защита Kotlin-демонов, пока идёт сборка Gradle.
+
+        Правило живёт в таблице, а не в исполнителе: тогда решение,
+        отчёт и метрика говорят одно и то же (раньше исполнитель резал
+        кандидатов в последний момент, а отчёт и метрика считали их
+        «убитыми»).
+        """
+        return s.gradle_building and s.daemon.kind == "kotlin"
 
     def always(s: Signals) -> bool:
         return True
@@ -192,6 +206,12 @@ def default_policy(cfg: dict) -> list[Rule]:
              "простой < порога простоя для этого класса демона",
              Action.KEEP, not_idle,
              lambda s: f"простой {s.age / 60:.0f} мин < {s.idle_limit / 60:.0f} мин"),
+        Rule("gradle-building",
+             "Идёт сборка Gradle — компилятор нужен прямо сейчас.",
+             "есть Gradle-демон со сборкой без конца",
+             Action.KEEP, gradle_building,
+             lambda s: "идёт сборка Gradle — Kotlin-демоны не трогаю",
+             protected=True),
         Rule("stuck",
              "Зависший демон: клиент отвалился во время сборки. Работать "
              "некому, и работать уже некому — Gradle такой демон не убирает "

@@ -26,7 +26,9 @@ DAEMON_FIELDS = frozenset({
 GLOBAL_FIELDS = frozenset({
     "version", "daemons", "would_kill", "metric", "freed_mb", "would_free_mb",
     "last_sweep_at", "last_sweep_ok", "pilot_started_at", "stale_peer_events",
-    "stale_peer_daemons", "rules_version",
+    "stale_peer_daemons", "rules_version", "would_free_pending_mb",
+    "rule_hits", "rule_hits_last", "measured_count", "measured_prev",
+    "degradation",
 })
 
 
@@ -77,6 +79,12 @@ def load_state(cfg: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("stale_peer_events", 0)    # сколько раз сработало «зависший клиент»
     data.setdefault("stale_peer_daemons", {})  # pid → число срабатываний
     data.setdefault("rules_version", 0)        # версия правил, по которым набрана метрика
+    data.setdefault("would_free_pending_mb", 0)   # что висит под ударом прямо сейчас
+    data.setdefault("rule_hits", {})          # сколько раз сработало каждое правило
+    data.setdefault("rule_hits_last", {})     # то же, но за последний свип
+    data.setdefault("measured_count", 0)      # сколько демонов мы смогли измерить
+    data.setdefault("measured_prev", 0)       # то же на прошлом свипе
+    data.setdefault("degradation", [])        # предупреждения о деградации
     return data
 
 
@@ -115,23 +123,87 @@ def save_state(cfg: dict[str, Any], state: dict[str, Any]) -> None:
 
 
 def update_metric(state: dict[str, Any], decisions: list[Decision], now: float,
-                  cfg: dict[str, Any]) -> dict[str, Any]:
+                  cfg: dict[str, Any],
+                  report: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Следит за судьбой «would kill»: понадобился ли демон снова в течение окна.
 
-    Событие — это уникальный PID (плюс starttime, чтобы переиспользованный PID
-    не считался тем же демоном).
+    Событие — уникальный демон (PID + starttime, чтобы переиспользованный PID
+    не считался тем же демоном). У события есть ИСХОД, и их четыре:
+
+      reused      — демон понадобился снова → ложное срабатывание;
+      not_reused  — не понадобился → верное срабатывание;
+      unknown     — мы не видели демона часть окна (наблюдение прервано:
+                    машина выключена, таймер молчал) → в знаменатель не
+                    идёт: иначе доля ложных срабатываний была бы занижена,
+                    а вердикт по пилоту — ложнооптимистичен;
+      killed      — демон реально убит (kill-режим): «понадобился снова» мы
+                    уже не увидим → тоже вне знаменателя.
+
+    В знаменатель попадают только `reused` и `not_reused` — то есть события,
+    которые мы наблюдали целиком и по которым вопрос «понадобился ли»
+    имеет честный ответ.
+
+    Источник событий — отчёт исполнителя, а не список решений: исполнитель
+    режет кандидатов (лимит за свип, прочие проверки), и то, что он не
+    выполнил, не должно попадать в метрику.
     """
     window = float(cfg["REUSE_WINDOW_SECONDS"])
     events = state.setdefault("would_kill", [])
     by_pid = {dec.daemon.pid: dec.daemon for dec in decisions}
 
+    # Разрыв наблюдения: сколько прошло с прошлого свипа. Если свипов не
+    # было (машина выключена), часть окна мы не видели.
+    last_sweep = float(state.get("last_sweep_at") or 0.0)
+    gap = (now - last_sweep) if last_sweep else None
+
+    # Кого исполнитель действительно тронет.
+    candidates: dict[int, Any] = {}
+    killed_pids: set[int] = set()
+    if report is None:
+        for dec in decisions:
+            if dec.kill:
+                candidates[dec.daemon.pid] = dec.daemon
+    else:
+        for item in report:
+            action = item.get("action")
+            pid = int(item["pid"])
+            if action == "dry-run":
+                d = by_pid.get(pid)
+                if d is not None:
+                    candidates[pid] = d
+            elif action in ("SIGTERM", "SIGKILL"):
+                killed_pids.add(pid)
+                d = by_pid.get(pid)
+                if d is not None:
+                    candidates[pid] = d
+
     for ev in events:
         if ev.get("final"):
+            # Событие, закрытое по старым правилам (или вручную), не имеет
+            # исхода — восстанавливаем его из признаков.
+            if not ev.get("outcome"):
+                if ev.get("killed"):
+                    ev["outcome"] = "killed"
+                elif float(ev.get("max_gap", 0.0)) > window:
+                    ev["outcome"] = "unknown"
+                else:
+                    ev["outcome"] = "reused" if ev.get("reused") else "not_reused"
             continue
+        # Учитываем разрыв наблюдения: событие пережило его.
+        if gap is not None:
+            ev["max_gap"] = max(float(ev.get("max_gap", 0.0)), gap)
         age = now - float(ev["at"])
         pid = int(ev["pid"])
         if age > window:
             ev["final"] = True
+            if ev.get("killed"):
+                ev["outcome"] = "killed"
+            elif float(ev.get("max_gap", 0.0)) > window:
+                ev["outcome"] = "unknown"
+            elif ev.get("reused"):
+                ev["outcome"] = "reused"
+            else:
+                ev["outcome"] = "not_reused"
             continue
         d = by_pid.get(pid)
         if d is None:
@@ -145,22 +217,56 @@ def update_metric(state: dict[str, Any], decisions: list[Decision], now: float,
 
     # новые события
     known = {int(e["pid"]) for e in events}
-    for dec in decisions:
-        if dec.kill and dec.daemon.pid not in known:
-            events.append({"pid": dec.daemon.pid, "at": now, "reused": False,
-                           "final": False, "starttime": dec.daemon.starttime,
-                           "mb": dec.daemon.footprint_mb})
+    for pid, d in candidates.items():
+        if pid in known:
+            # Демон уже учитывается: обновляем признак «убит».
+            for ev in events:
+                if int(ev["pid"]) == pid:
+                    if pid in killed_pids:
+                        ev["killed"] = True
+            continue
+        events.append({"pid": pid, "at": now, "reused": False,
+                       "final": False, "starttime": d.starttime,
+                       "mb": d.footprint_mb, "max_gap": 0.0,
+                       "killed": pid in killed_pids})
 
     finals = [e for e in events if e.get("final")]
-    reused = sum(1 for e in finals if e.get("reused"))
+    reused = sum(1 for e in finals if e.get("outcome") == "reused")
+    not_reused = sum(1 for e in finals if e.get("outcome") == "not_reused")
+    unknown = sum(1 for e in finals if e.get("outcome") == "unknown")
+    killed = sum(1 for e in finals if e.get("outcome") == "killed")
+    countable = reused + not_reused
+    pending = [e for e in events if not e.get("final")]
     state["metric"] = {
         "events": len(finals),
+        "counted": countable,
         "reused": reused,
-        "rate": (reused / len(finals)) if finals else 0.0,
-        "pending": len([e for e in events if not e.get("final")]),
+        "not_reused": not_reused,
+        "unknown": unknown,
+        "killed": killed,
+        "rate": (reused / countable) if countable else 0.0,
+        "pending": len(pending),
     }
+    # «Могло бы быть освобождено»: накопленное (все события) и то, что
+    # висит под ударом прямо сейчас (незакрытые события).
     state["would_free_mb"] = sum(int(e.get("mb", 0)) for e in events)
+    state["would_free_pending_mb"] = sum(int(e.get("mb", 0)) for e in pending)
+    _trim_events(events)
     return state["metric"]
+
+
+def _trim_events(events: list[dict[str, Any]], keep: int = 100) -> None:
+    """Не даём списку событий расти бесконечно.
+
+    Завершённые события нужны только для отчётов за последний период;
+    незакрытые (pending) — терять нельзя, по ним считается пилот.
+    """
+    finals = [e for e in events if e.get("final")]
+    if len(finals) <= keep:
+        return
+    tail = finals[-keep:]
+    pending = [e for e in events if not e.get("final")]
+    events[:] = pending + tail
 
 
 def record_freed(state: dict[str, Any], report: list[dict[str, Any]]) -> int:
@@ -171,6 +277,68 @@ def record_freed(state: dict[str, Any], report: list[dict[str, Any]]) -> int:
             freed += int(item.get("footprint_mb", 0))
     state["freed_mb"] = int(state.get("freed_mb", 0)) + freed
     return freed
+
+
+# Правила, после которых демон считается «неизмеренным»: мы не знаем,
+# сколько он простаивает, и потому не можем оценить его кандидатство.
+UNMEASURED_RULES = frozenset({"no-log", "unknown-history", "no-baseline"})
+
+
+def note_rule_hits(state: dict[str, Any], decisions: list[Decision]) -> dict[str, int]:
+    """Считает, какие правила сработали.
+
+    Наблюдаемость правил: без неё деградация детекции (например, формат
+    лога изменился и все демоны ушли в «неизвестная история») выглядит
+    как обычное «нечего было убивать».
+    """
+    hits: dict[str, int] = {}
+    for dec in decisions:
+        name = dec.rule or "unknown"
+        hits[name] = hits.get(name, 0) + 1
+    total = state.setdefault("rule_hits", {})
+    for name, count in hits.items():
+        total[name] = int(total.get(name, 0)) + count
+    state["rule_hits_last"] = hits
+    return hits
+
+
+def measure_coverage(state: dict[str, Any], decisions: list[Decision],
+                     cfg: dict[str, Any]) -> tuple[int, int]:
+    """(измеренных демонов, всего демонов) и обновление счётчиков."""
+    total = len(decisions)
+    measured = sum(1 for dec in decisions
+                   if (dec.rule or "") not in UNMEASURED_RULES)
+    state["measured_prev"] = int(state.get("measured_count", 0) or 0)
+    state["measured_count"] = measured
+    return measured, total
+
+
+def degradation_warnings(state: dict[str, Any], cfg: dict[str, Any],
+                         measured: int | None = None,
+                         total: int | None = None) -> list[str]:
+    """Признаки того, что рейпер слеп и молчит.
+
+    Два сигнала:
+      * измерить удалось меньше половины демонов — почти все под защитой
+        «не знаем», то есть ни один не может быть оценён;
+      * число измеренных демонов упало больше чем вдвое относительно
+        прошлого свипа — детектор стал видеть меньше.
+    """
+    out: list[str] = []
+    if measured is None:
+        measured = int(state.get("measured_count", 0) or 0)
+    if total is None:
+        total = 0
+    ratio = float(cfg.get("DEGRADATION_MIN_MEASURED_RATIO", 0.5))
+    if total > 0 and measured / total < ratio:
+        out.append(f"измерить удалось лишь {measured} из {total} демонов "
+                   f"(< {100 * ratio:.0f} %): детекция, скорее всего, деградировала")
+    prev = int(state.get("measured_prev", 0) or 0)
+    count_ratio = float(cfg.get("DEGRADATION_MIN_COUNT_RATIO", 0.5))
+    if prev > 0 and measured < prev * count_ratio:
+        out.append(f"число измеренных демонов упало: {prev} → {measured} "
+                   f"(прошлый свип)")
+    return out
 
 
 def note_stale_peers(state: dict[str, Any], decisions: list[Decision]) -> int:

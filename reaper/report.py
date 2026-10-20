@@ -85,9 +85,22 @@ def format_status(decisions: list[Decision], state: dict[str, Any],
                      f" ({len(kill)} шт){limit_txt}")
     metric = state.get("metric", {})
     if metric:
-        lines.append(f"метрика dry-run: событий {metric.get('events', 0)}, "
+        counted = int(metric.get("counted", metric.get("events", 0)))
+        lines.append(f"метрика dry-run: наблюдённых событий {counted}, "
                      f"повторно нужны {metric.get('reused', 0)} "
                      f"({100 * metric.get('rate', 0):.0f} %), в ожидании {metric.get('pending', 0)}")
+        unknown = int(metric.get("unknown", 0))
+        killed = int(metric.get("killed", 0))
+        if unknown or killed:
+            lines.append(f"  не засчитано: наблюдение прерывалось {unknown}, "
+                         f"демон убит {killed} — вне знаменателя")
+    hits = state.get("rule_hits_last") or {}
+    if hits:
+        top = ", ".join(f"{name} ×{count}" for name, count in
+                        sorted(hits.items(), key=lambda kv: -kv[1]))
+        lines.append(f"правила за последний свип: {top}")
+    for w in state.get("degradation", []) or []:
+        lines.append(f"ВНИМАНИЕ: {w}")
     freed = int(state.get("freed_mb", 0))
     would = int(state.get("would_free_mb", 0))
     if freed or would:
@@ -154,8 +167,13 @@ def format_json(decisions: list[Decision], state: dict[str, Any],
         "kinds": kind_summary(decisions, cfg),
         "daemons": [decision_to_dict(d) for d in decisions],
         "metric": state.get("metric", {}),
+        "rule_hits": state.get("rule_hits", {}),
+        "rule_hits_last": state.get("rule_hits_last", {}),
+        "measured_count": state.get("measured_count", 0),
+        "degradation": state.get("degradation", []),
         "freed_mb": state.get("freed_mb", 0),
         "would_free_mb": state.get("would_free_mb", 0),
+        "would_free_pending_mb": state.get("would_free_pending_mb", 0),
         "last_sweep_at": state.get("last_sweep_at", 0.0),
         "pilot_started_at": state.get("pilot_started_at", 0.0),
         "stale_peer_events": state.get("stale_peer_events", 0),
@@ -203,8 +221,14 @@ def pilot_report(cfg: dict[str, Any], state: dict[str, Any],
     """
     now = time.time() if now is None else now
     metric = state.get("metric", {}) or {}
-    events = int(metric.get("events", 0))
+    # В знаменатель попадают только события, которые мы наблюдали целиком:
+    # «unknown» (наблюдение прерывалось) и «killed» (демон убит) вопроса
+    # «понадобился ли» не имеют.
+    counted = int(metric.get("counted", metric.get("events", 0)))
     reused = int(metric.get("reused", 0))
+    not_reused = int(metric.get("not_reused", 0))
+    unknown = int(metric.get("unknown", 0))
+    killed = int(metric.get("killed", 0))
     pending = int(metric.get("pending", 0))
     rate = float(metric.get("rate", 0.0))
     started = float(state.get("pilot_started_at", 0.0))
@@ -212,9 +236,9 @@ def pilot_report(cfg: dict[str, Any], state: dict[str, Any],
     min_events = int(cfg.get("PILOT_MIN_EVENTS", PILOT_MIN_EVENTS))
     max_rate = float(cfg.get("PILOT_MAX_REUSE_RATE", PILOT_MAX_REUSE_RATE))
 
-    if events < min_events:
-        verdict = (f"ДАННЫХ МАЛО: событий {events} из нужных {min_events} — "
-                   f"вердикт не выносим")
+    if counted < min_events:
+        verdict = (f"ДАННЫХ МАЛО: наблюдённых событий {counted} из нужных "
+                   f"{min_events} — вердикт не выносим")
         code = 2
     elif rate > max_rate:
         verdict = (f"НЕ ВКЛЮЧАТЬ: доля ложных срабатываний "
@@ -222,7 +246,7 @@ def pilot_report(cfg: dict[str, Any], state: dict[str, Any],
         code = 1
     else:
         verdict = (f"МОЖНО ВКЛЮЧАТЬ: доля ложных срабатываний {100 * rate:.0f} % "
-                   f"≤ {100 * max_rate:.0f} %, событий {events}")
+                   f"≤ {100 * max_rate:.0f} %, наблюдённых событий {counted}")
         code = 0
 
     kills = read_kills(cfg, limit=0)
@@ -232,10 +256,13 @@ def pilot_report(cfg: dict[str, Any], state: dict[str, Any],
         "=" * 60,
         f"идёт: {days:.1f} сут (с {time.strftime('%d.%m %H:%M', time.localtime(started))})"
         if started else "идёт: неизвестно (нет отметки старта)",
-        f"событий «would kill»: {events} (в ожидании ещё {pending})",
+        f"наблюдённых событий «would kill»: {counted} (в ожидании ещё {pending})",
         f"из них понадобились снова: {reused} ({100 * rate:.0f} %)"
         f" — базис по ретроспективе 47 %",
-        f"критерий: доля ≤ {100 * max_rate:.0f} % при ≥ {min_events} событиях",
+        f"не понадобились: {not_reused}",
+        f"вне знаменателя: наблюдение прерывалось {unknown}, демон убит {killed}",
+        f"критерий: доля ≤ {100 * max_rate:.0f} % при ≥ {min_events} "
+        f"наблюдённых событиях",
         "",
         "Эффект:",
         f"  освобождено памяти (kill-режим): {int(state.get('freed_mb', 0))} МБ",
@@ -311,9 +338,14 @@ def health(cfg: dict[str, Any], state: dict[str, Any]) -> tuple[str, int]:
                  f"могло бы быть: {int(state.get('would_free_mb', 0))} МБ")
     metric = state.get("metric", {})
     if metric:
-        lines.append(f"java-reaper: метрика: событий {metric.get('events', 0)}, "
+        lines.append(f"java-reaper: метрика: наблюдённых событий "
+                     f"{metric.get('counted', metric.get('events', 0))}, "
                      f"повторно нужны {metric.get('reused', 0)} "
-                     f"({100 * metric.get('rate', 0):.0f} %)")
+                     f"({100 * metric.get('rate', 0):.0f} %), "
+                     f"вне знаменателя {metric.get('unknown', 0)} + "
+                     f"{metric.get('killed', 0)}")
+    for w in state.get("degradation", []) or []:
+        lines.append(f"java-reaper: ВНИМАНИЕ: {w}")
     if age is None:
         lines.append("java-reaper: СТАТУС: свипов не было — таймер не запущен "
                      "или рейпер ещё ни разу не отработал")
@@ -321,6 +353,9 @@ def health(cfg: dict[str, Any], state: dict[str, Any]) -> tuple[str, int]:
     if age > 2 * sweep:
         lines.append(f"java-reaper: СТАТУС: свип старше двух интервалов "
                      f"({age / 60:.1f} мин) — таймер молчит")
+        return "\n".join(lines), 1
+    if state.get("degradation"):
+        lines.append("java-reaper: СТАТУС: деградация детекции")
         return "\n".join(lines), 1
     lines.append("java-reaper: СТАТУС: ок")
     return "\n".join(lines), 0

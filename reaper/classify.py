@@ -157,11 +157,12 @@ def evaluate(signals: Signals, rules: list[Rule]) -> Decision:
             protected=rule.protected,
             protectors=list(signals.peer_protection),
             stale_peers=list(signals.peer_stale),
+            rule=rule.name,
         )
     # Правил не должно быть без catch-all; на всякий случай — оставить.
     return Decision(daemon=signals.daemon,  # type: ignore[arg-type]
                     action=Action.KEEP, reason="правило не сработало — оставляю",
-                    idle_seconds=signals.age, protected=True)
+                    idle_seconds=signals.age, protected=True, rule="catch-all")
 
 
 def classify(daemons: list[Daemon], state: dict[str, Any], now: float,
@@ -171,12 +172,19 @@ def classify(daemons: list[Daemon], state: dict[str, Any], now: float,
     peer_max_age = float(cfg["PEER_MAX_AGE_SECONDS"])
     prev = state.get("daemons", {})
 
+    # Контекст всего набора: идёт ли где-то сборка Gradle. Пока идёт —
+    # компилятор нужен, и Kotlin-демоны трогать нельзя.
+    gradle_building = any(d.kind == "gradle" and d.build_in_progress
+                           for d in daemons)
+
     signals: dict[int, Signals] = {}
     for d in daemons:
         rec = prev.get(str(d.pid)) or {}
         if rec.get("starttime") is not None and rec["starttime"] != d.starttime:
             rec = {}  # PID переиспользован
-        signals[d.pid] = _measure(d, rec, now, cfg)
+        sig = _measure(d, rec, now, cfg)
+        sig.gradle_building = gradle_building
+        signals[d.pid] = sig
 
     protection, stale = _peer_protection(signals, peer_max_age)
     for pid, s in signals.items():

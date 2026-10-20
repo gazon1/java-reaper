@@ -57,15 +57,9 @@ def execute(decisions: list[Decision], state: dict[str, Any], now: float,
             report.append({"pid": d.daemon.pid, "action": "skipped",
                            "reason": f"превышен лимит {limit} убийств за свип"})
 
-    # Защита Kotlin-демонов, если где-то идёт сборка Gradle.
-    gradle_building = any(d.daemon.kind == "gradle" and d.daemon.build_in_progress
-                          for d in decisions)
-    if gradle_building:
-        blocked = [d for d in to_kill if d.daemon.kind == "kotlin"]
-        for d in blocked:
-            report.append({"pid": d.daemon.pid, "action": "skipped",
-                           "reason": "идёт сборка Gradle — Kotlin-демоны не трогаю"})
-        to_kill = [d for d in to_kill if d.daemon.kind != "kotlin"]
+    # Защита Kotlin-демонов, если где-то идёт сборка Gradle, живёт в таблице
+    # правил (правило «gradle-building»), а не здесь: решение, отчёт и
+    # метрика должны говорить одно и то же.
 
     # Порядок: сначала Gradle (их shutdown-hook чистит маркеры клиентов).
     to_kill.sort(key=lambda d: 0 if d.daemon.kind == "gradle" else 1)
