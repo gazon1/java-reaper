@@ -36,7 +36,27 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from reaper.config import load_config  # noqa: E402
-from reaper.state import load_state, read_kills  # noqa: E402
+from reaper.state import load_state, read_kills, sweeps_path  # noqa: E402
+
+
+def read_sweeps(cfg: dict, since: float) -> list[dict]:
+    """Читает журнал свипов за период — это ИСТОРИЯ решений."""
+    out: list[dict] = []
+    try:
+        with open(sweeps_path(cfg), encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if float(rec.get("at", 0)) >= since:
+                    out.append(rec)
+    except OSError:
+        return []
+    return out
 
 
 def period_days(days: int) -> float:
@@ -64,6 +84,21 @@ def collect(cfg: dict, days: int) -> dict:
         key = reason.split(",")[0].split("(")[0].strip() or "?"
         by_reason[key] = by_reason.get(key, 0) + 1
 
+    # Журнал свипов: сколько памяти висело под ударом и как менялась
+    # картина. Это и есть эффект рейпера в непрерывном измерении.
+    sweeps = read_sweeps(cfg, since)
+    under_threat = [int(x.get("would_free_mb", 0)) for x in sweeps]
+    max_under_threat = max(under_threat) if under_threat else 0
+    avg_under_threat = (sum(under_threat) / len(under_threat)) if under_threat else 0
+    rule_hits: dict[str, int] = {}
+    for x in sweeps:
+        for name, count in (x.get("rules") or {}).items():
+            rule_hits[name] = rule_hits.get(name, 0) + int(count)
+    kinds_footprint = {"gradle": 0, "kotlin": 0}
+    for x in sweeps[-1:]:
+        for kind, data in (x.get("by_kind") or {}).items():
+            kinds_footprint[kind] = int(data.get("footprint_mb", 0))
+
     metric = state.get("metric", {}) or {}
     events = int(metric.get("events", 0))
     reused = int(metric.get("reused", 0))
@@ -84,6 +119,13 @@ def collect(cfg: dict, days: int) -> dict:
         "metric": {"events": events, "reused": reused, "rate": rate,
                    "pending": pending},
         "false_positive_rate": rate,
+        "min_events": int(cfg.get("PILOT_MIN_EVENTS", 8)),
+        "max_reuse_rate": float(cfg.get("PILOT_MAX_REUSE_RATE", 0.6)),
+        "sweeps": len(sweeps),
+        "max_under_threat_mb": max_under_threat,
+        "avg_under_threat_mb": int(avg_under_threat),
+        "rule_hits": rule_hits,
+        "current_footprint_mb": kinds_footprint,
         "stale_peer_events": int(state.get("stale_peer_events", 0)),
         "stale_peer_daemons": state.get("stale_peer_daemons", {}) or {},
         "pilot_started_at": float(state.get("pilot_started_at", 0.0)),
@@ -117,15 +159,34 @@ def format_report(data: dict) -> str:
     if not data["kills_in_period"]:
         lines.append("    (за период убийств не было — рейпер в dry-run)")
 
+    lines += [
+        "",
+        "Картина по журналу свипов:",
+        f"  свипов за период: {data['sweeps']}",
+        f"  под ударом висело: максимум {data['max_under_threat_mb']} МБ, "
+        f"в среднем {data['avg_under_threat_mb']} МБ",
+    ]
+    if data["current_footprint_mb"]:
+        gradle = data["current_footprint_mb"].get("gradle", 0)
+        kotlin = data["current_footprint_mb"].get("kotlin", 0)
+        lines.append(f"  сейчас держат демоны: Gradle {gradle} МБ, "
+                     f"Kotlin {kotlin} МБ")
+    if data["rule_hits"]:
+        lines.append("  правила за период:")
+        for name, count in sorted(data["rule_hits"].items(), key=lambda kv: -kv[1]):
+            lines.append(f"    {name}: {count}")
+    lines.append("")
+
     metric = data["metric"]
     lines += [
         "",
         "Ложные срабатывания (демон понадобился снова):",
         f"  событий «would kill»: {metric['events']} (в ожидании {metric['pending']})",
         f"  понадобились снова: {metric['reused']} ({100 * data['false_positive_rate']:.0f} %)",
-        f"  критерий перехода в бой: доля ≤ 60 % при ≥ 15 событиях",
+        f"  критерий перехода в бой: доля ≤ {100 * data['max_reuse_rate']:.0f} % "
+        f"при ≥ {data['min_events']} наблюдённых событиях",
     ]
-    if metric["events"] < 15:
+    if metric["events"] < data["min_events"]:
         lines.append("    данных пока мало — вердикт не выносится (см. --pilot)")
 
     stale = data["stale_peer_events"]

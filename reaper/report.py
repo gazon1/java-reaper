@@ -14,7 +14,7 @@ from .state import read_kills
 
 # Версия схемы машинного вывода: потребитель (агент, скрипт) обязан понимать,
 # что формат изменился, а не молча получить «поле пропало».
-JSON_SCHEMA_VERSION = 2
+JSON_SCHEMA_VERSION = 3
 
 # Критерий перехода из dry-run в kill-режим.
 # Значения по умолчанию; переопределяются конфигом (PILOT_MIN_EVENTS,
@@ -71,6 +71,10 @@ def format_status(decisions: list[Decision], state: dict[str, Any],
     lines.append("-" * 96)
     lines.append(f"всего демонов: {len(decisions)}, footprint: {total} МБ, "
                  f"под убийство: {idle_total} МБ")
+    available = state.get("mem_available_mb")
+    if available is not None:
+        lines.append(f"свободной памяти: {available} МБ "
+                     f"(порог давления {cfg.get('MEMORY_PRESSURE_MB')} МБ)")
     # Сводка по классам: у них разные пороги простоя и разная судьба.
     for kind in KINDS:
         items = [d for d in decisions if d.daemon.kind == kind]
@@ -143,6 +147,8 @@ def decision_to_dict(dec: Decision) -> dict[str, Any]:
         "log_path": d.log_path,
         "stuck_build": bool(d.stuck_build),
         "canceled_at": d.canceled_at,
+        "recreate_cost_seconds": dec.recreate_cost_seconds,
+        "rule": dec.rule,
     }
 
 
@@ -165,6 +171,11 @@ def format_json(decisions: list[Decision], state: dict[str, Any],
             "PID_ALLOWLIST": cfg.get("PID_ALLOWLIST", ""),
         },
         "kinds": kind_summary(decisions, cfg),
+        "memory": {
+            "available_mb": state.get("mem_available_mb"),
+            "pressure_mb": cfg.get("MEMORY_PRESSURE_MB"),
+            "large_daemon_mb": cfg.get("KILL_LARGE_DAEMON_MB"),
+        },
         "daemons": [decision_to_dict(d) for d in decisions],
         "metric": state.get("metric", {}),
         "rule_hits": state.get("rule_hits", {}),
@@ -208,6 +219,15 @@ def format_explain(cfg: dict[str, Any]) -> str:
                  f"лимит убийств за свип: {cfg.get('MAX_KILLS_PER_SWEEP')}; "
                  f"возраст «зависшего клиента»: "
                  f"{int(cfg.get('PEER_MAX_AGE_SECONDS', 0)) / 3600:.0f} ч")
+    pressure = int(cfg.get("MEMORY_PRESSURE_MB", 0) or 0)
+    pressure_txt = ("«всегда убирать»" if pressure <= 0
+                    else f"ниже {pressure} МБ свободной памяти")
+    lines.append(f"давление по памяти: убираем, когда {pressure_txt}; "
+                 f"крупные демоны (≥ {cfg.get('KILL_LARGE_DAEMON_MB')} МБ) — "
+                 f"всегда")
+    lines.append(f"цена воссоздания: Gradle {cfg.get('GRADLE_RECREATE_COST_SECONDS')} с, "
+                 f"Kotlin {cfg.get('KOTLIN_RECREATE_COST_SECONDS')} с "
+                 f"(влияет на порядок уборки)")
     return "\n".join(lines)
 
 

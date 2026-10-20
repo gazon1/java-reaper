@@ -217,6 +217,56 @@ def history_keys(path: str) -> set[tuple[str, float]]:
     return keys
 
 
+def summarize_by_path(path: str, kind: str | None = None
+                      ) -> dict[str, Any] | None:
+    """Сводка по логу демона — вид лога определяется по имени или по классу.
+
+    Имя лога Gradle — `daemon-<pid>.out.log`, лога Kotlin —
+    `kotlin-daemon.<дата>.<время>-<инстанс>.<N>.log`.
+    """
+    name = os.path.basename(path)
+    if kind == "gradle" or name.startswith("daemon-"):
+        version = os.path.basename(os.path.dirname(path))
+        pid = None
+        try:
+            pid = int(name.split("-")[1].split(".")[0])
+        except (IndexError, ValueError):
+            pid = None
+        try:
+            return summarize_gradle(path, pid=pid, version=version)
+        except OSError:
+            return None
+    if name.startswith("kotlin-daemon."):
+        instance = name.split("-")[-1].split(".")[0]
+        try:
+            return summarize_kotlin(path, instance=instance)
+        except OSError:
+            return None
+    return None
+
+
+def archive_daemon_log(path: str, kind: str | None, history_path: str,
+                       death_observed_at: float | None = None) -> bool:
+    """Сохраняет сводку по логу демона в историю. True — сохранили.
+
+    Нужно для демонов, которых больше нет: их логи в `/tmp` исчезают при
+    перезагрузке, и без сводки демон исчезает из истории навсегда.
+
+    `death_observed_at` — момент, когда мы заметили, что демона нет. Для
+    демона, который просто простаивал и потом умер, это единственный
+    источник знания о его смерти: лог молчит с момента последней записи,
+    и без этой отметки простой не виден вовсе (симулятор посчитал бы
+    демона умершим сразу после последней активности).
+    """
+    record = summarize_by_path(path, kind)
+    if record is None:
+        return False
+    if death_observed_at is not None:
+        record["death_observed_at"] = float(death_observed_at)
+    append_history(history_path, record)
+    return True
+
+
 def default_history_path(state_dir: str | None = None) -> str:
     """Путь к истории по умолчанию: рядом с состоянием рейпера."""
     base = state_dir or os.path.expanduser("~/.local/state/java-reaper")

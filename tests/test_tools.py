@@ -203,6 +203,117 @@ class TestMonthlyReport(unittest.TestCase):
         self.assertIn("metric", payload)
         self.assertIn("period_days", payload)
 
+    def test_sweeps_journal_gives_pressure_numbers(self):
+        """Отчёт читает журнал свипов: сколько памяти висело под ударом."""
+        now = time.time()
+        for i, (would_free, footprint) in enumerate([(1000, 5000),
+                                                     (3000, 8000)]):
+            reaper.append_sweep(self.cfg, {
+                "at": now - 60 + i, "daemons": 10, "footprint_mb": footprint,
+                "would_kill": 2, "would_free_mb": would_free,
+                "by_kind": {"gradle": {"count": 5, "footprint_mb": footprint,
+                                       "would_free_mb": would_free},
+                            "kotlin": {"count": 5, "footprint_mb": 0,
+                                       "would_free_mb": 0}},
+                "rules": {"kill": 2, "not-idle": 8},
+            })
+        data = monthly.collect(self.cfg, 30)
+        self.assertEqual(data["sweeps"], 2)
+        self.assertEqual(data["max_under_threat_mb"], 3000)
+        self.assertEqual(data["avg_under_threat_mb"], 2000)
+        self.assertEqual(data["rule_hits"], {"kill": 4, "not-idle": 16})
+        self.assertEqual(data["current_footprint_mb"]["gradle"], 8000)
+        text = monthly.format_report(data)
+        self.assertIn("под ударом висело", text)
+        self.assertIn("not-idle", text)
+
+    def test_sweeps_outside_period_are_ignored(self):
+        old = time.time() - 40 * 86400
+        reaper.append_sweep(self.cfg, {"at": old, "would_free_mb": 5000,
+                                       "rules": {}})
+        data = monthly.collect(self.cfg, 30)
+        self.assertEqual(data["sweeps"], 0)
+        self.assertEqual(data["max_under_threat_mb"], 0)
+
+
+# --------------------------------------------------------------------------- #
+# Архивирование умерших демонов самим рейпером
+# --------------------------------------------------------------------------- #
+
+class TestArchiveVanished(unittest.TestCase):
+    """Логи Kotlin живут в /tmp и исчезают при перезагрузке.
+
+    Рейпер обязан сохранить сводку, пока файл жив: иначе демон исчезнет
+    из истории навсегда.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_dir = os.path.join(self.tmp.name, "state")
+        os.makedirs(self.state_dir)
+        self.cfg = dict(reaper.DEFAULTS)
+        self.cfg["STATE_DIR"] = self.state_dir
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _kotlin_log(self, instance="kotlin-daemon.2026-10-20.08-29-00-827.00"):
+        path = os.path.join(self.tmp.name, instance + ".log")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("2026-10-20 08:29:00.100 [daemon] Kotlin daemon started\n")
+            fh.write("2026-10-20 08:31:00.100 [daemon] compiling\n")
+        return path
+
+    def test_vanished_daemon_is_archived(self):
+        path = self._kotlin_log()
+        state = {"daemons": {"4242": {"kind": "kotlin", "log_path": path}}}
+        archived = reaper.archive_vanished(self.cfg, state, [], time.time())
+        self.assertEqual(archived, 1)
+        history = os.path.join(self.state_dir, "logs-history.jsonl")
+        records = reaper.read_history(history)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["kind"], "kotlin")
+
+    def test_archive_records_observed_death(self):
+        """Момент пропажи демона — это его смерть: лог-то молчит давно."""
+        path = self._kotlin_log()
+        state = {"daemons": {"4242": {"kind": "kotlin", "log_path": path}}}
+        now = time.time()
+        reaper.archive_vanished(self.cfg, state, [], now)
+        history = os.path.join(self.state_dir, "logs-history.jsonl")
+        record = reaper.read_history(history)[0]
+        self.assertIn("death_observed_at", record)
+        self.assertAlmostEqual(record["death_observed_at"], now, delta=5)
+
+    def test_live_daemon_is_not_archived(self):
+        path = self._kotlin_log()
+        state = {"daemons": {"4242": {"kind": "kotlin", "log_path": path}}}
+
+        class FakeDaemon:
+            pid = 4242
+
+        archived = reaper.archive_vanished(self.cfg, state, [FakeDaemon()])
+        self.assertEqual(archived, 0)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.state_dir, "logs-history.jsonl")))
+
+    def test_missing_log_is_skipped(self):
+        state = {"daemons": {"4242": {"kind": "kotlin",
+                                      "log_path": "/tmp/нет-такого.log"}}}
+        archived = reaper.archive_vanished(self.cfg, state, [])
+        self.assertEqual(archived, 0)
+
+    def test_dead_daemon_gives_measurable_idle(self):
+        """С отметкой смерти простой виден: без неё демон «умирает» вместе
+        с последней записью в логе, и простоя не видно вовсе."""
+        path = self._kotlin_log()
+        state = {"daemons": {"4242": {"kind": "kotlin", "log_path": path}}}
+        reaper.archive_vanished(self.cfg, state, [], time.time() + 7200)
+        history = os.path.join(self.state_dir, "logs-history.jsonl")
+        record = reaper.read_history(history)[0]
+        self.assertGreater(record["death_observed_at"],
+                           record["last_activity"] + 3600)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -519,3 +630,74 @@ class TestSimulator(unittest.TestCase):
         self.assertEqual(data["kills"], 1)
         self.assertEqual(data["false_positives"], 1)
         self.assertAlmostEqual(data["rate"], 1.0)
+
+
+class TestStuckScan(unittest.TestCase):
+    """Скан порога «зависшего»: порог должен быть измерен, а не выбран."""
+
+    def _record(self, kind="gradle", builds=(), first=0.0, mtime=0.0,
+                canceled=None):
+        return {"kind": kind, "pid": 1, "builds": [list(b) for b in builds],
+                "first_activity": first, "last_activity": mtime, "mtime": mtime,
+                "canceled_at": canceled}
+
+    def test_stuck_lifetime_measured(self):
+        rec = self._record(builds=[[0.0, None]], first=0.0,
+                           mtime=100.0 + 2 * 3600, canceled=100.0)
+        self.assertAlmostEqual(simulate.stuck_lifetime(rec), 2 * 3600)
+
+    def test_not_stuck_has_no_lifetime(self):
+        rec = self._record(builds=[[0.0, 100.0]], first=0.0, mtime=100.0)
+        self.assertIsNone(simulate.stuck_lifetime(rec))
+
+    def test_scan_counts_kills_by_threshold(self):
+        """Демон, проживший после отмены 3 ч, переживает порог в 1 ч,
+        но не порог в 6 ч."""
+        recs = [self._record(builds=[[0.0, None]], first=0.0,
+                             mtime=100.0 + 3 * 3600, canceled=100.0)]
+        result = simulate.simulate_stuck(recs, {"60 мин": 3600.0,
+                                                "360 мин": 21600.0})
+        data = result["gradle"]
+        self.assertEqual(data["60 мин"]["kills"], 1)
+        self.assertEqual(data["60 мин"]["stuck"], 1)
+        self.assertEqual(data["360 мин"]["kills"], 0)
+
+    def test_scan_reports_median_and_max(self):
+        recs = [
+            self._record(builds=[[0.0, None]], first=0.0,
+                         mtime=100.0 + 600, canceled=100.0),
+            self._record(builds=[[0.0, None]], first=0.0,
+                         mtime=100.0 + 4 * 3600, canceled=100.0),
+        ]
+        result = simulate.simulate_stuck(recs, {"60 мин": 3600.0})
+        data = result["gradle"]["60 мин"]
+        self.assertAlmostEqual(data["max_lifetime_seconds"], 4 * 3600)
+        self.assertAlmostEqual(data["median_lifetime_seconds"], (600 + 14400) / 2)
+
+    def test_scan_counts_false_positives(self):
+        """Повторное использование зависшего демона невозможно по модели:
+        если клиент вернулся к тому же демону, демон не был зависшим."""
+        rec = self._record(builds=[[0.0, None], [20000.0, 20100.0]],
+                           first=0.0, mtime=20100.0, canceled=100.0)
+        result = simulate.simulate_stuck([rec], {"60 мин": 3600.0})
+        data = result["gradle"]["60 мин"]
+        self.assertEqual(data["stuck"], 0, "демон с новой сборкой не зависший")
+        self.assertEqual(data["kills"], 0)
+
+    def test_cli_accepts_stuck_thresholds(self):
+        """Скан запускается из командной строки."""
+        with tempfile.TemporaryDirectory() as tmp:
+            history = os.path.join(tmp, "history.jsonl")
+            rec = self._record(builds=[[0.0, None]], first=0.0,
+                               mtime=100.0 + 3 * 3600, canceled=100.0)
+            reaper.append_history(history, rec)
+            proc = subprocess.run(
+                [sys.executable, os.path.join(ROOT, "tools", "simulate.py"),
+                 "--history", history, "--stuck-thresholds", "60,360",
+                 "--json"],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            payload = json.loads(proc.stdout)
+            self.assertIn("stuck_scan", payload)
+            self.assertEqual(payload["stuck_thresholds"]["60 мин"], 3600.0)
+            self.assertEqual(payload["stuck_scan"]["gradle"]["60 мин"]["kills"], 1)

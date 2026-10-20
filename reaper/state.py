@@ -20,7 +20,7 @@ STATE_VERSION = 2
 DAEMON_FIELDS = frozenset({
     "first_seen", "kind", "cpu_ticks", "starttime", "last_cpu_at",
     "log_offset", "last_build_start", "last_build_end", "peer_first_seen",
-    "last_activity", "sigterm_attempts", "canceled_at",
+    "last_activity", "sigterm_attempts", "canceled_at", "log_path",
 })
 
 GLOBAL_FIELDS = frozenset({
@@ -28,7 +28,7 @@ GLOBAL_FIELDS = frozenset({
     "last_sweep_at", "last_sweep_ok", "pilot_started_at", "stale_peer_events",
     "stale_peer_daemons", "rules_version", "would_free_pending_mb",
     "rule_hits", "rule_hits_last", "measured_count", "measured_prev",
-    "degradation",
+    "degradation", "mem_available_mb",
 })
 
 
@@ -96,6 +96,7 @@ def load_state(cfg: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("measured_count", 0)      # сколько демонов мы смогли измерить
     data.setdefault("measured_prev", 0)       # то же на прошлом свипе
     data.setdefault("degradation", [])        # предупреждения о деградации
+    data.setdefault("mem_available_mb", None) # сколько памяти доступно системе
     return data
 
 

@@ -967,10 +967,32 @@ class TestKindSummary(unittest.TestCase):
         decisions = [reaper.Decision(g, True, "простой")]
         payload = _json.loads(reaper.format_json(decisions, {"metric": {}},
                                                  self.cfg, now=NOW))
-        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["schema_version"], 3)
         self.assertIn("kinds", payload)
         self.assertEqual(payload["kinds"]["gradle"]["count"], 1)
         self.assertEqual(payload["config"]["KOTLIN_IDLE_SECONDS"], 7200)
+
+    def test_json_has_memory_and_rule(self):
+        """Схема 3: в JSON видно память, правило и цену воссоздания."""
+        import json as _json
+        g = make_daemon(pid=1, kind="gradle", rss_mb=400)
+        decisions = [reaper.Decision(g, True, "простой", rule="kill",
+                                     recreate_cost_seconds=40)]
+        payload = _json.loads(reaper.format_json(decisions, {"metric": {}},
+                                                 self.cfg, now=NOW))
+        self.assertIn("memory", payload)
+        self.assertIn("available_mb", payload["memory"])
+        self.assertEqual(payload["memory"]["pressure_mb"],
+                         self.cfg["MEMORY_PRESSURE_MB"])
+        self.assertEqual(payload["memory"]["large_daemon_mb"],
+                         self.cfg["KILL_LARGE_DAEMON_MB"])
+        self.assertEqual(payload["daemons"][0]["rule"], "kill")
+        self.assertEqual(payload["daemons"][0]["recreate_cost_seconds"], 40)
+
+    def test_schema_version_is_public(self):
+        """Потребитель JSON обязан видеть версию схемы, а не угадывать."""
+        self.assertEqual(reaper.JSON_SCHEMA_VERSION, 3)
+
 
 # --------------------------------------------------------------------------- #
 # Контекст: свободная память и свежая сборка Gradle (общий объект)

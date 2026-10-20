@@ -12,6 +12,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from reaper.classify import build_context, classify, evaluate, recreate_cost  # noqa: E402,F401
+from reaper.cli import archive_vanished  # noqa: E402,F401
 from reaper.collect import (  # noqa: E402,F401
     canceled_state,
     collect_daemons,
@@ -36,12 +37,15 @@ from reaper.execute import (  # noqa: E402,F401
 from reaper.housekeeping import trim_idle_logs  # noqa: E402,F401
 from reaper.history import (  # noqa: E402,F401
     append_history,
+    archive_daemon_log,
     default_history_path,
     effective_canceled,
+    history_keys,
     intervals,
     kotlin_activity,
     parse_kotlin_ts,
     read_history,
+    summarize_by_path,
     summarize_gradle,
     summarize_kotlin,
 )
@@ -109,6 +113,7 @@ from reaper.state import (  # noqa: E402,F401
     STATE_VERSION,
     UNMEASURED_RULES,
     append_kill,
+    append_sweep,
     degradation_warnings,
     kills_path,
     load_state,
@@ -119,6 +124,8 @@ from reaper.state import (  # noqa: E402,F401
     record_freed,
     save_state,
     state_path,
+    sweep_record,
+    sweeps_path,
     sync_rules_version,
     update_metric,
 )

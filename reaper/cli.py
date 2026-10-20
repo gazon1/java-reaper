@@ -14,6 +14,7 @@ from .classify import classify
 from .collect import collect_daemons
 from .config import RULES_VERSION, disabled_flag, idle_limit as idle_limit_for, load_config
 from .execute import execute
+from .history import archive_daemon_log
 from .housekeeping import trim_idle_logs
 from .model import Decision
 from .report import (
@@ -82,6 +83,7 @@ def write_state(cfg: dict[str, Any], state: dict[str, Any],
         rec["starttime"] = d.starttime
         rec["last_cpu_at"] = now
         rec["log_offset"] = d.log_offset
+        rec["log_path"] = d.log_path
         if d.kind == "gradle":
             rec["last_build_start"] = d.last_build_start
             rec["last_build_end"] = d.last_build_end
@@ -112,6 +114,39 @@ def write_state(cfg: dict[str, Any], state: dict[str, Any],
     for key in list(prev.keys()):
         if key not in live_pids:
             prev.pop(key, None)
+
+
+def archive_vanished(cfg: dict[str, Any], state: dict[str, Any],
+                     daemons: list[Any], now: float | None = None) -> int:
+    """Архивирует сводки по демонам, которых больше нет.
+
+    Логи Kotlin-демонов живут в /tmp и умирают вместе с перезагрузкой.
+    Если не сохранить сводку сейчас, демон исчезнет из истории навсегда —
+    и по нему никогда нельзя будет понять, сколько памяти он занимал.
+
+    Момент, когда мы заметили пропажу демона, — это и есть его смерть
+    (с точностью до интервала свипа): лог-то молчит с последней записи,
+    и без этой отметки простой демона не виден вовсе.
+    """
+    history_path = os.path.join(os.path.expanduser(str(cfg["STATE_DIR"])),
+                                "logs-history.jsonl")
+    live = {d.pid for d in daemons}
+    prev = state.get("daemons", {})
+    seen_at = time.time() if now is None else now
+    archived = 0
+    for pid, rec in list(prev.items()):
+        if int(pid) in live:
+            continue
+        path = rec.get("log_path")
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            if archive_daemon_log(str(path), rec.get("kind"), history_path,
+                                  death_observed_at=seen_at):
+                archived += 1
+        except OSError:
+            continue
+    return archived
 
 
 def _sweep(cfg: dict[str, Any], state: dict[str, Any], now: float):
@@ -225,6 +260,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # ---- рабочий свип ----
+    # Демоны, которых больше нет, архивируем в историю: их логи в /tmp
+    # исчезают при перезагрузке, и без сводки они исчезнут навсегда.
+    archived = archive_vanished(cfg, state, daemons, now)
+
     report = execute(decisions, state, now, cfg, dry_run=(mode == "dry-run"))
     trim_report = trim_idle_logs(decisions, cfg, now)
     report = report + trim_report
@@ -233,6 +272,8 @@ def main(argv: list[str] | None = None) -> int:
     # Наблюдаемость: какие правила сработали и не деградировала ли детекция.
     # Считаем ДО вывода — отчёт должен показывать свежие числа.
     note_rule_hits(state, decisions)
+    if decisions and decisions[0].context is not None:
+        state["mem_available_mb"] = decisions[0].context.mem_available_mb
     measured, total = measure_coverage(state, decisions, cfg)
     warnings = degradation_warnings(state, cfg, measured, total)
     state["degradation"] = warnings

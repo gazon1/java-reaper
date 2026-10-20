@@ -24,11 +24,23 @@
 
   * размер демона (правило `small-footprint`) — считаем, что прошёл;
   * клиенты и наблюдатели (правило `peer`) — считаем, что защиты не было;
-  * CPU и дети (правила `cpu-busy`, `children`) — считаем, что демон не работал.
+  * CPU и дети (правила `cpu-busy`, `children`) — считаем, что демон не работал;
+  * момент смерти, если демона видел рейпер (`death_observed_at`): без этой
+    отметки лог замолкает в момент последней активности, и простой виден
+    лишь у тех демонов, чей лог кто-то ещё пережил (Gradle, у которого есть
+    маркеры сборок). Для Kotlin без отметки рейпера простой не виден вовсе.
 
 Поэтому симулятор даёт ВЕРХНЮЮ ОЦЕНКУ количества убийств: реальный рейпер
 убил бы меньше. Для вопроса «какая доля ложных срабатываний» это, наоборот,
 консервативная оценка.
+
+Два независимых скана:
+
+  * порог простоя (`--thresholds`) — сколько демонов переживёт застой;
+  * порог «зависшего» (`--stuck-thresholds`) — сколько зависших демонов
+    переживёт отведённое им время. Это отдельная популяция: зависший демон
+    умирает не сам (таймаут Gradle не действует, пока демон «в сборке»),
+    и убираем его мы — значит, порог надо измерять, а не выбирать на глаз.
 """
 
 from __future__ import annotations
@@ -36,6 +48,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import statistics
 import sys
 import time
 from typing import Any
@@ -56,8 +69,20 @@ GRADLE_SELF_TIMEOUT = 180 * 60
 
 
 def _death(record: dict[str, Any]) -> float:
-    """Когда демон умер (последняя запись в лог)."""
-    return float(record.get("mtime") or 0.0)
+    """Когда демон умер.
+
+    Обычно это последняя запись в логе (`mtime`). Но для демона, который
+    простаивал и потом умер, лог замолчал задолго до смерти: последняя
+    запись — это конец активности, а не конец жизни. Поэтому, если свидетелем
+    смерти был рейпер (`death_observed_at`), берём более позднее из двух:
+    это верхняя оценка простоя, и она честнее, чем «умер сразу после
+    последней записи».
+    """
+    mtime = float(record.get("mtime") or 0.0)
+    observed = record.get("death_observed_at")
+    if observed is None:
+        return mtime
+    return max(mtime, float(observed))
 
 
 def _first(record: dict[str, Any]) -> float:
@@ -145,6 +170,100 @@ def reused_after(record: dict[str, Any], moment: float) -> bool:
     return False
 
 
+def stuck_lifetime(record: dict[str, Any]) -> float | None:
+    """Сколько секунд прожил зависший демон после отмены сборки.
+
+    None — демон не завис (отмены не было, либо она была перекрыта
+    последующей сборкой).
+    """
+    canceled = effective_canceled(record)
+    if canceled is None:
+        return None
+    return max(0.0, _death(record) - float(canceled))
+
+
+def simulate_stuck(records: list[dict[str, Any]],
+                   stuck_thresholds: dict[str, float]) -> dict[str, Any]:
+    """Сканирует порог «зависшего» (STUCK_AFTER_SECONDS) по истории.
+
+    Зависшие демоны — отдельная популяция: их убирает рейпер, а не Gradle
+    (его idle-таймаут не действует, пока демон «в сборке»). Порог для них
+    свой, и он должен переизмеряться по мере накопления истории: слишком
+    малый — убьём демона, который ещё понадобится; слишком большой — будем
+    держать мусор часами.
+
+    Для каждого порога: сколько зависших демонов пережило его (то есть были
+    бы убиты), сколько из них после этого понадобились снова (ложные
+    срабатывания) и как долго зависшие живут в среднем.
+
+    Порог простоя здесь НЕ участвует: у зависшего демона момент смерти
+    определяется только порогом «зависшего» (см. kill_time).
+
+    О ЛОЖНЫХ СРАБАТЫВАНИЯХ. В корпусе они не измеряются: если клиент вернулся
+    к тому же демону, то демон не был зависшим (см. effective_canceled) — то
+    есть повторное использование видно только как «это не зависший». Настоящее
+    ложное срабатывание (клиент вернулся уже к другому демону) в сводках не
+    видно. Поэтому «ложных» здесь честно ноль, и это НЕ доказательство
+    безопасности правила — это слепое пятно измерения.
+    """
+    out: dict[str, Any] = {}
+    for kind in ("gradle", "kotlin"):
+        items = [r for r in records if r.get("kind") == kind]
+        stuck_items = [r for r in items if effective_canceled(r) is not None]
+        lifetimes = [stuck_lifetime(r) or 0.0 for r in stuck_items]
+        for label, threshold in stuck_thresholds.items():
+            kills = 0
+            false_positives = 0
+            for rec, lifetime in zip(stuck_items, lifetimes):
+                if lifetime <= threshold:
+                    continue
+                kills += 1
+                canceled = float(effective_canceled(rec))
+                if reused_after(rec, canceled + threshold):
+                    false_positives += 1
+            out.setdefault(kind, {})[label] = {
+                "stuck": len(stuck_items),
+                "kills": kills,
+                "false_positives": false_positives,
+                "rate": (false_positives / kills) if kills else 0.0,
+                "max_lifetime_seconds": max(lifetimes) if lifetimes else 0.0,
+                "median_lifetime_seconds": (statistics.median(lifetimes)
+                                            if lifetimes else 0.0),
+            }
+    return out
+
+
+def _duration(seconds: float) -> str:
+    """Время по-человечески: минуты, пока не час; дальше — часы."""
+    if seconds < 3600:
+        return f"{seconds / 60:.0f} мин"
+    return f"{seconds / 3600:.1f} ч"
+
+
+def format_stuck_report(result: dict[str, Any]) -> str:
+    """Таблица скана порога «зависшего»."""
+    lines = ["Порог «зависшего» (STUCK_AFTER_SECONDS) — скан по истории",
+             "=" * 72,
+             "  Зависший демон = клиент отвалился во время сборки. Gradle его",
+             "  не убирает (таймаут не действует, пока демон «в сборке»),",
+             "  поэтому убираем мы — и порог должен быть измерен, а не выбран.",
+             ""]
+    for kind in ("gradle", "kotlin"):
+        if kind not in result:
+            continue
+        lines.append(f"  {kind}:")
+        lines.append(f"    {'порог':>10} {'зависших':>9} {'убито':>7} "
+                     f"{'ложных':>8} {'доля':>7} {'медиана':>9} {'максимум':>9}")
+        for label, data in result[kind].items():
+            lines.append(f"    {label:>10} {data['stuck']:>9} {data['kills']:>7} "
+                         f"{data['false_positives']:>8} "
+                         f"{100 * data['rate']:>6.0f} % "
+                         f"{_duration(data['median_lifetime_seconds']):>9} "
+                         f"{_duration(data['max_lifetime_seconds']):>9}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def simulate(records: list[dict[str, Any]], thresholds: dict[str, float],
              stuck_threshold: float = 3600.0) -> dict[str, Any]:
     """Прогоняет пороги по истории и считает убийства и ложные срабатывания."""
@@ -217,6 +336,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--thresholds", default=None,
                         help="пороги простоя в минутах через запятую; "
                              "по умолчанию — из конфига рейпера")
+    parser.add_argument("--stuck-thresholds", default=None,
+                        help="пороги «зависшего» в минутах через запятую; "
+                             "сканирует STUCK_AFTER_SECONDS по накопленной "
+                             "истории (по умолчанию — из конфига)")
     parser.add_argument("--json", action="store_true",
                         help="машиночитаемый вывод")
     args = parser.parse_args(argv)
@@ -247,15 +370,33 @@ def main(argv: list[str] | None = None) -> int:
         thresholds = {f"{gradle:g} мин": gradle * 60, f"{kotlin:g} мин": kotlin * 60}
         stuck_threshold = float(cfg.get("STUCK_AFTER_SECONDS", 3600))
 
+    # Скан порога «зависшего»: по умолчанию — сам порог из конфига плюс
+    # несколько точек вокруг, чтобы был виден ход зависимости, а не одна
+    # цифра. Явно заданный список — как есть.
+    if args.stuck_thresholds:
+        stuck_thresholds: dict[str, float] = {}
+        for token in args.stuck_thresholds.replace(",", " ").split():
+            try:
+                minutes = float(token)
+            except ValueError:
+                continue
+            stuck_thresholds[f"{minutes:g} мин"] = minutes * 60
+    else:
+        stuck_thresholds = {f"{stuck_threshold / 60:g} мин": stuck_threshold}
+    stuck_result = simulate_stuck(records, stuck_thresholds)
+
     result = simulate(records, thresholds, stuck_threshold)
     if args.json:
         print(json.dumps({"history": history_path, "records": len(records),
                           "thresholds": thresholds,
                           "stuck_threshold_seconds": stuck_threshold,
-                          "result": result},
+                          "stuck_thresholds": stuck_thresholds,
+                          "result": result,
+                          "stuck_scan": stuck_result},
                          ensure_ascii=False, indent=1, sort_keys=True), flush=True)
     else:
         print(format_report(result, records, thresholds), flush=True)
+        print(format_stuck_report(stuck_result), flush=True)
     return 0
 
 
