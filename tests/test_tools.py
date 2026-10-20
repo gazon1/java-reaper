@@ -24,6 +24,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 import _api as reaper  # noqa: E402
+from reaper import history, logfiles  # noqa: E402
 
 
 def _load_tool(name: str, filename: str):
@@ -38,6 +39,8 @@ def _load_tool(name: str, filename: str):
 watchdog = _load_tool("reaper_watchdog", "watchdog.py")
 monthly = _load_tool("reaper_monthly", "monthly-report.py")
 analyze = _load_tool("reaper_analyze_idle", "analyze-idle.py")
+idlestats = reaper.idlestats
+logfiles = reaper.logfiles
 
 
 class TestWatchdog(unittest.TestCase):
@@ -314,6 +317,61 @@ class TestArchiveVanished(unittest.TestCase):
         record = reaper.read_history(history)[0]
         self.assertGreater(record["death_observed_at"],
                            record["last_activity"] + 3600)
+
+
+class TestSummarySelfDescription(unittest.TestCase):
+    """Сводка должна описывать себя сама: модель активности и пороги цели.
+
+    Иначе история не самодостаточна: «умер ли демон сам» и «простой ли он
+    дольше порога» приходилось бы угадывать по нынешним настройкам цели, а
+    модель активности — по наличию ключа в словаре (смена формы сводки
+    тихо ломала бы разбор).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = os.path.join(self.tmp.name, "daemon-4242.out.log")
+        with open(self.log, "w", encoding="utf-8") as fh:
+            fh.write(
+                "2026-10-19T19:36:17.864+0300 [INFO] [org.gradle.launcher] "
+                "Received command: Build{id=1}\n"
+                "2026-10-19T19:37:00.000+0300 [INFO] [org.gradle.launcher] "
+                "Marking the daemon as idle, address: []\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _spec(self, **kw):
+        base = dict(name="gradle", label="Gradle",
+                    match_cmdline="org.gradle.launcher.daemon",
+                    log_name_regex=r"^daemon-\d+\.out\.log$",
+                    activity=reaper.ACTIVITY_MARKERS, ts_format="iso",
+                    build_start="Received command: Build",
+                    build_end="Marking the daemon as idle",
+                    idle_seconds=21600.0, self_timeout_seconds=10800.0,
+                    rebuildable=True)
+        base.update(kw)
+        return reaper.TargetSpec(**base)
+
+    def test_summary_remembers_thresholds_and_model(self):
+        rec = reaper.summarize_builds(self.log, self._spec(), pid=4242)
+        self.assertEqual(rec["activity_kind"], "builds")
+        self.assertEqual(rec["idle_seconds"], 21600.0)
+        self.assertEqual(rec["self_timeout_seconds"], 10800.0)
+
+    def test_intervals_follow_explicit_model(self):
+        """Явное поле выбора модели главнее содержимого словаря."""
+        rec = {"activity_kind": "activity", "bucket_seconds": 300,
+               "activity": [[1000.0, 1.0]], "builds": [[1.0, 2.0]]}
+        spans = reaper.intervals(rec)
+        self.assertEqual(spans, [(1000.0, 1300.0)])
+
+    def test_legacy_record_without_field_still_readable(self):
+        """Старые записи (без поля) разбираются как раньше — по содержанию."""
+        legacy = {"builds": [[1.0, 2.0]]}
+        self.assertEqual(reaper.intervals(legacy), [(1.0, 2.0)])
+        legacy_activity = {"activity": [[1000.0, 1.0]], "bucket_seconds": 300}
+        self.assertEqual(reaper.intervals(legacy_activity), [(1000.0, 1300.0)])
 
 
 if __name__ == "__main__":
@@ -776,7 +834,7 @@ class TestAnalyzeIdle(unittest.TestCase):
         return path
 
     def _analyze(self, spec, thresholds=(30,)):
-        report, scan = analyze.analyze_target(
+        report, scan = idlestats.analyze_target(
             spec, list(thresholds), 7200, time.time(), 512 * 1024 * 1024)
         return report, scan
 
@@ -799,25 +857,25 @@ class TestAnalyzeIdle(unittest.TestCase):
 
     def test_target_without_markers_is_skipped_with_reason(self):
         """Цель с activity=mtime анализом не охватывается — и это сказано."""
-        reason = analyze.analyzable(self._spec(activity=reaper.ACTIVITY_MTIME,
-                                               build_start="", build_end=""))
+        reason = idlestats.analyzable(self._spec(activity=reaper.ACTIVITY_MTIME,
+                                                 build_start="", build_end=""))
         self.assertIsNotNone(reason)
         self.assertIn("mtime", reason)
 
     def test_target_with_markers_is_analyzable(self):
-        self.assertIsNone(analyze.analyzable(self._spec()))
+        self.assertIsNone(idlestats.analyzable(self._spec()))
 
     def test_pid_comes_from_target_description(self):
         """PID демона берётся из log_pid_regex цели, а не из имени файла."""
         spec = self._spec()
-        self.assertEqual(analyze.pid_from_name(spec, "/x/mock-4242.out.log"), 4242)
+        self.assertEqual(logfiles.pid_of(spec, "/x/mock-4242.out.log"), 4242)
         # У цели без log_pid_regex PID неизвестен — и это не «ноль».
         spec = self._spec(log_pid_regex="")
-        self.assertIsNone(analyze.pid_from_name(spec, "/x/mock-4242.out.log"))
+        self.assertIsNone(logfiles.pid_of(spec, "/x/mock-4242.out.log"))
 
     def test_alive_is_unknown_without_pid_regex(self):
         spec = self._spec(log_pid_regex="")
-        self.assertIsNone(analyze.daemon_alive(spec, "/x/mock-4242.out.log"))
+        self.assertIsNone(logfiles.daemon_alive(spec, "/x/mock-4242.out.log"))
 
     def test_cli_reports_skipped_target(self):
         """CLI по файлу целей: разобранная цель — в отчёте, пропущенная — с причиной."""
@@ -859,3 +917,201 @@ def _iso(seconds: float) -> str:
     import datetime as _dt
     moment = _dt.datetime.fromtimestamp(seconds, _dt.timezone.utc)
     return moment.strftime("%Y-%m-%dT%H:%M:%S.000+0000")
+
+
+# --------------------------------------------------------------------------- #
+# Общий модуль работы с файлами логов целей (reaper/logfiles.py)
+# --------------------------------------------------------------------------- #
+
+
+class TestLogFiles(unittest.TestCase):
+    """«Чей это лог» — одно правило для уборщика, истории и ретроспективы.
+
+    Раньше правило жило в трёх копиях, и копии расходились: уборщик считал
+    один и тот же файл живым, а история — чужим. Теперь правило одно, а
+    тесты ниже фиксируют его контракт.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.logs = os.path.join(self.tmp.name, "logs")
+        os.makedirs(self.logs)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write(self, name, size=16):
+        path = os.path.join(self.logs, name)
+        with open(path, "wb") as fh:
+            fh.write(b"x" * size)
+        return path
+
+    def _spec(self, **kw):
+        base = dict(
+            name="mock",
+            log_globs=(os.path.join(self.logs, "mock-*.log"),),
+            log_pid_regex=r"^mock-(?P<pid>\d+)\.log$",
+            log_group_regex=r"^(?P<group>mock-\d+)\.\d+\.log$",
+            forbidden_prefixes=("mock-marker-",),
+        )
+        base.update(kw)
+        return reaper.TargetSpec(**base)
+
+    # --- поиск файлов ----------------------------------------------------
+
+    def test_expand_pattern_returns_files_only(self):
+        """Каталог — не лог: в план уборки он попадать не должен."""
+        self._write("mock-1.log")
+        os.makedirs(os.path.join(self.logs, "mock-2.log"))
+        found = logfiles.expand_pattern(os.path.join(self.logs, "*"))
+        self.assertEqual(found, [os.path.join(self.logs, "mock-1.log")])
+
+    def test_expand_pattern_expands_home(self):
+        """«~» в шаблоне цели раскрывается: иначе путь не найдётся."""
+        home = self.tmp.name
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = home
+        try:
+            os.makedirs(os.path.join(home, "daemon-logs"))
+            path = os.path.join(home, "daemon-logs", "mock-7.log")
+            with open(path, "wb") as fh:
+                fh.write(b"x")
+            self.assertEqual(logfiles.expand_pattern("~/daemon-logs/*.log"),
+                             [path])
+        finally:
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+
+    def test_discover_uses_target_globs(self):
+        first = self._write("mock-1.log")
+        second = self._write("mock-2.log")
+        self._write("other.txt")
+        self.assertEqual(logfiles.discover(self._spec()), sorted([first, second]))
+
+    def test_discover_deduplicates(self):
+        """Один файл под двумя шаблонами — один файл в плане."""
+        path = self._write("mock-1.log")
+        spec = self._spec(log_globs=(os.path.join(self.logs, "mock-*.log"),
+                                     os.path.join(self.logs, "mock-1.log")))
+        self.assertEqual(logfiles.discover(spec), [path])
+
+    def test_discover_overrides_by_target_name(self):
+        """Перекрытие оператора приходит словарём «имя цели → шаблоны»."""
+        path = self._write("other-1.log")
+        spec = self._spec()
+        overrides = {"mock": [os.path.join(self.logs, "other-*.log")]}
+        self.assertEqual(logfiles.discover(spec, overrides), [path])
+
+    def test_discover_overrides_as_plain_list(self):
+        """Ретроспектива перекрывает шаблоны одной цели — списком."""
+        path = self._write("other-1.log")
+        spec = self._spec()
+        overrides = [os.path.join(self.logs, "other-*.log")]
+        self.assertEqual(logfiles.discover(spec, overrides), [path])
+
+    def test_discover_without_overrides_keeps_target_globs(self):
+        """Пустое перекрытие — это «шаблоны цели», а не «ничего не искать»."""
+        path = self._write("mock-1.log")
+        self.assertEqual(logfiles.discover(self._spec(), {}), [path])
+
+    # --- кто это демон ----------------------------------------------------
+
+    def test_pid_of_reads_target_regex(self):
+        spec = self._spec()
+        self.assertEqual(logfiles.pid_of(spec, "/x/mock-4242.log"), 4242)
+
+    def test_pid_of_unknown_without_regex(self):
+        """Нет регулярки — PID неизвестен, а не «ноль» и не «нет демона»."""
+        spec = self._spec(log_pid_regex="")
+        self.assertIsNone(logfiles.pid_of(spec, "/x/mock-4242.log"))
+
+    def test_pid_of_none_on_mismatch(self):
+        spec = self._spec()
+        self.assertIsNone(logfiles.pid_of(spec, "/x/other-4242.log"))
+
+    def test_pid_of_none_on_broken_regex(self):
+        """Негодная регулярка не должна ронять уборку."""
+        spec = self._spec(log_pid_regex="([")
+        self.assertIsNone(logfiles.pid_of(spec, "/x/mock-4242.log"))
+
+    def test_pid_for_falls_back_to_file_name(self):
+        """Имя файла разбирается, когда описание цели не совпало."""
+        self.assertEqual(logfiles.pid_for(self._spec(), "/x/daemon-77.out.log"),
+                         77)
+
+    def test_group_of_reads_target_regex(self):
+        spec = self._spec()
+        self.assertEqual(logfiles.group_of(spec, "/x/mock-42.00.log"),
+                         "mock-42")
+
+    def test_group_of_unknown_without_regex(self):
+        spec = self._spec(log_group_regex="")
+        self.assertIsNone(logfiles.group_of(spec, "/x/mock-42.00.log"))
+
+    def test_instance_of_prefers_group(self):
+        spec = self._spec()
+        self.assertEqual(logfiles.instance_of(spec, "/x/mock-42.00.log"),
+                         "mock-42")
+
+    def test_instance_of_falls_back_to_file_name(self):
+        """Без регулярки группировки инстанс видно только в имени файла."""
+        spec = self._spec(log_group_regex="")
+        self.assertEqual(
+            logfiles.instance_of(spec, "/x/kotlin-daemon.2026-10-20.08-827.00.log"),
+            "827")
+
+    def test_is_forbidden(self):
+        spec = self._spec()
+        self.assertTrue(logfiles.is_forbidden(spec, "mock-marker-123"))
+        self.assertFalse(logfiles.is_forbidden(spec, "mock-42.00.log"))
+
+    # --- жив ли демон -----------------------------------------------------
+
+    def test_daemon_alive_unknown_without_pid_regex(self):
+        spec = self._spec(log_pid_regex="")
+        self.assertIsNone(logfiles.daemon_alive(spec, "/x/mock-4242.log"))
+
+    def test_daemon_alive_true_for_own_pid(self):
+        spec = self._spec()
+        path = os.path.join(self.logs, f"mock-{os.getpid()}.log")
+        self.assertTrue(logfiles.daemon_alive(spec, path))
+
+    def test_daemon_alive_false_for_missing_pid(self):
+        spec = self._spec()
+        path = os.path.join(self.logs, "mock-999999.log")
+        self.assertFalse(logfiles.daemon_alive(spec, path))
+
+    def test_is_target_process_matches_cmdline(self):
+        """Процесс должен быть похож на демона цели, а не просто на живой."""
+        spec = self._spec(name="mock", match_cmdline="python")
+        targets = reaper.TargetSet({"mock": spec})
+        self.assertTrue(logfiles.is_target_process(os.getpid(), spec, targets))
+
+    def test_is_target_process_rejects_foreign_process(self):
+        spec = self._spec(name="mock", match_cmdline="definitely-not-here")
+        targets = reaper.TargetSet({"mock": spec})
+        self.assertFalse(logfiles.is_target_process(os.getpid(), spec, targets))
+
+    # --- инструменты пользуются общим правилом ---------------------------
+
+    def test_prune_uses_common_implementation(self):
+        """Уборщик не должен заводить свою копию правила."""
+        self.assertIs(prune.pid_of, logfiles.pid_of)
+        self.assertIs(prune.is_forbidden, logfiles.is_forbidden)
+
+    def test_prune_group_falls_back_to_path(self):
+        """В уборке «файл сам себе группа»: открытый файл защищает группу."""
+        kotlin = self._spec(log_group_regex="")
+        self.assertEqual(prune.group_of(kotlin, "/x/mock-1.log"),
+                         "/x/mock-1.log")
+
+    def test_history_uses_common_implementation(self):
+        """История и общий модуль должны понимать логи одинаково."""
+        spec = self._spec()
+        path = "/x/mock-42.00.log"
+        self.assertEqual(history._instance_for(path, spec),
+                         logfiles.instance_of(spec, path))
+        self.assertEqual(history._pid_for("/x/daemon-77.out.log", spec),
+                         logfiles.pid_for(spec, "/x/daemon-77.out.log"))

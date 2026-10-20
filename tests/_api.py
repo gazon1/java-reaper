@@ -11,6 +11,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from reaper import idlestats, logfiles  # noqa: E402,F401
 from reaper.classify import build_context, classify, evaluate, recreate_cost  # noqa: E402,F401
 from reaper.cli import archive_vanished  # noqa: E402,F401
 from reaper.collect import (  # noqa: E402,F401
@@ -49,6 +50,7 @@ from reaper.history import (  # noqa: E402,F401
     parse_kotlin_ts,
     read_history,
     summarize_by_path,
+    summarize_builds,
     summarize_gradle,
     summarize_kotlin,
 )
@@ -124,6 +126,7 @@ from reaper.report import (  # noqa: E402,F401
     health,
     kind_summary,
     pilot_report,
+    redact_home,
 )
 from reaper.state import (  # noqa: E402,F401
     DAEMON_FIELDS,
