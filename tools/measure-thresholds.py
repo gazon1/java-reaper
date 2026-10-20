@@ -42,6 +42,16 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from reaper.config import load_config, resolve_targets  # noqa: E402
+from reaper.corpus import (  # noqa: E402
+    gaps_between_builds,
+    human,
+    percentile,
+    read_jsonl,
+    rule_coverage,
+    stuck_summaries,
+    tail_idle,
+    tail_idle_bounds,
+)
 from reaper.targets import (  # noqa: E402
     ACTIVITY_MARKERS,
     TargetSet,
@@ -51,48 +61,6 @@ from reaper.targets import (  # noqa: E402
 # Минимальный размер выборки, при котором вывод можно принимать к сведению.
 # Ниже — вывод не делается, но показывается, чего не хватает.
 MIN_SAMPLE = 30
-
-
-def read_jsonl(path: str) -> List[dict[str, Any]]:
-    """Читает JSONL-журнал, пропуская битые строки (одна не должна ронять разбор)."""
-    rows: List[dict[str, Any]] = []
-    if not os.path.isfile(path):
-        return rows
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                value = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(value, dict):
-                rows.append(value)
-    return rows
-
-
-def percentile(values: Sequence[float], q: float) -> float:
-    """Перцентиль (линейная интерполяция)."""
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return float(ordered[0])
-    pos = (len(ordered) - 1) * (q / 100.0)
-    low = int(pos)
-    high = min(low + 1, len(ordered) - 1)
-    frac = pos - low
-    return float(ordered[low] * (1.0 - frac) + ordered[high] * frac)
-
-
-def human(value: float, digits: int = 1) -> str:
-    return f"{value:,.{digits}f}".replace(",", " ")
-
-
-# --------------------------------------------------------------------------- #
-# Часть 1: журнал свипов — давление по памяти
-# --------------------------------------------------------------------------- #
 
 
 def measure_sweeps(rows: List[dict[str, Any]], cfg: dict[str, Any],
@@ -113,6 +81,7 @@ def measure_sweeps(rows: List[dict[str, Any]], cfg: dict[str, Any],
             footprint_by_kind.setdefault(kind, []).append(value)
 
     sweeps_with_impact = sum(1 for v in under_impact if v > 0)
+    coverage = rule_coverage(rows)
     result: Dict[str, Any] = {
         "sweeps": len(rows),
         "period_days": (max(r["at"] for r in rows)
@@ -126,6 +95,7 @@ def measure_sweeps(rows: List[dict[str, Any]], cfg: dict[str, Any],
         "large_daemon_mb": large_mb,
         "footprint_by_kind": {},
         "free_memory": {},
+        "rule_coverage": coverage,
     }
 
     for kind, values in sorted(footprint_by_kind.items()):
@@ -171,42 +141,6 @@ def measure_sweeps(rows: List[dict[str, Any]], cfg: dict[str, Any],
 # --------------------------------------------------------------------------- #
 
 
-def gaps_between_builds(record: dict[str, Any]) -> Optional[float]:
-    """Простой МЕЖДУ сборками, секунды (сумма промежутков).
-
-    Это «живой простой»: сколько демон ждал между сборками, пока ещё был
-    нужен. Порог простоя обязан быть выше него — иначе мы будем мешать
-    работающей программе.
-    """
-    builds = record.get("builds") or []
-    if not builds:
-        return None
-    total = 0.0
-    for i in range(len(builds) - 1):
-        end = builds[i][1]
-        if end is None:
-            continue
-        start_next = builds[i + 1][0]
-        if start_next is not None and start_next > end:
-            total += start_next - end
-    return total
-
-
-def tail_idle(record: dict[str, Any]) -> Optional[float]:
-    """Простой от последней работы до смерти демона, секунды.
-
-    Именно это решает рейпер: «простой = прошло с последней измеренной
-    активности». Измерить можно там, где момент смерти известен — то есть
-    где рейпер заметил пропажу демона (death_observed_at). Без этого
-    отметки простой умершего демона не виден вовсе: лог-то замолчал давно.
-    """
-    last = record.get("last_activity")
-    death = record.get("death_observed_at")
-    if last is None or death is None or death <= last:
-        return None
-    return death - last
-
-
 def measure_history(rows: List[dict[str, Any]],
                     targets: TargetSet) -> Dict[str, Any]:
     """Что показывает история сводок: простой по видам против порогов целей."""
@@ -215,10 +149,13 @@ def measure_history(rows: List[dict[str, Any]],
 
     gaps: Dict[str, List[float]] = {}
     tails: Dict[str, List[float]] = {}
+    tail_bounds: Dict[str, List[tuple[float, float]]] = {}
     unknown: Dict[str, int] = {}
     deaths: Dict[str, int] = {}
+    totals_by_kind: Dict[str, int] = {}
     for record in rows:
         kind = str(record.get("kind") or "unknown")
+        totals_by_kind[kind] = totals_by_kind.get(kind, 0) + 1
         if record.get("death_observed_at") is not None:
             deaths[kind] = deaths.get(kind, 0) + 1
         gap = gaps_between_builds(record)
@@ -227,6 +164,9 @@ def measure_history(rows: List[dict[str, Any]],
         tail = tail_idle(record)
         if tail is not None:
             tails.setdefault(kind, []).append(tail)
+        bounds = tail_idle_bounds(record)
+        if bounds is not None:
+            tail_bounds.setdefault(kind, []).append(bounds)
         if gap is None and tail is None:
             unknown[kind] = unknown.get(kind, 0) + 1
 
@@ -235,6 +175,8 @@ def measure_history(rows: List[dict[str, Any]],
         "kinds": {},
         "unmeasurable_by_kind": unknown,
         "deaths_observed_by_kind": deaths,
+        "stuck": stuck_summaries(rows),
+        "totals_by_kind": totals_by_kind,
     }
     kinds = sorted(set(gaps) | set(tails))
     for kind in kinds:
@@ -271,6 +213,26 @@ def measure_history(rows: List[dict[str, Any]],
                 bucket["tail"]["over_limit"] = over
                 bucket["tail"]["over_limit_pct"] = (
                     round(100.0 * over / len(tail_values), 1) if tail_values else 0.0)
+
+        # Границы хвостового простоя: момент смерти известен с точностью до
+        # интервала свипа. Нижняя граница (демон точно жил) не завышает
+        # простой — значит, не создаёт мнимых «долгих простоев».
+        bounds_list = tail_bounds.get(kind, [])
+        if bounds_list:
+            lowers = [b[0] for b in bounds_list]
+            uppers = [b[1] for b in bounds_list]
+            bucket["tail_bounds"] = {
+                "measured": len(bounds_list),
+                "lower_max_min": max(lowers) / 60.0,
+                "upper_max_min": max(uppers) / 60.0,
+                "lower_p90_min": percentile(lowers, 90) / 60.0,
+                "upper_p90_min": percentile(uppers, 90) / 60.0,
+            }
+            if limit is not None:
+                bucket["tail_bounds"]["over_limit_lower"] = sum(
+                    1 for b in bounds_list if b[0] > limit)
+                bucket["tail_bounds"]["over_limit_upper"] = sum(
+                    1 for b in bounds_list if b[1] > limit)
 
         # Вердикт: данных мало — вывода нет; данных хватает — говорим прямо.
         if bucket["measured"] < MIN_SAMPLE:
@@ -332,6 +294,18 @@ def print_report(sweeps: Dict[str, Any], history: Dict[str, Any]) -> None:
         print()
         print(f"  ВЫВОД: {sweeps['verdict']}")
 
+        coverage = sweeps.get("rule_coverage") or {}
+        if coverage.get("sweeps"):
+            print()
+            print("  Покрытие правил (какие пороги вообще проверены):")
+            for rule, count in (coverage.get("fired") or {}).items():
+                print(f"    сработало {count:>6} раз  {rule}")
+            never = coverage.get("never_fired") or []
+            if never:
+                print(f"    НИ РАЗУ не сработало: {', '.join(never)}")
+                print("      → пороги за этими правилами на живых демонах не "
+                      "проверены")
+
     print()
     print("2. Простой по видам (по истории сводок демонов)")
     print("-" * 78)
@@ -363,12 +337,52 @@ def print_report(sweeps: Dict[str, Any], history: Dict[str, Any]) -> None:
                 if "over_limit" in tail:
                     print(f"      дольше порога цели: {tail['over_limit']}"
                           f" ({tail['over_limit_pct']} %)")
+            if "tail_bounds" in data:
+                bounds = data["tail_bounds"]
+                print(f"    границы хвостового простоя (смерть известна с "
+                      f"точностью до свипа): замеров {bounds['measured']},"
+                      f" максимум от {human(bounds['lower_max_min'])}"
+                      f" до {human(bounds['upper_max_min'])} мин")
+                if "over_limit_lower" in bounds:
+                    print(f"      дольше порога: по нижней границе "
+                          f"{bounds['over_limit_lower']}, по верхней "
+                          f"{bounds['over_limit_upper']}")
             print(f"    {data['verdict']}")
         deaths = history.get("deaths_observed_by_kind") or {}
         if deaths:
             print()
             print("  момент смерти замечен у:", ", ".join(
                 f"{kind} — {count}" for kind, count in sorted(deaths.items())))
+
+        stuck = history.get("stuck") or {}
+        counts = stuck.get("count_by_kind") or {}
+        if counts:
+            print()
+            print("  ЗАВИСШИЕ (клиент отвалился во время сборки) — единственный "
+                  "класс, который программа сама не убирает:")
+            for kind, count in sorted(counts.items()):
+                lifetimes = (stuck.get("lifetimes_by_kind") or {}).get(kind) or []
+                share = ""
+                total = (history.get("totals_by_kind") or {}).get(kind, 0)
+                if total:
+                    share = f" ({100.0 * count / total:.1f} % всех демонов вида)"
+                print(f"    {kind}: {count}{share}")
+                if lifetimes:
+                    print(f"      прожили после отмены: замеров {len(lifetimes)},"
+                          f" p50 = {human(percentile(lifetimes, 50) / 60.0)} мин,"
+                          f" p90 = {human(percentile(lifetimes, 90) / 60.0)} мин,"
+                          f" максимум = {human(max(lifetimes) / 60.0)} мин")
+                    sources = stuck.get("sources") or {}
+                    if sources:
+                        print(f"      откуда оценка: " + ", ".join(
+                            f"{key} — {count}" for key, count in
+                            sorted(sources.items()))
+                            + " (mtime — «умер сразу после последней записи»,"
+                              " оценка снизу; death_mark — рейпер видел пропажу; "
+                              "last_seen — рейпер видел демона живым)")
+                else:
+                    print("      сколько прожили после отмены — измерить нечем: "
+                          "момент смерти не замечен")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

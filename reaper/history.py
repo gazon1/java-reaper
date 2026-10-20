@@ -25,6 +25,7 @@ import os
 import time
 from typing import Any
 
+from .corpus import read_jsonl
 from .logfiles import (instance_from_log_name, instance_of, pid_for,
                        pid_from_log_name)
 from .logparse import Markers, parse_line_ts, scan_file
@@ -244,21 +245,13 @@ def append_history(path: str, record: dict[str, Any]) -> None:
 
 
 def read_history(path: str) -> list[dict[str, Any]]:
-    """Читает историю сводок."""
-    out: list[dict[str, Any]] = []
-    try:
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    out.append(json.loads(line))
-                except ValueError:
-                    continue
-    except OSError:
-        return []
-    return out
+    """Читает историю сводок.
+
+    Разбор журнала — общий (`corpus.read_jsonl`): иначе прибор измерения и
+    симулятор читали бы один и тот же файл по-разному, и их цифры
+    разошлись бы из-за мелочи вроде битой строки.
+    """
+    return read_jsonl(path)
 
 
 def history_keys(path: str) -> set[tuple[str, float]]:
@@ -339,7 +332,8 @@ def _instance_for(path: str, spec: Any) -> str | None:
 
 def archive_daemon_log(path: str, kind: str | None, history_path: str,
                        death_observed_at: float | None = None,
-                       targets: TargetSet | None = None) -> bool:
+                       targets: TargetSet | None = None,
+                       last_seen_at: float | None = None) -> bool:
     """Сохраняет сводку по логу демона в историю. True — сохранили.
 
     Нужно для демонов, которых больше нет: их логи в `/tmp` исчезают при
@@ -350,12 +344,21 @@ def archive_daemon_log(path: str, kind: str | None, history_path: str,
     источник знания о его смерти: лог молчит с момента последней записи,
     и без этой отметки простой не виден вовсе (симулятор посчитал бы
     демона умершим сразу после последней активности).
+
+    `last_seen_at` — момент, когда демона видели В ПОСЛЕДНИЙ РАЗ (конец
+    предыдущего свипа). Между ним и `death_observed_at` демон умер, но
+    когда именно — неизвестно. Нижняя граница нужна, чтобы оценивать простой
+    честно: считать, что демон жил до момента обнаружения, — это завышать
+    его простой (и выглядеть так, будто он простаивал дольше, чем на самом
+    деле). С нижней границей измерение не завышает.
     """
     record = summarize_by_path(path, kind, targets)
     if record is None:
         return False
     if death_observed_at is not None:
         record["death_observed_at"] = float(death_observed_at)
+    if last_seen_at is not None:
+        record["last_seen_at"] = float(last_seen_at)
     append_history(history_path, record)
     return True
 

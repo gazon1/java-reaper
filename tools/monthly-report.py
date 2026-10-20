@@ -37,27 +37,19 @@ if ROOT not in sys.path:
 
 from reaper.config import load_config, resolve_targets  # noqa: E402
 from reaper.state import load_state, read_kills, sweeps_path  # noqa: E402
+from reaper.corpus import read_jsonl  # noqa: E402
 from reaper.targets import load_targets  # noqa: E402
 
 
 def read_sweeps(cfg: dict, since: float) -> list[dict]:
-    """Читает журнал свипов за период — это ИСТОРИЯ решений."""
-    out: list[dict] = []
-    try:
-        with open(sweeps_path(cfg), encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                if float(rec.get("at", 0)) >= since:
-                    out.append(rec)
-    except OSError:
-        return []
-    return out
+    """Читает журнал свипов за период — это ИСТОРИЯ решений.
+
+    Разбор журнала общий (`corpus.read_jsonl`): месячный отчёт, прибор
+    измерения и симулятор читают один и тот же файл и должны получать
+    один и тот же результат.
+    """
+    return [rec for rec in read_jsonl(sweeps_path(cfg))
+            if float(rec.get("at", 0)) >= since]
 
 
 def period_days(days: int) -> float:
