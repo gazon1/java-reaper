@@ -551,5 +551,72 @@ class TestKindSignatures(unittest.TestCase):
         self.assertEqual(len(state["would_kill"]), 2)
 
 
+class TestOverrideInheritsBuiltin(unittest.TestCase):
+    """Переопределение встроенной цели меняет только написанное.
+
+    Иначе частичное описание цели молча ломает остальное: цель «kotlin»
+    без ts_format получила бы iso вместо local (и перестала бы понимать
+    свои таймстемпы), а цель без log_name_regex — «своего лога нет», и
+    демон навсегда попадал бы под защиту no-log.
+    """
+
+    def _yaml(self, body: str) -> str:
+        return "targets:\n" + body
+
+    def test_unspecified_fields_are_inherited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "targets.yaml")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(self._yaml(
+                    "  - name: kotlin\n"
+                    "    label: Kotlin (мой)\n"))
+            targets = tg.load_targets(path)
+        spec = targets.get("kotlin")
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.label, "Kotlin (мой)")
+        # Не написано — значит осталось как было у встроенной цели.
+        self.assertEqual(spec.ts_format, tg.TS_LOCAL)
+        self.assertEqual(spec.log_name_regex, r"^kotlin-daemon\..*\.log$")
+        self.assertTrue(spec.rebuildable)
+
+    def test_explicit_value_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "targets.yaml")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(self._yaml(
+                    "  - name: kotlin\n"
+                    "    ts_format: iso\n"
+                    "    idle_seconds: 3600\n"))
+            targets = tg.load_targets(path)
+        spec = targets.get("kotlin")
+        self.assertEqual(spec.ts_format, tg.TS_ISO)
+        self.assertEqual(spec.idle_seconds, 3600)
+
+    def test_explicit_empty_log_regex_means_no_own_log(self):
+        """Пустая регулярка — это «своего лога нет», а не «наследовать»."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "targets.yaml")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(self._yaml(
+                    "  - name: gradle\n"
+                    "    log_name_regex: ''\n"))
+            targets = tg.load_targets(path)
+        self.assertEqual(targets.get("gradle").log_name_regex, "")
+
+    def test_new_target_does_not_inherit_anything(self):
+        """Новая цель — дефолты, и rebuildable по умолчанию False."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "targets.yaml")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(self._yaml(
+                    "  - name: brandnew\n"
+                    "    match_cmdline: 'brandnew'\n"))
+            targets = tg.load_targets(path)
+        spec = targets.get("brandnew")
+        self.assertFalse(spec.rebuildable)
+        self.assertEqual(spec.log_name_regex, "")
+        self.assertEqual(spec.ts_format, tg.TS_ISO)
+
+
 if __name__ == "__main__":
     unittest.main()
