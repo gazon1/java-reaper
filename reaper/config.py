@@ -42,6 +42,9 @@ DEFAULTS: dict[str, Any] = {
     # назад и не завершившаяся, — это зависший демон, а не идущая работа;
     # иначе один зависший Gradle-демон блокировал бы уборку Kotlin-навсегда.
     "GRADLE_BUILD_ACTIVE_SECONDS": 1800,  # 30 мин
+    # Общее окно «свежей сборки» — для видов, которых нет в плоских ключах
+    # (то есть для новых целей, описанных в targets.yaml).
+    "BUILD_ACTIVE_SECONDS": 1800,
     # Давление по памяти: сколько свободной памяти (МБ) считается «мало».
     # Ниже этого порога машина нуждается в памяти, и простаивающие демоны
     # подлежат уборке. Выше — памяти хватает, и рейпер не трогает демонов
@@ -167,14 +170,38 @@ def load_config(path: str | None,
 
 
 # Плоские ключи конфига, через которые задавались пороги ДО появления
-# targets.yaml. Оставлены, чтобы не сломать оператора: если ключ реально
-# написан в файле конфига, он главнее значения из targets.yaml (и мы
-# предупреждаем, что порог пора перенести в targets.yaml).
+# targets.yaml.
+#
+# Ключи делятся на два класса, и от этого зависит, кто главнее:
+#
+#   * ПЛОСКИЕ ВИДОВЫЕ (KOTLIN_IDLE_SECONDS, GRADLE_RECREATE_COST_SECONDS,
+#     GRADLE_BUILD_ACTIVE_SECONDS) — относятся к конкретному виду и
+#     достались из прежней настройки. Если такой ключ задан в файле конфига
+#     ЯВНО, он главнее значения из targets.yaml: оператор правил его,
+#     значит это и есть его намерение.
+#
+#   * ПЛОСКИЕ ОБЩИЕ (IDLE_SECONDS, STUCK_AFTER_SECONDS, MIN_FOOTPRINT_MB,
+#     KILL_LARGE_DAEMON_MB и новые) — относятся ко всем видам сразу. Значение
+#     для конкретного вида в targets.yaml СПЕЦИФИЧНЕЕ, поэтому оно главнее;
+#     общий ключ работает там, где в YAML значения нет. Если общий ключ
+#     задан явно и расходится с YAML — рейпер предупреждает: молчать об
+#     этом нельзя, иначе «опечатка в конфиге» выглядит как «рейпер сломался».
 LEGACY_IDLE_KEYS = {"kotlin": "KOTLIN_IDLE_SECONDS"}
 LEGACY_COST_KEYS = {
     "gradle": "GRADLE_RECREATE_COST_SECONDS",
     "kotlin": "KOTLIN_RECREATE_COST_SECONDS",
 }
+LEGACY_BUILD_ACTIVE_KEYS = {"gradle": "GRADLE_BUILD_ACTIVE_SECONDS"}
+
+# (поле спецификации, общий плоский ключ, плоские ключи по видам)
+THRESHOLD_KEYS: tuple[tuple[str, str, dict[str, str]], ...] = (
+    ("idle_seconds", "IDLE_SECONDS", LEGACY_IDLE_KEYS),
+    ("recreate_cost_seconds", "RECREATE_COST_SECONDS", LEGACY_COST_KEYS),
+    ("build_active_seconds", "BUILD_ACTIVE_SECONDS", LEGACY_BUILD_ACTIVE_KEYS),
+    ("stuck_after_seconds", "STUCK_AFTER_SECONDS", {}),
+    ("min_footprint_mb", "MIN_FOOTPRINT_MB", {}),
+    ("large_daemon_mb", "KILL_LARGE_DAEMON_MB", {}),
+)
 
 
 def legacy_idle_key(kind: str) -> str:
@@ -190,54 +217,60 @@ def legacy_cost_key(kind: str) -> str:
 def resolve_targets(targets: "TargetSet", cfg: dict[str, Any],
                     explicit: set[str] | None = None,
                     warnings: list[str] | None = None) -> "TargetSet":
-    """Подставляет в цели пороги простоя и цену воссоздания.
+    """Подставляет в цели пороги (простоя, цены, свежести сборки и прочие).
 
-    Порядок приоритета:
-      1. плоский ключ конфига (IDLE_SECONDS и т. п.), если он ЯВНО задан в
-         файле конфига — оператор правил его, значит он и главный;
-      2. значение из targets.yaml — там живут пороги целей, которых нет в
-         плоском конфиге (то есть новых);
-      3. значение по умолчанию.
+    Приоритет для каждого порога:
+      1. явно заданный плоский ВИДОВОЙ ключ конфига (например
+         KOTLIN_IDLE_SECONDS) — он и есть намерение оператора;
+      2. значение из targets.yaml — оно относится к конкретному виду, то
+         есть специфичнее общего плоского ключа;
+      3. общий плоский ключ конфига (или значение по умолчанию).
 
-    Если ключ конфига и значение из YAML расходятся — рейпер предупреждает:
-    иначе оператор правил бы одно место, а действовало бы другое, и это
-    выглядело бы как «рейпер сломался».
+    Расхождение значений — не молчание, а предупреждение при запуске.
     """
     from dataclasses import replace as _replace
 
     explicit = explicit or set()
     resolved: dict[str, Any] = {}
     for name, spec in targets.specs_by_name().items():
-        idle_key = legacy_idle_key(name)
-        cost_key = legacy_cost_key(name)
-        flat_idle = float(cfg.get(idle_key, DEFAULTS["IDLE_SECONDS"]))
-        flat_cost = float(cfg.get(cost_key, DEFAULTS["RECREATE_COST_SECONDS"]))
-        idle = spec.idle_seconds
-        cost = spec.recreate_cost_seconds
-        if idle is None:
-            idle = flat_idle
-        elif idle_key in explicit:
-            if float(cfg.get(idle_key, idle)) != idle:
-                if warnings is not None:
-                    warnings.append(
-                        f"конфиг: ключ {idle_key}={cfg.get(idle_key)} расходится "
-                        f"с порогом простоя для «{name}» в targets.yaml "
-                        f"({idle:.0f} с) — работает значение из конфига; "
-                        f"перенесите порог в targets.yaml, чтобы править "
-                        f"в одном месте")
-            idle = float(cfg.get(idle_key, idle))
-        if cost is None:
-            cost = flat_cost
-        elif cost_key in explicit:
-            if float(cfg.get(cost_key, cost)) != cost:
-                if warnings is not None:
-                    warnings.append(
-                        f"конфиг: ключ {cost_key}={cfg.get(cost_key)} расходится "
-                        f"с ценой воссоздания для «{name}» в targets.yaml "
-                        f"({cost:.0f} с) — работает значение из конфига")
-            cost = float(cfg.get(cost_key, cost))
-        resolved[name] = _replace(spec, idle_seconds=float(idle),
-                                   recreate_cost_seconds=float(cost))
+        values: dict[str, Any] = {}
+        for field, general_key, per_kind in THRESHOLD_KEYS:
+            yaml_value = getattr(spec, field)
+            kind_key = per_kind.get(name)
+            # 1. Явно заданный плоский ВИДОВОЙ ключ — намерение оператора.
+            if kind_key is not None and kind_key in explicit:
+                flat = float(cfg.get(kind_key, DEFAULTS[kind_key]))
+                if yaml_value is not None and float(yaml_value) != flat:
+                    if warnings is not None:
+                        warnings.append(
+                            f"конфиг: ключ {kind_key}={cfg.get(kind_key)} "
+                            f"расходится с порогом для «{name}» в "
+                            f"targets.yaml ({float(yaml_value):.0f}) — работает "
+                            f"значение из конфига; перенесите порог в "
+                            f"targets.yaml, чтобы править в одном месте")
+                values[field] = flat
+                continue
+            # 2. Значение из targets.yaml — оно относится к конкретному
+            #    виду, то есть специфичнее общего плоского ключа.
+            if yaml_value is not None:
+                if general_key in explicit:
+                    flat = float(cfg.get(general_key, DEFAULTS[general_key]))
+                    if flat != float(yaml_value):
+                        if warnings is not None:
+                            warnings.append(
+                                f"конфиг: ключ {general_key}={cfg.get(general_key)} "
+                                f"расходится с порогом для «{name}» в "
+                                f"targets.yaml ({float(yaml_value):.0f}) — "
+                                f"работает значение из targets.yaml; уберите "
+                                f"общий ключ из конфига, чтобы править "
+                                f"в одном месте")
+                values[field] = float(yaml_value)
+                continue
+            # 3. Запасной путь: видовой ключ (с его значением по умолчанию),
+            #    а для новых видов — общий ключ.
+            fallback = kind_key or general_key
+            values[field] = float(cfg.get(fallback, DEFAULTS[fallback]))
+        resolved[name] = _replace(spec, **values)
     return TargetSet(resolved)
 
 

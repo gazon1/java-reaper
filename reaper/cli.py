@@ -193,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
                 "events": int(metric.get("events", 0)),
                 "reused": int(metric.get("reused", 0)),
                 "reuse_rate": float(metric.get("rate", 0.0)),
+                "by_kind": metric.get("by_kind", {}),
                 "pilot_started_at": state.get("pilot_started_at", 0.0),
                 "freed_mb": state.get("freed_mb", 0),
                 "would_free_mb": state.get("would_free_mb", 0),

@@ -452,6 +452,57 @@ class TestMetric(unittest.TestCase):
         self.assertEqual(metric["events"], 1)
         self.assertEqual(metric["pending"], 0)
 
+    def test_metric_split_by_kind(self):
+        """Метрика разбита по видам: у разных видов разная цена ошибки."""
+        gradle = make_daemon(pid=1, kind="gradle", last_build_end=NOW - 5 * HOUR)
+        kotlin = make_daemon(pid=2, kind="kotlin", last_build_end=NOW - 5 * HOUR)
+        state = {}
+        decisions = [
+            reaper.Decision(gradle, True, "x", recreate_cost_seconds=40),
+            reaper.Decision(kotlin, True, "x", recreate_cost_seconds=5),
+        ]
+        reaper.update_metric(state, decisions, NOW, self.cfg)
+        # Закрываем окно, чтобы события получили исход.
+        later = NOW + 10 * HOUR
+        reaper.update_metric(state, [], later, self.cfg)
+        metric = state["metric"]
+        self.assertIn("gradle", metric["by_kind"])
+        self.assertIn("kotlin", metric["by_kind"])
+        self.assertEqual(metric["by_kind"]["gradle"]["counted"], 1)
+        self.assertEqual(metric["by_kind"]["kotlin"]["counted"], 1)
+
+    def test_event_remembers_kind_and_cost(self):
+        d = make_daemon(kind="gradle", last_build_end=NOW - 5 * HOUR)
+        state = {}
+        reaper.update_metric(state, [reaper.Decision(d, True, "x",
+                                                     recreate_cost_seconds=40)],
+                             NOW, self.cfg)
+        event = state["would_kill"][0]
+        self.assertEqual(event["kind"], "gradle")
+        self.assertEqual(event["cost"], 40)
+
+    def test_weighted_rate_counts_expensive_false_positive_more(self):
+        """Взвешивание по цене: дорогое ложное срабатывание весит больше."""
+        state = {
+            "would_kill": [
+                {"pid": 1, "at": NOW - 10 * HOUR, "reused": True, "final": True,
+                 "outcome": "reused", "kind": "gradle", "cost": 40.0},
+                {"pid": 2, "at": NOW - 10 * HOUR, "reused": False, "final": True,
+                 "outcome": "not_reused", "kind": "gradle", "cost": 40.0},
+                {"pid": 3, "at": NOW - 10 * HOUR, "reused": False, "final": True,
+                 "outcome": "not_reused", "kind": "esbuild", "cost": 5.0},
+            ]
+        }
+        metric = reaper.update_metric(state, [], NOW, self.cfg)
+        gradle = metric["by_kind"]["gradle"]
+        self.assertAlmostEqual(gradle["rate"], 0.5)
+        self.assertAlmostEqual(gradle["rate_weighted"], 0.5)
+        self.assertEqual(gradle["cost_reused_seconds"], 40.0)
+        # Дешёвый вид: одно ложное из одного события.
+        esbuild = metric["by_kind"]["esbuild"]
+        self.assertEqual(esbuild["rate"], 0.0)
+        self.assertEqual(esbuild["cost_reused_seconds"], 0.0)
+
     def test_new_event_registered_once(self):
         d = make_daemon(last_build_end=NOW - 5 * HOUR)
         state = {}

@@ -191,15 +191,26 @@ class TestThresholdResolution(unittest.TestCase):
         self.assertEqual(resolved.get("kotlin").idle_seconds, 7200)
         self.assertEqual(self.warnings, [])
 
-    def test_flat_key_wins_over_yaml(self):
-        """Оператор правил старый ключ конфига — он и главный."""
+    def test_per_kind_flat_key_wins_over_yaml(self):
+        """Видовой ключ конфига (KOTLIN_IDLE_SECONDS) — намерение оператора."""
+        cfg = dict(self.cfg)
+        cfg["KOTLIN_IDLE_SECONDS"] = 3600
+        targets = tg.TargetSet({"kotlin": tg.TargetSpec(name="kotlin",
+                                                        idle_seconds=7200)})
+        resolved = reaper.resolve_targets(targets, cfg, {"KOTLIN_IDLE_SECONDS"},
+                                          self.warnings)
+        self.assertEqual(resolved.get("kotlin").idle_seconds, 3600)
+
+    def test_yaml_is_more_specific_than_general_key(self):
+        """Общий ключ конфига — менее специфичен, чем значение для вида."""
         cfg = dict(self.cfg)
         cfg["IDLE_SECONDS"] = 3600
         targets = tg.TargetSet({"gradle": tg.TargetSpec(name="gradle",
                                                         idle_seconds=21600)})
         resolved = reaper.resolve_targets(targets, cfg, {"IDLE_SECONDS"},
                                           self.warnings)
-        self.assertEqual(resolved.get("gradle").idle_seconds, 3600)
+        self.assertEqual(resolved.get("gradle").idle_seconds, 21600)
+        self.assertTrue(any("IDLE_SECONDS" in w for w in self.warnings))
 
     def test_mismatch_warns(self):
         """Значения расходятся — молчать об этом нельзя."""
@@ -209,6 +220,35 @@ class TestThresholdResolution(unittest.TestCase):
                                                         idle_seconds=21600)})
         reaper.resolve_targets(targets, cfg, {"IDLE_SECONDS"}, self.warnings)
         self.assertTrue(any("IDLE_SECONDS" in w for w in self.warnings))
+
+    def test_builtin_values_unchanged(self):
+        """Главное: значения встроенных целей не поехали."""
+        targets = reaper.resolve_targets(reaper.builtin_targets(),
+                                         dict(self.cfg), set(), [])
+        gradle = targets.get("gradle")
+        kotlin = targets.get("kotlin")
+        self.assertEqual(gradle.idle_seconds, 21600)
+        self.assertEqual(gradle.recreate_cost_seconds, 40)
+        self.assertEqual(gradle.build_active_seconds, 1800)
+        self.assertEqual(gradle.stuck_after_seconds, 3600)
+        self.assertEqual(kotlin.idle_seconds, 7200)
+        self.assertEqual(kotlin.recreate_cost_seconds, 5)
+
+    def test_new_target_gets_its_own_thresholds(self):
+        """У новой цели — свои пороги из YAML."""
+        targets = tg.TargetSet({
+            "esbuild": tg.TargetSpec(name="esbuild", idle_seconds=3600,
+                                     recreate_cost_seconds=2,
+                                     min_footprint_mb=64,
+                                     large_daemon_mb=2048),
+        })
+        resolved = reaper.resolve_targets(targets, dict(self.cfg), set(),
+                                          self.warnings)
+        spec = resolved.get("esbuild")
+        self.assertEqual(spec.idle_seconds, 3600)
+        self.assertEqual(spec.recreate_cost_seconds, 2)
+        self.assertEqual(spec.min_footprint_mb, 64)
+        self.assertEqual(spec.large_daemon_mb, 2048)
 
     def test_agreeing_values_do_not_warn(self):
         cfg = dict(self.cfg)

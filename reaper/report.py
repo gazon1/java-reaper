@@ -301,17 +301,58 @@ def pilot_report(cfg: dict[str, Any], state: dict[str, Any],
     min_events = int(cfg.get("PILOT_MIN_EVENTS", PILOT_MIN_EVENTS))
     max_rate = float(cfg.get("PILOT_MAX_REUSE_RATE", PILOT_MAX_REUSE_RATE))
 
-    if counted < min_events:
-        verdict = (f"ДАННЫХ МАЛО: наблюдённых событий {counted} из нужных "
-                   f"{min_events} — вердикт не выносим")
+    # Вердикт — по видам: у каждого своя цена ошибки, и общая цифра смешала
+    # бы «ложное срабатывание на 40-секундном Gradle» с «ложным
+    # срабатыванием на 2-секундном демоне». Вид, у которого событий мало,
+    # своего вердикта не получает (данных недостаточно).
+    by_kind = metric.get("by_kind") or {}
+    kind_verdicts: list[dict[str, Any]] = []
+    for kind, data in sorted(by_kind.items()):
+        kind_counted = int(data.get("counted", 0))
+        kind_rate = float(data.get("rate", 0.0))
+        if kind_counted < min_events:
+            kind_code = 2
+        elif kind_rate > max_rate:
+            kind_code = 1
+        else:
+            kind_code = 0
+        kind_verdicts.append({"kind": kind, "counted": kind_counted,
+                              "reused": int(data.get("reused", 0)),
+                              "rate": kind_rate,
+                              "rate_weighted": float(data.get("rate_weighted", 0.0)),
+                              "cost_reused_seconds": float(
+                                  data.get("cost_reused_seconds", 0.0)),
+                              "verdict_code": kind_code})
+    judged = [v for v in kind_verdicts if v["verdict_code"] != 2]
+    if not kind_verdicts and counted:
+        # Метрика старого формата (без разбивки по видам) — вердикт как раньше,
+        # по общей цифре. Так читаются состояния, набранные до появления целей.
+        if counted < min_events:
+            verdict = (f"ДАННЫХ МАЛО: наблюдённых событий {counted} из нужных "
+                       f"{min_events} — вердикт не выносим")
+            code = 2
+        elif rate > max_rate:
+            verdict = (f"НЕ ВКЛЮЧАТЬ: доля ложных срабатываний "
+                       f"{100 * rate:.0f} % > {100 * max_rate:.0f} %")
+            code = 1
+        else:
+            verdict = (f"МОЖНО ВКЛЮЧАТЬ: доля ложных срабатываний "
+                       f"{100 * rate:.0f} % ≤ {100 * max_rate:.0f} %, "
+                       f"наблюдённых событий {counted}")
+            code = 0
+    elif not judged:
+        verdict = (f"ДАННЫХ МАЛО: ни у одного вида не набралось {min_events} "
+                   f"наблюдённых событий — вердикт не выносим")
         code = 2
-    elif rate > max_rate:
-        verdict = (f"НЕ ВКЛЮЧАТЬ: доля ложных срабатываний "
-                   f"{100 * rate:.0f} % > {100 * max_rate:.0f} %")
+    elif any(v["verdict_code"] == 1 for v in judged):
+        worst = next(v for v in judged if v["verdict_code"] == 1)
+        verdict = (f"НЕ ВКЛЮЧАТЬ: у вида «{worst['kind']}» доля ложных "
+                   f"срабатываний {100 * worst['rate']:.0f} % > "
+                   f"{100 * max_rate:.0f} %")
         code = 1
     else:
-        verdict = (f"МОЖНО ВКЛЮЧАТЬ: доля ложных срабатываний {100 * rate:.0f} % "
-                   f"≤ {100 * max_rate:.0f} %, наблюдённых событий {counted}")
+        verdict = (f"МОЖНО ВКЛЮЧАТЬ: у всех видов с достаточной выборкой доля "
+                   f"ложных ≤ {100 * max_rate:.0f} %")
         code = 0
 
     kills = read_kills(cfg, limit=0)
@@ -338,8 +379,18 @@ def pilot_report(cfg: dict[str, Any], state: dict[str, Any],
         f"  «зависший клиент» снял защиту: {int(state.get('stale_peer_events', 0))} раз",
         f"  демонов с зависшим клиентом: {len(state.get('stale_peer_daemons', {}))}",
         "",
-        f"ВЕРДИКТ: {verdict}",
     ]
+    if kind_verdicts:
+        lines.append("По видам демонов (у каждого своя цена ошибки):")
+        for item in kind_verdicts:
+            mark = {0: "ок", 1: "ПЛОХО", 2: "мало данных"}.get(item["verdict_code"])
+            lines.append(
+                f"  {item['kind']}: событий {item['counted']}, ложных "
+                f"{100 * item['rate']:.0f} % (взвешенно по цене "
+                f"{100 * item['rate_weighted']:.0f} %), цена ложных "
+                f"{item['cost_reused_seconds']:.0f} с — {mark}")
+        lines.append("")
+    lines.append(f"ВЕРДИКТ: {verdict}")
     return "\n".join(lines), code
 
 

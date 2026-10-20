@@ -118,6 +118,7 @@ def collect(cfg: dict, days: int, targets=None) -> dict:
         "freed_mb": int(state.get("freed_mb", 0)),
         "would_free_mb": int(state.get("would_free_mb", 0)),
         "metric": {"events": events, "reused": reused, "rate": rate,
+                   "by_kind": metric.get("by_kind", {}),
                    "pending": pending},
         "false_positive_rate": rate,
         "min_events": int(cfg.get("PILOT_MIN_EVENTS", 8)),
@@ -192,6 +193,15 @@ def format_report(data: dict) -> str:
     ]
     if metric["events"] < data["min_events"]:
         lines.append("    данных пока мало — вердикт не выносится (см. --pilot)")
+    by_kind = metric.get("by_kind") or {}
+    if by_kind:
+        lines.append("  по видам (у каждого своя цена ошибки):")
+        for kind, data in sorted(by_kind.items()):
+            lines.append(
+                f"    {kind}: событий {data.get('counted', 0)}, ложных "
+                f"{100 * data.get('rate', 0.0):.0f} % (взвешенно по цене "
+                f"{100 * data.get('rate_weighted', 0.0):.0f} %), цена ложных "
+                f"{data.get('cost_reused_seconds', 0.0):.0f} с")
 
     stale = data["stale_peer_events"]
     lines += [

@@ -162,6 +162,9 @@ def update_metric(state: dict[str, Any], decisions: list[Decision], now: float,
     window = float(cfg["REUSE_WINDOW_SECONDS"])
     events = state.setdefault("would_kill", [])
     by_pid = {dec.daemon.pid: dec.daemon for dec in decisions}
+    kind_of = {dec.daemon.pid: dec.daemon.kind for dec in decisions}
+    cost_of = {dec.daemon.pid: float(dec.recreate_cost_seconds)
+               for dec in decisions}
 
     # Разрыв наблюдения: сколько прошло с прошлого свипа. Если свипов не
     # было (машина выключена), часть окна мы не видели.
@@ -240,7 +243,13 @@ def update_metric(state: dict[str, Any], decisions: list[Decision], now: float,
         events.append({"pid": pid, "at": now, "reused": False,
                        "final": False, "starttime": d.starttime,
                        "mb": d.footprint_mb, "max_gap": 0.0,
-                       "killed": pid in killed_pids})
+                       "killed": pid in killed_pids,
+                       # Вид демона и цена его воссоздания: без них метрика
+                       # была бы одной общей цифрой на все виды, а цена
+                       # ошибки у разных видов разная (Gradle — 40 с,
+                       # дешёвый демон — единицы секунд).
+                       "kind": kind_of.get(pid, "unknown"),
+                       "cost": cost_of.get(pid, 0.0)})
 
     finals = [e for e in events if e.get("final")]
     reused = sum(1 for e in finals if e.get("outcome") == "reused")
@@ -258,6 +267,7 @@ def update_metric(state: dict[str, Any], decisions: list[Decision], now: float,
         "killed": killed,
         "rate": (reused / countable) if countable else 0.0,
         "pending": len(pending),
+        "by_kind": _metric_by_kind(events),
     }
     # «Могло бы быть освобождено»: накопленное (все события) и то, что
     # висит под ударом прямо сейчас (незакрытые события).
@@ -265,6 +275,56 @@ def update_metric(state: dict[str, Any], decisions: list[Decision], now: float,
     state["would_free_pending_mb"] = sum(int(e.get("mb", 0)) for e in pending)
     _trim_events(events)
     return state["metric"]
+
+
+def _metric_by_kind(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Метрика по видам демонов + взвешивание по цене воссоздания.
+
+    Почему по видам: у разных программ разная цена ошибки. Ложное
+    срабатывание на Gradle-демоне стоит 40 с пересборки, на дешёвом
+    демоне — единицы секунд. Одна общая доля «ложных» это разные вещи
+    смешивает, и вердикт по ней получается бессмысленным, как только
+    целей больше одной.
+
+    Взвешивание: rate_weighted — доля ложных, посчитанная по сумме цен
+    воссоздания, а не по числу событий. Ложное срабатывание на дорогом
+    демоне весит больше, чем на дешёвом, — и это должно отражаться в
+    вердикте.
+    """
+    out: dict[str, Any] = {}
+    for event in events:
+        kind = str(event.get("kind") or "unknown")
+        bucket = out.setdefault(kind, {
+            "events": 0, "counted": 0, "reused": 0, "not_reused": 0,
+            "unknown": 0, "killed": 0, "pending": 0,
+            "cost_reused_seconds": 0.0, "cost_counted_seconds": 0.0,
+        })
+        outcome = event.get("outcome")
+        if not event.get("final"):
+            bucket["pending"] += 1
+            continue
+        bucket["events"] += 1
+        cost = float(event.get("cost") or 0.0)
+        if outcome == "reused":
+            bucket["reused"] += 1
+            bucket["counted"] += 1
+            bucket["cost_reused_seconds"] += cost
+            bucket["cost_counted_seconds"] += cost
+        elif outcome == "not_reused":
+            bucket["not_reused"] += 1
+            bucket["counted"] += 1
+            bucket["cost_counted_seconds"] += cost
+        elif outcome == "unknown":
+            bucket["unknown"] += 1
+        elif outcome == "killed":
+            bucket["killed"] += 1
+    for bucket in out.values():
+        counted = bucket["counted"]
+        bucket["rate"] = (bucket["reused"] / counted) if counted else 0.0
+        cost_total = bucket["cost_counted_seconds"]
+        bucket["rate_weighted"] = ((bucket["cost_reused_seconds"] / cost_total)
+                                   if cost_total else 0.0)
+    return out
 
 
 def _trim_events(events: list[dict[str, Any]], keep: int = 100) -> None:

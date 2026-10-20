@@ -385,6 +385,57 @@ class TestPilotReport(unittest.TestCase):
                                       now=NOW)
         self.assertEqual(code, 0)
 
+    # ---- вердикт по видам ----
+
+    def _state_by_kind(self, by_kind, started=NOW - 86400):
+        """Состояние с новой метрикой: разбивка по видам."""
+        counted = sum(d["counted"] for d in by_kind.values())
+        reused = sum(d["reused"] for d in by_kind.values())
+        return {"metric": {"events": counted, "counted": counted,
+                           "reused": reused, "pending": 0, "by_kind": by_kind},
+                "pilot_started_at": started}
+
+    def test_verdict_is_per_kind(self):
+        """Один плохой вид блокирует выкатку, даже если общая цифра хорошая."""
+        state = self._state_by_kind({
+            "gradle": {"counted": 20, "reused": 2, "rate": 0.1,
+                       "rate_weighted": 0.1, "cost_reused_seconds": 80.0},
+            "esbuild": {"counted": 10, "reused": 9, "rate": 0.9,
+                        "rate_weighted": 0.9, "cost_reused_seconds": 18.0},
+        })
+        text, code = reaper.pilot_report(self.cfg, state, now=NOW)
+        self.assertEqual(code, 1)
+        self.assertIn("esbuild", text)
+
+    def test_kind_with_few_events_does_not_block(self):
+        """Вид с малой выборкой своего вердикта не получает и не блокирует."""
+        state = self._state_by_kind({
+            "gradle": {"counted": 20, "reused": 2, "rate": 0.1,
+                       "rate_weighted": 0.1, "cost_reused_seconds": 80.0},
+            "esbuild": {"counted": 2, "reused": 2, "rate": 1.0,
+                        "rate_weighted": 1.0, "cost_reused_seconds": 4.0},
+        })
+        text, code = reaper.pilot_report(self.cfg, state, now=NOW)
+        self.assertEqual(code, 0)
+        self.assertIn("мало данных", text)
+
+    def test_no_kind_with_enough_events_is_no_verdict(self):
+        state = self._state_by_kind({
+            "esbuild": {"counted": 3, "reused": 1, "rate": 0.33,
+                        "rate_weighted": 0.33, "cost_reused_seconds": 2.0},
+        })
+        _, code = reaper.pilot_report(self.cfg, state, now=NOW)
+        self.assertEqual(code, 2)
+
+    def test_report_shows_weighted_rate_and_cost(self):
+        state = self._state_by_kind({
+            "gradle": {"counted": 20, "reused": 4, "rate": 0.2,
+                       "rate_weighted": 0.35, "cost_reused_seconds": 160.0},
+        })
+        text, _ = reaper.pilot_report(self.cfg, state, now=NOW)
+        self.assertIn("взвешенно", text)
+        self.assertIn("160", text)
+
     def test_boundary_min_events(self):
         """Ровно PILOT_MIN_EVENTS событий — вердикт выносится."""
         _, code = reaper.pilot_report(self.cfg,

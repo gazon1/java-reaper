@@ -65,6 +65,11 @@ class TargetSpec:
     cancel         — маркер «клиент отвалился» (даёт признак «завис»);
     idle_seconds   — порог простоя (None → берётся из плоского конфига);
     recreate_cost_seconds — цена холодного старта (None → плоский конфиг);
+    build_active_seconds — окно «свежей» сборки: пока идёт сборка, начавшаяся
+                     не позже, защищать защищаемые виды (None → плоский конфиг);
+    stuck_after_seconds — через сколько после отмены сборки демон «завис»;
+    min_footprint_mb — ниже этого демон не стоит пересоздания (None → конфиг);
+    large_daemon_mb  — крупнее этого демона убираем в любом случае;
     self_timeout_seconds  — через сколько демон умирает сам (Gradle: 180 мин);
     protects       — какие виды демонов этот вид защищает, пока работает;
     rebuildable    — «это пересоздаваемый кэш, его можно убить»;
@@ -86,6 +91,10 @@ class TargetSpec:
     cancel: str = ""
     idle_seconds: float | None = None
     recreate_cost_seconds: float | None = None
+    build_active_seconds: float | None = None
+    stuck_after_seconds: float | None = None
+    min_footprint_mb: int | None = None
+    large_daemon_mb: int | None = None
     self_timeout_seconds: float | None = None
     protects: tuple[str, ...] = ()
     rebuildable: bool = False
@@ -222,6 +231,12 @@ def _spec_from_dict(raw: dict[str, Any], warnings: list[str],
         cancel=str(raw.get("cancel") or ""),
         idle_seconds=_optional_float(raw.get("idle_seconds")),
         recreate_cost_seconds=_optional_float(raw.get("recreate_cost_seconds")),
+        build_active_seconds=_optional_float(raw.get("build_active_seconds")),
+        stuck_after_seconds=_optional_float(raw.get("stuck_after_seconds")),
+        min_footprint_mb=(None if raw.get("min_footprint_mb") in (None, "")
+                          else int(raw["min_footprint_mb"])),
+        large_daemon_mb=(None if raw.get("large_daemon_mb") in (None, "")
+                         else int(raw["large_daemon_mb"])),
         self_timeout_seconds=_optional_float(raw.get("self_timeout_seconds")),
         protects=tuple(str(p) for p in protects),
         rebuildable=bool(raw.get("rebuildable", False)),

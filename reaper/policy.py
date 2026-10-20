@@ -52,6 +52,12 @@ class Signals:
     # Контекст всего набора демонов: свободная память, свежая сборка
     # (по видам демонов). Правила читают его, а не каждый демон сам по себе.
     context: Context = field(default_factory=Context)
+    # Пороги для ЭТОГО вида демонов (из targets.yaml). Ноль/None — правило
+    # берёт значение из плоского конфига (запасной путь).
+    min_footprint: int = 0
+    large_daemon_mb: int = 0
+    stuck_after: float = 0.0
+    build_active: float = 0.0
     # Пересоздаваем ли этого демона (targets.yaml → rebuildable). False —
     # это сервис или база данных: убивать его нельзя никогда.
     # По умолчанию False: «не знаем ⇒ не трогаем».
@@ -133,7 +139,8 @@ def default_policy(cfg: dict) -> list[Rule]:
         return s.log_recent
 
     def small(s: Signals) -> bool:
-        return s.daemon.footprint_mb < min_footprint
+        limit = s.min_footprint or min_footprint
+        return s.daemon.footprint_mb < limit
 
     def building(s: Signals) -> bool:
         return s.build_in_progress and s.age < s.idle_limit
@@ -157,9 +164,10 @@ def default_policy(cfg: dict) -> list[Rule]:
         начавшаяся несколько часов назад и не завершившаяся, — это
         зависший демон, и он сам подлежит уборке.
         """
+        window = s.build_active or build_active
         for protector in s.protector_kinds:
             age = s.context.build_ages.get(protector)
-            if age is not None and age <= build_active:
+            if age is not None and age <= window:
                 return True
         return False
 
@@ -181,7 +189,8 @@ def default_policy(cfg: dict) -> list[Rule]:
             return False  # режим «всегда убирать»
         if available < pressure_mb:
             return False  # память нужна — убираем
-        return s.daemon.footprint_mb < large_mb
+        large = s.large_daemon_mb or large_mb
+        return s.daemon.footprint_mb < large
 
     def stuck(s: Signals) -> bool:
         """Демон завис: клиент отвалился во время сборки.
@@ -195,7 +204,8 @@ def default_policy(cfg: dict) -> list[Rule]:
         шесть часов демон, которому работать некому, незачем. Демон с
         живым клиентом защищён правилом `peer` — раньше него.
         """
-        return s.stuck_build and s.stuck_age > stuck_after
+        threshold = s.stuck_after or stuck_after
+        return s.stuck_build and s.stuck_age > threshold
 
     return [
         Rule("allowlist",
